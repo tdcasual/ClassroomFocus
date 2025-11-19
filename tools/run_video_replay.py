@@ -2,7 +2,7 @@
 import cv2, time
 from cv.face_analyzer import FaceAnalyzer, FaceAnalyzerConfig
 
-video = "samples/classroom_3p.mp4"  # 你的测试视频
+video = "samples/students.mp4"  # 你的测试视频
 cfg = FaceAnalyzerConfig(debug_draw=True)  # 开显示
 fa = FaceAnalyzer(cfg)
 

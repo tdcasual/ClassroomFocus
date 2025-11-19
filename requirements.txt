@@ -1,0 +1,9 @@
+opencv-python>=4.7,<5.0
+mediapipe>=0.10.13
+streamlit
+websocket-client
+numpy
+sounddevice
+tqdm
+python-dotenv
+requests

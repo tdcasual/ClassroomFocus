@@ -368,6 +368,8 @@ class FaceAnalyzer:
 # -------- 便捷 CLI：实时摄像头演示 --------
 if __name__ == "__main__":
     import argparse, time as _time
+    import platform # 引入这个库来判断系统
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--webcam", type=int, default=0, help="摄像头索引（默认0）")
     ap.add_argument("--width", type=int, default=640)
@@ -378,10 +380,29 @@ if __name__ == "__main__":
     cfg = FaceAnalyzerConfig(debug_draw=args.show)
     analyzer = FaceAnalyzer(cfg)
 
-    cap = cv2.VideoCapture(args.webcam, cv2.CAP_V4L2)
+    # --- 针对不同系统的兼容性修改 ---
+    current_os = platform.system()
+    if current_os == "Windows":
+        # Windows 下推荐使用 DirectShow
+        backend = cv2.CAP_DSHOW
+    elif current_os == "Linux":
+        # Linux 下使用 V4L2 (例如树莓派)
+        backend = cv2.CAP_V4L2
+    else:
+        # macOS 或其他系统自动选择
+        backend = cv2.CAP_ANY
+    
+    print(f"正在当前系统 ({current_os}) 上启动摄像头...")
+    cap = cv2.VideoCapture(args.webcam, backend)
+    # ----------------------------
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_FPS, 30)
+
+    if not cap.isOpened():
+        print(f"无法打开摄像头 (index={args.webcam})。请检查连接或尝试 --webcam 1")
+        exit(0)
 
     t0 = _time.time()
     frames = 0
@@ -389,15 +410,20 @@ if __name__ == "__main__":
         while True:
             ok, frame = cap.read()
             if not ok:
+                print("无法读取视频帧，退出...")
                 break
+            
             ts = _time.time()
             results, events = analyzer.analyze_frame(frame, ts)
             frames += 1
+            
             # 打印事件
             for e in events:
                 print(e)
+            
             if args.show:
                 cv2.imshow("FaceAnalyzer", frame)
+                # Windows 下 ESC 键退出
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
     finally:

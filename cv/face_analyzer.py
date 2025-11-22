@@ -309,9 +309,9 @@ class FaceAnalyzer:
                         })
                     del self.tracks[tid]
 
-        # 可选：在帧上叠加调试文本
+        # 可选：在帧上叠加调试文本与关键点（当 debug_draw True 时）
         if self.cfg.debug_draw:
-            self._draw_debug(frame_bgr, results)
+            self._draw_debug(frame_bgr, results, faces_pts)
 
         return results, events
 
@@ -355,14 +355,42 @@ class FaceAnalyzer:
         return assign
 
     # ---------- 调试绘制 ----------
-    def _draw_debug(self, frame_bgr: np.ndarray, results: List[Dict]):
-        y = 30
-        for r in results:
-            txt = f"ID{r['student_id']} EAR={r['ear']:.2f} (thr {r['ear_thresh']:.2f}) " \
-                  f"Pitch={r['pitch'] if r['pitch'] is not None else 'NA'}  {r['state']}"
-            cv2.putText(frame_bgr, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 0, 255) if "drowsy" in r['state'] else (0, 255, 0), 2)
-            y += 24
+    def _draw_debug(self, frame_bgr: np.ndarray, results: List[Dict], faces_pts: List[np.ndarray]):
+        """在帧上绘制简易 face mesh、关键点高亮和状态文本。results 与 faces_pts 顺序一一对应。"""
+        # 绘制每人脸的点与文本
+        for i, r in enumerate(results):
+            pts2d = faces_pts[i] if i < len(faces_pts) else None
+            if pts2d is not None and pts2d.size != 0:
+                # 绘制所有 landmark（轻量点）
+                for (x, y) in pts2d.astype(int):
+                    cv2.circle(frame_bgr, (int(x), int(y)), 1, (0, 255, 255), -1)
+
+                # 高亮眼部与 PnP 点
+                eye_idxs = [LEFT_EYE_H[0], LEFT_EYE_H[1], LEFT_EYE_V1[0], LEFT_EYE_V1[1], LEFT_EYE_V2[0], LEFT_EYE_V2[1],
+                            RIGHT_EYE_H[0], RIGHT_EYE_H[1], RIGHT_EYE_V1[0], RIGHT_EYE_V1[1], RIGHT_EYE_V2[0], RIGHT_EYE_V2[1]]
+                for idx in set(eye_idxs):
+                    if idx < pts2d.shape[0]:
+                        x, y = pts2d[idx].astype(int)
+                        cv2.circle(frame_bgr, (int(x), int(y)), 3, (0, 0, 255), -1)
+
+                for idx in PNP_IDXS:
+                    if idx < pts2d.shape[0]:
+                        x, y = pts2d[idx].astype(int)
+                        cv2.circle(frame_bgr, (int(x), int(y)), 4, (255, 0, 0), 2)
+
+                # 文本与中心
+                cx, cy = int(np.mean(pts2d[:, 0])), int(np.mean(pts2d[:, 1]))
+                txt = f"ID{r['student_id']} {r['state']} EAR={r['ear']:.2f}"
+                color = (0, 0, 255) if ("drowsy" in r['state'] or "down" in r['state']) else (0, 255, 0)
+                cv2.putText(frame_bgr, txt, (cx - 80, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                # 画圈表示人脸中心
+                cv2.circle(frame_bgr, (cx, cy), 12, color, 2)
+            else:
+                # 若没有 pts，则换行显示文本在左侧
+                y = 30 + i * 24
+                txt = f"ID{r['student_id']} {r['state']} EAR={r['ear']:.2f}"
+                color = (0, 0, 255) if ("drowsy" in r['state'] or "down" in r['state']) else (0, 255, 0)
+                cv2.putText(frame_bgr, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
 # -------- 便捷 CLI：实时摄像头演示 --------

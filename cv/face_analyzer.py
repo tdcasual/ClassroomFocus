@@ -79,18 +79,19 @@ class FaceAnalyzerConfig:
     refine_landmarks: bool = False
     min_det_conf: float = 0.5
     min_trk_conf: float = 0.5
-
-    ear_min: float = 0.15
-    ear_ratio: float = 0.70
+    # Tuning defaults (made more sensitive to reduce missed drowsy detection)
+    ear_min: float = 0.18
+    ear_ratio: float = 0.85
     calibrate_secs: float = 3.0
-    ear_ema_alpha: float = 0.3
+    ear_ema_alpha: float = 0.6
 
-    drowsy_secs: float = 2.8
+    drowsy_secs: float = 1.6
     blink_max_secs: float = 0.25
     recover_secs: float = 0.8
 
-    pitch_down_deg: float = -20.0
-    down_secs: float = 1.6
+    pitch_down_deg: float = -12.0
+    pitch_ema_alpha: float = 0.5
+    down_secs: float = 1.0
 
     match_max_px: float = 80.0
     max_miss_count: int = 10
@@ -176,7 +177,8 @@ class FaceAnalyzer:
             # Pitch
             pitch = self._compute_pitch(pts2d, W, H)
             if pitch is not None:
-                st.pitch_ema = pitch if st.pitch_ema is None else 0.7 * st.pitch_ema + 0.3 * pitch
+                alpha = getattr(self.cfg, 'pitch_ema_alpha', 0.3)
+                st.pitch_ema = pitch if st.pitch_ema is None else (alpha * pitch + (1 - alpha) * st.pitch_ema)
 
             # Eye/drowsy FSM
             was_closed = st.eye_closed
@@ -259,14 +261,35 @@ class FaceAnalyzer:
             elif st.down_active:
                 state = "down"
             st.state = state
-
+            x1 = float(np.min(pts2d[:, 0])) if pts2d.size else 0.0
+            y1 = float(np.min(pts2d[:, 1])) if pts2d.size else 0.0
+            x2 = float(np.max(pts2d[:, 0])) if pts2d.size else 0.0
+            y2 = float(np.max(pts2d[:, 1])) if pts2d.size else 0.0
+            w_px = max(1.0, x2 - x1)
+            h_px = max(1.0, y2 - y1)
+            bbox_norm = [
+                float(max(0.0, min(1.0, x1 / max(1.0, W)))),
+                float(max(0.0, min(1.0, y1 / max(1.0, H)))),
+                float(max(0.0, min(1.0, w_px / max(1.0, W)))),
+                float(max(0.0, min(1.0, h_px / max(1.0, H)))),
+            ]
+            cx_norm = float(center[0] / max(1.0, W))
+            cy_norm = float(center[1] / max(1.0, H))
+            area = float(bbox_norm[2] * bbox_norm[3])
             results.append({
                 "student_id": tid,
+                "track_id": tid,
                 "ear": float(st.ear_ema) if st.ear_ema is not None else None,
                 "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                 "state": st.state,
                 "ear_thresh": float(ear_thresh),
                 "blink_count": st.blink_count,
+                "bbox": bbox_norm,
+                "center": [cx_norm, cy_norm],
+                "center_x": cx_norm,
+                "center_y": cy_norm,
+                "area": area,
+                "ts": float(timestamp),
             })
 
         # Cleanup missing tracks

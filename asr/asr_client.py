@@ -140,7 +140,7 @@ class _AliCallback(RecognitionCallback):
 
 
     
-def transcribe_file(api_key: Optional[str], wav_path: str, time_base: Callable[[], float], on_sentence: Callable[[dict], None], model: str = "fun-asr-realtime", sample_rate: int = 16000, chunk_ms: int = 100):
+def transcribe_file(api_key: Optional[str], wav_path: str, time_base: Callable[[], float], on_sentence: Callable[[dict], None], model: str = "fun-asr-realtime", sample_rate: int = 16000, chunk_ms: int = 100, progress_hook: Optional[Callable[[float], None]] = None):
     """Utility to transcribe a WAV file by sending chunks to Recognition.
 
     This function does not open any pyaudio streams and is safe to run when
@@ -180,13 +180,26 @@ def transcribe_file(api_key: Optional[str], wav_path: str, time_base: Callable[[
         with _wave.open(wav_path, 'rb') as wf:
             bytes_per_frame = wf.getsampwidth() * wf.getnchannels()
             frames_per_chunk = int(sample_rate * (chunk_ms / 1000.0))
+            frames_sent = 0
             while True:
                 chunk = wf.readframes(frames_per_chunk)
                 if not chunk:
                     break
                 recog.send_audio_frame(chunk)
+                if bytes_per_frame > 0:
+                    frames_sent += len(chunk) // bytes_per_frame
+                    if progress_hook:
+                        try:
+                            progress_hook(frames_sent / float(sample_rate))
+                        except Exception:
+                            pass
     finally:
         try:
             recog.stop()
+        except Exception:
+            pass
+    if progress_hook:
+        try:
+            progress_hook(frames_sent / float(sample_rate))
         except Exception:
             pass

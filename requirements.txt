@@ -3,7 +3,15 @@ mediapipe>=0.10.13
 streamlit
 websocket-client
 numpy
+pytest
 sounddevice
 tqdm
 python-dotenv
+requests
+dashscope
+pyaudio
+matplotlib
+fastapi
+uvicorn[standard]
+msgpack
 requests

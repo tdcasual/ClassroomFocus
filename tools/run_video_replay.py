@@ -7,11 +7,12 @@ cfg = FaceAnalyzerConfig(debug_draw=True)  # 开显示
 fa = FaceAnalyzer(cfg)
 
 cap = cv2.VideoCapture(video)
-t0 = time.time(); frames = 0
+start_wall = time.time(); frames = 0
 while True:
     ok, frame = cap.read()
     if not ok: break
-    ts = time.time()
+    # 统一使用相对时间轴
+    ts = time.time() - start_wall
     results, events = fa.analyze_frame(frame, ts)
     for e in events:
         print(e)
@@ -19,4 +20,4 @@ while True:
     cv2.imshow("replay", frame)
     if cv2.waitKey(1) & 0xFF == 27: break
 cap.release(); cv2.destroyAllWindows()
-print("FPS:", frames / (time.time()-t0))
+print("FPS:", frames / (time.time()-start_wall))

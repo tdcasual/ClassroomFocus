@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Classroom Timeline Viz</title>
+    <style>
+      html,body{height:100%;margin:0;font-family:Segoe UI,Roboto,Arial}
+      #toolbar{padding:8px;background:#f5f5f5;border-bottom:1px solid #ddd}
+      #canvasWrap{display:flex;flex:1}
+      canvas{width:100%;height:calc(100vh - 48px);display:block}
+    </style>
+  </head>
+  <body>
+    <div id="toolbar">
+      Window(s): <select id="windowSel"><option>10</option><option selected>60</option><option>120</option></select>
+      &nbsp; Show text: <input type="checkbox" id="showText" checked />
+      &nbsp; Status: <span id="status">disconnected</span>
+    </div>
+    <div id="canvasWrap"><canvas id="timeline"></canvas></div>
+    <script src="viz.js"></script>
+  </body>
+</html>

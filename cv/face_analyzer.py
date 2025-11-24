@@ -1,49 +1,50 @@
 # cv/face_analyzer.py
 # -*- coding: utf-8 -*-
-import cv2
-import numpy as np
-import mediapipe as mp
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+"""Face analysis: EAR-based drowsiness, pitch-based looking-down detection, simple multi-face tracking."""
+import time
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-# ---------- 眼部关键点（MediaPipe FaceMesh 索引） ----------
-# 左眼：水平(33,133)；垂直(159,145) 与 (160,144)
+import cv2
+import mediapipe as mp
+import numpy as np
+import requests
+
+# FaceMesh landmark indices for eye geometry
 LEFT_EYE_H = (33, 133)
 LEFT_EYE_V1 = (159, 145)
 LEFT_EYE_V2 = (160, 144)
-# 右眼：水平(263,362)；垂直(386,374) 与 (385,380)
 RIGHT_EYE_H = (263, 362)
 RIGHT_EYE_V1 = (386, 374)
 RIGHT_EYE_V2 = (385, 380)
 
-# 头姿 PnP 6 点（鼻尖、下巴、左眼外角、右眼外角、左嘴角、右嘴角）
+# 6-point PnP landmarks: nose, chin, eye corners, mouth corners
 PNP_IDXS = [1, 152, 33, 263, 61, 291]
 MODEL_POINTS = np.array([
-    [0.0,    0.0,    0.0],     # nose tip
-    [0.0,  -330.0, -65.0],     # chin
-    [-225., 170.,  -135.],     # left eye outer
-    [225.,  170.,  -135.],     # right eye outer
-    [-150., -150., -125.],     # left mouth corner
-    [150.,  -150., -125.],     # right mouth corner
+    [0.0,    0.0,    0.0],
+    [0.0,  -330.0, -65.0],
+    [-225., 170.,  -135.],
+    [225.,  170.,  -135.],
+    [-150., -150., -125.],
+    [150.,  -150., -125.],
 ], dtype=np.float32)
+
 
 def _dist(a, b) -> float:
     return float(np.linalg.norm(a - b))
+
 
 def _ear_from_pts(pts2d: np.ndarray,
                   H: Tuple[int, int],
                   V1: Tuple[int, int],
                   V2: Tuple[int, int]) -> float:
-    """根据眼部6个点计算单眼 EAR"""
+    """Compute single-eye EAR from 6 landmark points."""
     ph = _dist(pts2d[H[0]], pts2d[H[1]]) + 1e-6
     pv = _dist(pts2d[V1[0]], pts2d[V1[1]]) + _dist(pts2d[V2[0]], pts2d[V2[1]])
     return float(pv / (2.0 * ph))
 
-def _avg_two(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    if a is None and b is None: return None
-    if a is None: return b
-    if b is None: return a
-    return 0.5 * (a + b)
 
 @dataclass
 class TrackState:
@@ -52,29 +53,25 @@ class TrackState:
     center: Tuple[float, float] = (0.0, 0.0)
     miss_count: int = 0
 
-    # 平滑值
     ear_ema: Optional[float] = None
     pitch_ema: Optional[float] = None
 
-    # 标定
     seen_secs: float = 0.0
     ear_open_baseline: Optional[float] = None
 
-    # 眼睛与瞌睡
     eye_closed: bool = False
     closed_timer: float = 0.0
     drowsy_active: bool = False
     drowsy_start_ts: Optional[float] = None
 
-    # 低头
     down: bool = False
     down_timer: float = 0.0
     down_active: bool = False
     down_start_ts: Optional[float] = None
 
-    # 统计
     blink_count: int = 0
-    state: str = "awake"  # 可选：awake / drowsy / down / both
+    state: str = "awake"  # awake / drowsy / down / drowsy+down
+
 
 @dataclass
 class FaceAnalyzerConfig:
@@ -83,29 +80,27 @@ class FaceAnalyzerConfig:
     min_det_conf: float = 0.5
     min_trk_conf: float = 0.5
 
-    # EAR 阈值与标定
     ear_min: float = 0.15
     ear_ratio: float = 0.70
     calibrate_secs: float = 3.0
     ear_ema_alpha: float = 0.3
 
-    # 瞌睡/眨眼阈值
     drowsy_secs: float = 2.8
     blink_max_secs: float = 0.25
     recover_secs: float = 0.8
 
-    # 低头（Pitch）阈值（绕 x 轴，向下为负多数情况）
     pitch_down_deg: float = -20.0
     down_secs: float = 1.6
 
-    # 多脸匹配
     match_max_px: float = 80.0
     max_miss_count: int = 10
 
-    # 调试显示
     debug_draw: bool = False
 
+
 class FaceAnalyzer:
+    """Analyze frames for EAR/pitch and emit state-change events."""
+
     def __init__(self, cfg: FaceAnalyzerConfig = FaceAnalyzerConfig()):
         self.cfg = cfg
         self._mp = mp.solutions.face_mesh
@@ -118,84 +113,77 @@ class FaceAnalyzer:
         self.tracks: Dict[int, TrackState] = {}
         self._next_id: int = 0
 
-    # ---------- 核心：分析一帧 ----------
     def analyze_frame(self, frame_bgr: np.ndarray, timestamp: float):
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self._mesh.process(rgb)
 
-        # 收集本帧所有人脸的 2D 坐标与中心
         faces_pts: List[np.ndarray] = []
         centers: List[Tuple[float, float]] = []
         if res.multi_face_landmarks:
             for fl in res.multi_face_landmarks[: self.cfg.max_faces]:
-                n = len(fl.landmark)  # 468 或 478
+                n = len(fl.landmark)
                 pts2d = np.zeros((n, 2), dtype=np.float32)
                 xs, ys = [], []
                 for i, lm in enumerate(fl.landmark):
                     x, y = lm.x * W, lm.y * H
                     pts2d[i] = (x, y)
-                    xs.append(x); ys.append(y)
+                    xs.append(x)
+                    ys.append(y)
                 faces_pts.append(pts2d)
                 centers.append((float(np.mean(xs)), float(np.mean(ys))))
 
-        # 数据关联（最近邻）
         assign = self._associate(centers)
 
-        results = []   # 每人脸的原始数值
-        events = []    # 状态切换事件
+        results: List[Dict] = []
+        events: List[Dict] = []
         used_ids = set()
 
         for idx, pts2d in enumerate(faces_pts):
             center = centers[idx]
             tid = assign.get(idx)
             if tid is None:
-                # 新建 track
                 tid = self._next_id
                 self._next_id += 1
                 self.tracks[tid] = TrackState(id=tid, center=center, last_ts=timestamp)
             st = self.tracks[tid]
             used_ids.add(tid)
 
-            # 计算 dt
             dt = 0.0 if st.last_ts is None else max(0.0, timestamp - st.last_ts)
             st.last_ts = timestamp
             st.center = center
-            st.miss_count = 0  # 本帧命中
+            st.miss_count = 0
 
-            # -------- EAR ----------
+            # EAR
             left_ear = _ear_from_pts(pts2d, LEFT_EYE_H, LEFT_EYE_V1, LEFT_EYE_V2)
             right_ear = _ear_from_pts(pts2d, RIGHT_EYE_H, RIGHT_EYE_V1, RIGHT_EYE_V2)
             ear = (left_ear + right_ear) / 2.0
+            st.ear_ema = ear if st.ear_ema is None else (
+                self.cfg.ear_ema_alpha * ear + (1 - self.cfg.ear_ema_alpha) * st.ear_ema
+            )
 
-            # EMA 平滑
-            st.ear_ema = ear if st.ear_ema is None else \
-                (self.cfg.ear_ema_alpha * ear + (1 - self.cfg.ear_ema_alpha) * st.ear_ema)
-
-            # 标定
+            # Calibration of open-eye baseline
             if st.seen_secs < self.cfg.calibrate_secs:
                 st.seen_secs += dt
                 if st.ear_open_baseline is None:
                     st.ear_open_baseline = st.ear_ema
                 else:
-                    # 慢速逼近
                     st.ear_open_baseline = 0.9 * st.ear_open_baseline + 0.1 * st.ear_ema
 
             ear_base = st.ear_open_baseline if st.ear_open_baseline else 0.28
             ear_thresh = max(self.cfg.ear_min, self.cfg.ear_ratio * ear_base)
 
-            # -------- Pitch ----------
+            # Pitch
             pitch = self._compute_pitch(pts2d, W, H)
             if pitch is not None:
                 st.pitch_ema = pitch if st.pitch_ema is None else 0.7 * st.pitch_ema + 0.3 * pitch
 
-            # -------- 状态机：眼睛/瞌睡 ----------
+            # Eye/drowsy FSM
             was_closed = st.eye_closed
             st.eye_closed = (st.ear_ema is not None) and (st.ear_ema < ear_thresh)
 
             if st.eye_closed:
                 st.closed_timer += dt
-                # 刚跨过 drowsy 阈值 → 触发 START
                 if (not st.drowsy_active) and (st.closed_timer >= self.cfg.drowsy_secs):
                     st.drowsy_active = True
                     st.drowsy_start_ts = timestamp - st.closed_timer
@@ -205,12 +193,10 @@ class FaceAnalyzer:
                         "type": "DROWSY_START",
                         "dur": None,
                         "ear": float(st.ear_ema),
-                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None
+                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                     })
             else:
-                # 刚从闭眼恢复
                 if was_closed:
-                    # 短暂闭眼：BLINK
                     if 0.0 < st.closed_timer < self.cfg.blink_max_secs:
                         st.blink_count += 1
                         events.append({
@@ -219,9 +205,8 @@ class FaceAnalyzer:
                             "type": "BLINK",
                             "dur": float(st.closed_timer),
                             "ear": float(st.ear_ema),
-                            "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None
+                            "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                         })
-                    # 长闭眼结束：DROWSY_END（若已进入 drowsy）
                     if st.drowsy_active:
                         events.append({
                             "ts": timestamp,
@@ -229,15 +214,14 @@ class FaceAnalyzer:
                             "type": "DROWSY_END",
                             "dur": float(timestamp - (st.drowsy_start_ts or timestamp)),
                             "ear": float(st.ear_ema),
-                            "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None
+                            "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                         })
                     st.drowsy_active = False
                     st.drowsy_start_ts = None
                 st.closed_timer = 0.0
 
-            # -------- 状态机：低头 ----------
+            # Looking down FSM (pitch)
             was_down = st.down
-            # 注意 Pitch 正负号可能因坐标系不同略有差异，这里按“向下为负”处理
             is_down_now = (st.pitch_ema is not None) and (st.pitch_ema <= self.cfg.pitch_down_deg)
             st.down = is_down_now
             if st.down:
@@ -251,7 +235,7 @@ class FaceAnalyzer:
                         "type": "LOOKING_DOWN_START",
                         "dur": None,
                         "ear": float(st.ear_ema),
-                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None
+                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                     })
             else:
                 if was_down and st.down_active:
@@ -261,14 +245,12 @@ class FaceAnalyzer:
                         "type": "LOOKING_DOWN_END",
                         "dur": float(timestamp - (st.down_start_ts or timestamp)),
                         "ear": float(st.ear_ema),
-                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None
+                        "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                     })
                 st.down_active = False
                 st.down_start_ts = None
                 st.down_timer = 0.0
 
-            # -------- 输出每人脸的数值 --------
-            # 归一化状态（便于上层显示）
             state = "awake"
             if st.drowsy_active and st.down_active:
                 state = "drowsy+down"
@@ -284,15 +266,14 @@ class FaceAnalyzer:
                 "pitch": float(st.pitch_ema) if st.pitch_ema is not None else None,
                 "state": st.state,
                 "ear_thresh": float(ear_thresh),
-                "blink_count": st.blink_count
+                "blink_count": st.blink_count,
             })
 
-        # 未匹配到的人脸 track 递增 miss_count，超限回收
+        # Cleanup missing tracks
         for tid, st in list(self.tracks.items()):
             if tid not in used_ids:
                 st.miss_count += 1
                 if st.miss_count > self.cfg.max_miss_count:
-                    # 若在消失时仍处于 active 状态，补一条 END 事件
                     if st.drowsy_active:
                         events.append({
                             "ts": st.last_ts if st.last_ts else 0.0,
@@ -309,13 +290,11 @@ class FaceAnalyzer:
                         })
                     del self.tracks[tid]
 
-        # 可选：在帧上叠加调试文本与关键点（当 debug_draw True 时）
         if self.cfg.debug_draw:
             self._draw_debug(frame_bgr, results, faces_pts)
 
         return results, events
 
-    # ---------- 头姿求解 ----------
     def _compute_pitch(self, pts2d: np.ndarray, W: int, H: int) -> Optional[float]:
         try:
             image_points = np.array([pts2d[i] for i in PNP_IDXS], dtype=np.float32)
@@ -323,22 +302,20 @@ class FaceAnalyzer:
             K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1]], dtype=np.float32)
             dist = np.zeros(5, dtype=np.float32)
             ok, rvec, tvec = cv2.solvePnP(MODEL_POINTS, image_points, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-            if not ok: return None
+            if not ok:
+                return None
             R, _ = cv2.Rodrigues(rvec)
             sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-            pitch = np.degrees(np.arctan2(-R[2, 0], sy))  # 向下为负；如方向相反，可取负号
+            pitch = np.degrees(np.arctan2(-R[2, 0], sy))  # negative is looking down
             return float(pitch)
         except Exception:
             return None
 
-    # ---------- 关联 ----------
     def _associate(self, centers: List[Tuple[float, float]]) -> Dict[int, int]:
-        """把本帧的人脸 idx 关联到已有 track_id（最近邻+距离阈值）"""
+        """Greedy nearest-neighbor face-to-track assignment."""
         assign: Dict[int, int] = {}
         if not centers:
             return assign
-        # 简单贪心：对于每个新中心，找最近的 track
-        # （人脸数目不大，够用；需要更强时可用匈牙利算法）
         unused_tracks = set(self.tracks.keys())
         for i, c in enumerate(centers):
             best_tid, best_d = None, 1e9
@@ -354,20 +331,22 @@ class FaceAnalyzer:
                 assign[i] = None
         return assign
 
-    # ---------- 调试绘制 ----------
     def _draw_debug(self, frame_bgr: np.ndarray, results: List[Dict], faces_pts: List[np.ndarray]):
-        """在帧上绘制简易 face mesh、关键点高亮和状态文本。results 与 faces_pts 顺序一一对应。"""
-        # 绘制每人脸的点与文本
+        """Draw landmarks and state text on the frame when debug_draw=True."""
         for i, r in enumerate(results):
             pts2d = faces_pts[i] if i < len(faces_pts) else None
             if pts2d is not None and pts2d.size != 0:
-                # 绘制所有 landmark（轻量点）
                 for (x, y) in pts2d.astype(int):
                     cv2.circle(frame_bgr, (int(x), int(y)), 1, (0, 255, 255), -1)
 
-                # 高亮眼部与 PnP 点
-                eye_idxs = [LEFT_EYE_H[0], LEFT_EYE_H[1], LEFT_EYE_V1[0], LEFT_EYE_V1[1], LEFT_EYE_V2[0], LEFT_EYE_V2[1],
-                            RIGHT_EYE_H[0], RIGHT_EYE_H[1], RIGHT_EYE_V1[0], RIGHT_EYE_V1[1], RIGHT_EYE_V2[0], RIGHT_EYE_V2[1]]
+                eye_idxs = [
+                    LEFT_EYE_H[0], LEFT_EYE_H[1],
+                    LEFT_EYE_V1[0], LEFT_EYE_V1[1],
+                    LEFT_EYE_V2[0], LEFT_EYE_V2[1],
+                    RIGHT_EYE_H[0], RIGHT_EYE_H[1],
+                    RIGHT_EYE_V1[0], RIGHT_EYE_V1[1],
+                    RIGHT_EYE_V2[0], RIGHT_EYE_V2[1],
+                ]
                 for idx in set(eye_idxs):
                     if idx < pts2d.shape[0]:
                         x, y = pts2d[idx].astype(int)
@@ -378,84 +357,188 @@ class FaceAnalyzer:
                         x, y = pts2d[idx].astype(int)
                         cv2.circle(frame_bgr, (int(x), int(y)), 4, (255, 0, 0), 2)
 
-                # 文本与中心
                 cx, cy = int(np.mean(pts2d[:, 0])), int(np.mean(pts2d[:, 1]))
                 txt = f"ID{r['student_id']} {r['state']} EAR={r['ear']:.2f}"
                 color = (0, 0, 255) if ("drowsy" in r['state'] or "down" in r['state']) else (0, 255, 0)
                 cv2.putText(frame_bgr, txt, (cx - 80, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                # 画圈表示人脸中心
                 cv2.circle(frame_bgr, (cx, cy), 12, color, 2)
             else:
-                # 若没有 pts，则换行显示文本在左侧
                 y = 30 + i * 24
                 txt = f"ID{r['student_id']} {r['state']} EAR={r['ear']:.2f}"
                 color = (0, 0, 255) if ("drowsy" in r['state'] or "down" in r['state']) else (0, 255, 0)
                 cv2.putText(frame_bgr, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
-# -------- 便捷 CLI：实时摄像头演示 --------
+def list_cameras(max_index: int = 8, backend: Optional[int] = None, timeout: float = 1.0) -> List[Dict]:
+    """Probe camera indices and return those that produce frames."""
+    found: List[Dict] = []
+    for idx in range(max_index):
+        try:
+            cap = cv2.VideoCapture(idx) if backend is None else cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            t0 = time.time()
+            ok = False
+            while time.time() - t0 < timeout:
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    h, w = frame.shape[:2]
+                    found.append({"index": idx, "width": int(w), "height": int(h)})
+                    ok = True
+                    break
+                time.sleep(0.05)
+
+            cap.release()
+            if not ok:
+                continue
+        except Exception:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            continue
+    return found
+
+
+class _Poster:
+    """Background poster that batches JSON events and sends them to an HTTP endpoint."""
+    def __init__(self, url: Optional[str], batch_interval: float = 0.1, max_batch: int = 200):
+        self.url = url
+        self._q = queue.Queue()
+        self._thr: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self.batch_interval = float(batch_interval)
+        self.max_batch = int(max_batch)
+
+    def start(self):
+        if not self.url:
+            return
+        if self._thr and self._thr.is_alive():
+            return
+        self._thr = threading.Thread(target=self._run, daemon=True)
+        self._thr.start()
+
+    def send(self, obj: Dict[str, Any]):
+        if not self.url:
+            return
+        try:
+            self._q.put_nowait(obj)
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self._stop.is_set():
+            batch = []
+            try:
+                ev = self._q.get(timeout=self.batch_interval)
+                batch.append(ev)
+            except queue.Empty:
+                continue
+
+            while len(batch) < self.max_batch:
+                try:
+                    ev = self._q.get_nowait()
+                    batch.append(ev)
+                except queue.Empty:
+                    break
+
+            payload = {"type": "batch", "events": batch}
+            try:
+                requests.post(self.url, json=payload, timeout=3)
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop.set()
+        if self._thr:
+            self._thr.join(timeout=1.0)
+
+
+def open_camera(index: int = 0, width: int = 640, height: int = 480, backend: Optional[int] = None) -> cv2.VideoCapture:
+    """Open and configure a camera, returning the cv2.VideoCapture instance."""
+    cap = cv2.VideoCapture(index) if backend is None else cv2.VideoCapture(index, backend)
+    if not cap.isOpened():
+        return cap
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    return cap
+
+
 if __name__ == "__main__":
-    import argparse, time as _time
-    import platform # 引入这个库来判断系统
+    import argparse
+    import platform
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--webcam", type=int, default=0, help="摄像头索引（默认0）")
+    ap.add_argument("--webcam", type=int, default=0, help="Webcam index (default 0)")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--show", action="store_true", help="显示调试窗口")
+    ap.add_argument("--show", action="store_true", help="Show debug window")
+    ap.add_argument("--list-cams", action="store_true", help="List available cameras and exit")
+    ap.add_argument("--push-url", type=str, default=None, help="Optional HTTP push URL for events")
     args = ap.parse_args()
 
     cfg = FaceAnalyzerConfig(debug_draw=args.show)
     analyzer = FaceAnalyzer(cfg)
 
-    # --- 针对不同系统的兼容性修改 ---
     current_os = platform.system()
     if current_os == "Windows":
-        # Windows 下推荐使用 DirectShow
         backend = cv2.CAP_DSHOW
     elif current_os == "Linux":
-        # Linux 下使用 V4L2 (例如树莓派)
         backend = cv2.CAP_V4L2
     else:
-        # macOS 或其他系统自动选择
         backend = cv2.CAP_ANY
-    
-    print(f"正在当前系统 ({current_os}) 上启动摄像头...")
-    cap = cv2.VideoCapture(args.webcam, backend)
-    # ----------------------------
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    if args.list_cams:
+        cams = list_cameras(max_index=12, backend=backend, timeout=0.8)
+        if not cams:
+            print("No cameras found (tried indices 0-11)")
+        else:
+            print("Found cameras:")
+            for c in cams:
+                print(f"  index={c['index']}, resolution={c['width']}x{c['height']}")
+        raise SystemExit(0)
+
+    print(f"Starting camera on {current_os} (backend={backend}) ...")
+    cap = open_camera(index=args.webcam, width=args.width, height=args.height, backend=backend)
 
     if not cap.isOpened():
-        print(f"无法打开摄像头 (index={args.webcam})。请检查连接或尝试 --webcam 1")
-        exit(0)
+        print(f"Could not open camera index={args.webcam}. Check connections or try --webcam 1")
+        raise SystemExit(1)
 
-    t0 = _time.time()
+    poster = _Poster(args.push_url) if args.push_url else None
+    if poster:
+        poster.start()
+
+    t0 = time.time()
     frames = 0
+    start_wall = time.time()
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                print("无法读取视频帧，退出...")
+                print("Could not read video frame, exiting...")
                 break
-            
-            ts = _time.time()
+
+            ts = time.time() - start_wall
             results, events = analyzer.analyze_frame(frame, ts)
             frames += 1
-            
-            # 打印事件
+
             for e in events:
                 print(e)
-            
+                if poster:
+                    poster.send(e)
+
             if args.show:
                 cv2.imshow("FaceAnalyzer", frame)
-                # Windows 下 ESC 键退出
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        dur = max(1e-6, _time.time() - t0)
+        if poster:
+            poster.stop()
+        dur = max(1e-6, time.time() - t0)
         print(f"Frames={frames}, FPS={frames/dur:.2f}")

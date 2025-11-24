@@ -51,6 +51,7 @@ class TrackState:
     id: int
     last_ts: Optional[float] = None
     center: Tuple[float, float] = (0.0, 0.0)
+    prev_center: Tuple[float, float] = (0.0, 0.0)
     miss_count: int = 0
 
     ear_ema: Optional[float] = None
@@ -94,6 +95,8 @@ class FaceAnalyzerConfig:
     down_secs: float = 1.0
 
     match_max_px: float = 80.0
+    # allowed extra pixels per second of absence when matching (time-aware slack)
+    match_speed_px_per_sec: float = 200.0
     max_miss_count: int = 10
 
     debug_draw: bool = False
@@ -134,7 +137,7 @@ class FaceAnalyzer:
                 faces_pts.append(pts2d)
                 centers.append((float(np.mean(xs)), float(np.mean(ys))))
 
-        assign = self._associate(centers)
+        assign = self._associate(centers, timestamp)
 
         results: List[Dict] = []
         events: List[Dict] = []
@@ -146,11 +149,12 @@ class FaceAnalyzer:
             if tid is None:
                 tid = self._next_id
                 self._next_id += 1
-                self.tracks[tid] = TrackState(id=tid, center=center, last_ts=timestamp)
+                self.tracks[tid] = TrackState(id=tid, center=center, prev_center=center, last_ts=timestamp)
             st = self.tracks[tid]
             used_ids.add(tid)
-
             dt = 0.0 if st.last_ts is None else max(0.0, timestamp - st.last_ts)
+            # remember previous center before updating (useful for prediction/heuristics)
+            st.prev_center = st.center
             st.last_ts = timestamp
             st.center = center
             st.miss_count = 0
@@ -334,24 +338,41 @@ class FaceAnalyzer:
         except Exception:
             return None
 
-    def _associate(self, centers: List[Tuple[float, float]]) -> Dict[int, int]:
-        """Greedy nearest-neighbor face-to-track assignment."""
+    def _associate(self, centers: List[Tuple[float, float]], timestamp: float) -> Dict[int, int]:
+        """Greedy nearest-neighbor face-to-track assignment with time-aware tolerance.
+
+        If a track was last seen some time ago, allow a larger matching radius
+        proportional to the elapsed time (pixels/sec configured by
+        `match_speed_px_per_sec`). This reduces ID churn when subjects move
+        quickly or are briefly occluded.
+        """
         assign: Dict[int, int] = {}
         if not centers:
             return assign
         unused_tracks = set(self.tracks.keys())
         for i, c in enumerate(centers):
             best_tid, best_d = None, 1e9
-            for tid in unused_tracks:
+            for tid in list(unused_tracks):
                 st = self.tracks[tid]
                 d = np.hypot(c[0] - st.center[0], c[1] - st.center[1])
                 if d < best_d:
                     best_d, best_tid = d, tid
-            if best_tid is not None and best_d <= self.cfg.match_max_px:
-                assign[i] = best_tid
-                unused_tracks.remove(best_tid)
+
+            if best_tid is not None:
+                st = self.tracks[best_tid]
+                # time since last seen; if None, treat as just-seen (dt=0)
+                dt = max(0.0, timestamp - (st.last_ts or timestamp))
+                # allow extra slack proportional to time since last seen
+                slack = dt * float(getattr(self.cfg, 'match_speed_px_per_sec', 0.0))
+                threshold = float(self.cfg.match_max_px) + slack
+                if best_d <= threshold:
+                    assign[i] = best_tid
+                    unused_tracks.remove(best_tid)
+                else:
+                    assign[i] = None
             else:
                 assign[i] = None
+
         return assign
 
     def _draw_debug(self, frame_bgr: np.ndarray, results: List[Dict], faces_pts: List[np.ndarray]):

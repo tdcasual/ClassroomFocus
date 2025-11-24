@@ -6,6 +6,11 @@ const sidebar = document.getElementById('sidebar');
 const btnStart = document.getElementById('btnStart');
 const btnStop = document.getElementById('btnStop');
 const recStatus = document.getElementById('recStatus');
+const btnStats = document.getElementById('btnStats');
+const statsPanel = document.getElementById('statsPanel');
+const statsClose = document.getElementById('statsClose');
+const statsLinks = document.getElementById('statsLinks');
+const statsTableWrap = document.getElementById('statsTableWrap');
 
 let ws = null;
 let students = new Map(); // track_id -> {id, state, last_seen, img, history: [{ts, state}]}
@@ -43,8 +48,129 @@ function init() {
         try {
             const res = await fetch('/api/session/stop', {method: 'POST'});
             if(res.ok) setRecording(false);
+            // enable stats button when stopped
+            btnStats.style.display = 'inline-block';
         } catch(e) { console.error(e); }
     };
+
+    btnStats.onclick = async () => {
+        btnStats.disabled = true;
+        statsLinks.innerHTML = '<div>正在开始统计处理…</div>';
+        statsTableWrap.innerHTML = '';
+        statsPanel.style.display = 'block';
+        try {
+            const startRes = await fetch('/api/session/process', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
+            const j = await startRes.json();
+            if(!j.ok) {
+                statsLinks.innerHTML = `<div style="color:red;">处理失败: ${j.error || 'unknown'}</div>`;
+                btnStats.disabled = false;
+                return;
+            }
+            const job = j.job_id;
+            statsLinks.innerHTML = `<div>任务已提交，job=${job}。处理中，请稍候…</div>`;
+            // poll
+            let done = false;
+            let result = null;
+            for(let i=0;i<120;i++){
+                await new Promise(r=>setTimeout(r, 1000));
+                try{
+                    const st = await fetch(`/api/session/process/status?job_id=${job}`);
+                    const sj = await st.json();
+                    if(sj.ok && sj.job){
+                        const stt = sj.job.status;
+                        if(stt === 'done'){
+                            done = true;
+                            result = sj.job.result;
+                            break;
+                        } else if(stt === 'error'){
+                            statsLinks.innerHTML = `<div style="color:red;">处理出错: ${sj.job.error}</div>`;
+                            break;
+                        }
+                        // else still running
+                        statsLinks.innerHTML = `<div>处理中: ${stt} (轮询 ${i+1})</div>`;
+                    }
+                }catch(e){ console.warn(e); }
+            }
+            if(done && result){
+                // show links
+                let linksHtml = '<div style="margin-bottom:8px;"><strong>下载：</strong></div>';
+                if(result.video) linksHtml += `<div><a href="${result.video}" target="_blank">完整视频</a></div>`;
+                if(result.transcript) linksHtml += `<div><a href="${result.transcript}" target="_blank">完整文字转录</a></div>`;
+                if(result.stats) linksHtml += `<div><a href="${result.stats}" target="_blank">统计 JSON</a></div>`;
+                statsLinks.innerHTML = linksHtml;
+
+                // fetch stats json and render table
+                try{
+                    const sj = await fetch(result.stats);
+                    const data = await sj.json();
+                    renderStatsTable(data.per_student || {});
+                }catch(e){ statsTableWrap.innerHTML = `<div style="color:red">无法加载统计结果：${e}</div>`; }
+            } else {
+                statsLinks.innerHTML = `<div style="color:orange;">处理未在超时时间内完成，请稍后重试或查看服务器日志。</div>`;
+            }
+        } catch(e){
+            statsLinks.innerHTML = `<div style="color:red;">启动处理失败: ${e}</div>`;
+            console.error(e);
+        }
+        btnStats.disabled = false;
+    };
+
+    statsClose.onclick = () => { statsPanel.style.display = 'none'; };
+
+function renderStatsTable(per_student) {
+    statsTableWrap.innerHTML = '';
+    const keys = Object.keys(per_student).sort();
+    if(keys.length === 0){
+        statsTableWrap.innerHTML = '<div>没有检测到非-awake 状态。</div>';
+        return;
+    }
+    keys.forEach(sid => {
+        const info = per_student[sid];
+        const container = document.createElement('div');
+        container.style.borderTop = '1px solid #eee';
+        container.style.padding = '8px 0';
+        const title = document.createElement('div');
+        title.innerHTML = `<strong>Student ${sid}</strong>`;
+        container.appendChild(title);
+        const table = document.createElement('div');
+        table.style.fontSize = '13px';
+        if(!info.intervals || info.intervals.length === 0){
+            const none = document.createElement('div'); none.innerText = '没有检测到异常状态'; table.appendChild(none);
+        } else {
+            info.intervals.forEach(it => {
+                const row = document.createElement('div');
+                row.style.padding = '6px 0';
+                row.style.borderBottom = '1px dashed #f0f0f0';
+                const hdr = document.createElement('div');
+                hdr.innerHTML = `<em>${it.type}</em> — ${it.start.toFixed(2)}s → ${it.end.toFixed(2)}s`;
+                row.appendChild(hdr);
+                if(it.asr_text){
+                    const p = document.createElement('div');
+                    p.style.marginTop = '6px';
+                    p.style.whiteSpace = 'pre-wrap';
+                    p.innerHTML = `<strong>当时讲解:</strong> ${escapeHtml(it.asr_text)}`;
+                    row.appendChild(p);
+                }
+                if(it.knowledge_points && it.knowledge_points.length){
+                    const kp = document.createElement('div');
+                    kp.style.marginTop = '6px';
+                    kp.innerHTML = `<strong>知识点:</strong> <ul>${it.knowledge_points.map(k => `<li>${escapeHtml(k)}</li>`).join('')}</ul>`;
+                    row.appendChild(kp);
+                }
+                table.appendChild(row);
+            });
+        }
+        container.appendChild(table);
+        statsTableWrap.appendChild(container);
+    });
+}
+
+function escapeHtml(str){
+    if(!str) return '';
+    return String(str).replace(/[&<>"]+/g, function(s){
+        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[s];
+    });
+}
     
     // Check initial status
     fetch('/api/session/status').then(r=>r.json()).then(d => {
@@ -211,8 +337,7 @@ function createStudentCard(tid) {
     div.className = 'student-card';
     div.id = `student-${tid}`;
     div.innerHTML = `
-        <div class="student-img-wrap" style="width:40px;height:40px;background:#eee;border-radius:50%;overflow:hidden">
-            <img id="img-${tid}" style="width:100%;height:100%;object-fit:cover;display:none">
+        <div class="student-img-wrap" style="width:40px;height:40px;background:#eee;border-radius:50%;overflow:hidden; display:none">
         </div>
         <div class="student-info">
             <div>ID: ${tid}</div>

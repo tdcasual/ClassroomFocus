@@ -35,6 +35,7 @@
       <div id="toolbar">
         <button id="btnStart">Start Recording</button>
         <button id="btnStop" disabled>Stop Recording</button>
+        <button id="btnStats" style="display:none; margin-left:8px;">统计</button>
         <span>Window: <select id="windowSel"><option>30</option><option selected>60</option><option>120</option></select>s</span>
         <span style="flex:1"></span>
         <span id="status">disconnected</span>
@@ -47,6 +48,16 @@
         <div id="canvasWrap">
           <div id="previewWrap" style="height: calc(100% - 180px);">
             <canvas id="preview" style="width:100%; height:100%; display:block; background:#000"></canvas>
+            <div id="statsPanel" style="position:absolute; right:12px; top:12px; width:360px; max-height:80%; background:#fff; border:1px solid #ddd; box-shadow:0 6px 18px rgba(0,0,0,0.12); display:none; z-index:50; overflow:auto;">
+              <div style="display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border-bottom:1px solid #eee;">
+                <strong>统计结果</strong>
+                <div>
+                  <button id="statsClose" style="margin-right:8px;">关闭</button>
+                </div>
+              </div>
+              <div id="statsLinks" style="padding:8px 10px; font-size:13px;"></div>
+              <div id="statsTableWrap" style="padding:8px 10px;"></div>
+            </div>
           </div>
           <div id="timelineWrap" style="height:180px; border-top:1px solid #eee;">
             <canvas id="timeline" style="width:100%; height:100%; display:block"></canvas>

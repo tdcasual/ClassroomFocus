@@ -1,20 +1,38 @@
 import asyncio
 import json
+import base64
+import os
 from typing import List
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+# Import SessionManager
+import sys
+PROJ_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJ_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJ_ROOT))
+from tools.session_manager import SessionManager
 
 app = FastAPI()
 
 # serve frontend static files from /static
 app.mount("/static", StaticFiles(directory="web"), name="static")
+# serve output files (videos, images)
+Path("out").mkdir(exist_ok=True)
+app.mount("/out", StaticFiles(directory="out"), name="out")
 
 # in-memory queue of events
 event_queue: asyncio.Queue = asyncio.Queue()
 
-# simple runtime stats
+# Session Manager Instance
+# Hardcoded ffmpeg path for now based on user context
+FFMPEG_PATH = r"C:\Users\HP\Downloads\ffmpeg\bin\ffmpeg.exe"
+session_mgr = SessionManager(ffmpeg_path=FFMPEG_PATH)
+
+# runtime stats
 stats = {
     'received': 0,
     'batches_broadcast': 0,
@@ -22,16 +40,6 @@ stats = {
 }
 
 
-async def stats_logger():
-    """Periodically log server stats for debugging/observability."""
-    while True:
-        try:
-            print(f"[web_viz_server] stats received={stats['received']} batches_broadcast={stats['batches_broadcast']} last_batch_size={stats['last_batch_size']}")
-        except Exception:
-            pass
-        await asyncio.sleep(2.0)
-
-# set of active websocket connections
 class ConnectionManager:
     def __init__(self):
         self.active: List[WebSocket] = []
@@ -52,6 +60,7 @@ class ConnectionManager:
             coros.append(ws.send_text(message))
         if coros:
             await asyncio.gather(*coros, return_exceptions=True)
+
 
 manager = ConnectionManager()
 
@@ -86,12 +95,62 @@ async def broadcaster_task():
         await asyncio.sleep(BATCH_INTERVAL)
 
 
+async def stats_logger():
+    while True:
+        try:
+            print(f"[web_viz_server] stats received={stats['received']} batches_broadcast={stats['batches_broadcast']} last_batch_size={stats['last_batch_size']}")
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+
+
+# Global loop reference
+main_loop = None
+
+
 @app.on_event("startup")
 async def startup():
-    # start background broadcaster
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
+    # Configure session manager callback
+    def callback_wrapper(data, img_bytes):
+        if main_loop:
+            if img_bytes:
+                data['image_base64'] = base64.b64encode(img_bytes).decode('utf-8')
+            main_loop.call_soon_threadsafe(event_queue.put_nowait, data)
+
+    session_mgr.set_callback(callback_wrapper)
+
+    # start background tasks
     asyncio.create_task(broadcaster_task())
-    # start stats logger
     asyncio.create_task(stats_logger())
+
+
+@app.post("/api/session/start")
+async def start_session():
+    try:
+        sid = session_mgr.start(output_dir_base="out")
+        return {"ok": True, "session_id": sid}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/session/stop")
+async def stop_session():
+    try:
+        path = session_mgr.stop()
+        return {"ok": True, "path": path}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/session/status")
+async def session_status():
+    return {
+        "is_recording": session_mgr.is_recording,
+        "session_id": session_mgr.session_id
+    }
 
 
 @app.post("/push")
@@ -106,7 +165,6 @@ async def push(request: Request):
 
     events = data if isinstance(data, list) else [data]
     for e in events:
-        # ensure timestamp
         if isinstance(e, dict) and "ts" not in e:
             e["ts"] = asyncio.get_event_loop().time()
         await event_queue.put(e)

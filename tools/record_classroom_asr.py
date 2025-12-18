@@ -178,7 +178,7 @@ if __name__ == '__main__':
 Usage:
   - Ensure `.env` contains DASHSCOPE_API_KEY (or pass key as first arg).
   - Run:
-      .venv\Scripts\python.exe tools\record_classroom_asr.py [api_key] [duration_seconds]
+      .venv\\Scripts\\python.exe tools\\record_classroom_asr.py [api_key] [duration_seconds]
 
 Notes:
   - This script starts `AliASRClient` to stream audio to DashScope and

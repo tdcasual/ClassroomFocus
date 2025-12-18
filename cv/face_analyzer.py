@@ -1,16 +1,27 @@
 # cv/face_analyzer.py
 # -*- coding: utf-8 -*-
 """Face analysis: EAR-based drowsiness, pitch-based looking-down detection, simple multi-face tracking."""
+from __future__ import annotations
+
 import time
 import threading
 import queue
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import cv2
-import mediapipe as mp
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover
+    mp = None
 import numpy as np
-import requests
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None
 
 # FaceMesh landmark indices for eye geometry
 LEFT_EYE_H = (33, 133)
@@ -98,12 +109,26 @@ class FaceAnalyzerConfig:
     match_max_px: float = 80.0
     # allowed extra pixels per second of absence when matching (time-aware slack)
     match_speed_px_per_sec: float = 200.0
+    # Cap how much time contributes to the matching slack (prevents huge gates
+    # after long occlusions; prefer creating a new track over wrong re-attach).
+    match_slack_max_secs: float = 0.8
     max_miss_count: int = 10
+    # Hard cap for how long we keep a track without seeing it (seconds).
+    # Useful when FPS varies (miss_count is frame-rate dependent).
+    max_miss_secs: float = 3.0
     # Optional stabilization against camera motion (pan/tilt).
     # When enabled, we estimate a global translation between the previous tracks
     # and current detections and compensate before matching.
     compensate_camera_shift: bool = True
     camera_shift_max_px: float = 600.0
+    # Also compensate rotation/zoom (similarity transform) when enough faces are
+    # present. This is a cheap alternative to running a face-recognition model
+    # when you only need stable IDs within one session.
+    compensate_camera_similarity: bool = True
+    camera_rot_max_deg: float = 18.0
+    camera_scale_max: float = 1.25
+    camera_icp_iters: int = 2
+    camera_icp_inlier_px: float = 120.0
 
     debug_draw: bool = False
 
@@ -113,17 +138,24 @@ class FaceAnalyzer:
 
     def __init__(self, cfg: FaceAnalyzerConfig = FaceAnalyzerConfig()):
         self.cfg = cfg
-        self._mp = mp.solutions.face_mesh
-        self._mesh = self._mp.FaceMesh(
-            max_num_faces=cfg.max_faces,
-            refine_landmarks=cfg.refine_landmarks,
-            min_detection_confidence=cfg.min_det_conf,
-            min_tracking_confidence=cfg.min_trk_conf,
-        )
+        self._mesh = None
+        if mp is not None:
+            try:
+                self._mp = mp.solutions.face_mesh
+                self._mesh = self._mp.FaceMesh(
+                    max_num_faces=cfg.max_faces,
+                    refine_landmarks=cfg.refine_landmarks,
+                    min_detection_confidence=cfg.min_det_conf,
+                    min_tracking_confidence=cfg.min_trk_conf,
+                )
+            except Exception:
+                self._mesh = None
         self.tracks: Dict[int, TrackState] = {}
         self._next_id: int = 0
 
     def analyze_frame(self, frame_bgr: np.ndarray, timestamp: float):
+        if cv2 is None or self._mesh is None:
+            return [], []
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self._mesh.process(rgb)
@@ -307,7 +339,13 @@ class FaceAnalyzer:
         for tid, st in list(self.tracks.items()):
             if tid not in used_ids:
                 st.miss_count += 1
-                if st.miss_count > self.cfg.max_miss_count:
+                too_old = False
+                if st.last_ts is not None:
+                    try:
+                        too_old = (timestamp - float(st.last_ts)) > float(getattr(self.cfg, "max_miss_secs", 3.0))
+                    except Exception:
+                        too_old = False
+                if st.miss_count > self.cfg.max_miss_count or too_old:
                     if st.drowsy_active:
                         events.append({
                             "ts": st.last_ts if st.last_ts else 0.0,
@@ -330,6 +368,8 @@ class FaceAnalyzer:
         return results, events
 
     def _compute_pitch(self, pts2d: np.ndarray, W: int, H: int) -> Optional[float]:
+        if cv2 is None:
+            return None
         try:
             image_points = np.array([pts2d[i] for i in PNP_IDXS], dtype=np.float32)
             f = 1.2 * W
@@ -377,16 +417,181 @@ class FaceAnalyzer:
             vx = (st.center[0] - st.prev_center[0]) / dt_hist
             vy = (st.center[1] - st.prev_center[1]) / dt_hist
             dt_fwd = max(0.0, float(timestamp - st.last_ts))
+            dt_fwd = min(dt_fwd, float(getattr(self.cfg, "match_slack_max_secs", 0.8)))
             return (st.center[0] + vx * dt_fwd, st.center[1] + vy * dt_fwd)
 
         pred = {tid: _predict_center(self.tracks[tid]) for tid in track_ids}
 
-        # Optional: compensate a global camera translation (pan/tilt) using a
-        # robust median of nearest-neighbor deltas.
-        if getattr(self.cfg, "compensate_camera_shift", True) and len(track_ids) >= 2 and len(centers) >= 2:
+        def _estimate_similarity_umeyama(src: np.ndarray, dst: np.ndarray):
+            """Estimate 2D similarity transform dst ~= s * R * src + t.
+
+            Returns (s, R(2x2), t(2,)) or None.
+            """
+            if src.shape[0] < 2 or dst.shape[0] < 2:
+                return None
+            src = src.astype(np.float64)
+            dst = dst.astype(np.float64)
+            mu_src = np.mean(src, axis=0)
+            mu_dst = np.mean(dst, axis=0)
+            src_c = src - mu_src
+            dst_c = dst - mu_dst
+            var_src = float(np.mean(np.sum(src_c ** 2, axis=1)))
+            if var_src <= 1e-9:
+                return None
+            cov = (dst_c.T @ src_c) / float(src.shape[0])
+            try:
+                U, S, Vt = np.linalg.svd(cov)
+            except Exception:
+                return None
+            R = U @ Vt
+            if np.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vt
+            scale = float(np.sum(S) / var_src)
+            if not np.isfinite(scale) or scale <= 0:
+                return None
+            t = mu_dst - scale * (R @ mu_src)
+            return scale, R, t
+
+        def _apply_similarity_to_point(p: Tuple[float, float], scale: float, R: np.ndarray, t: np.ndarray) -> Tuple[float, float]:
+            x = np.array([float(p[0]), float(p[1])], dtype=np.float64)
+            y = scale * (R @ x) + t
+            return float(y[0]), float(y[1])
+
+        def _try_camera_similarity_compensation() -> None:
+            """Mutate `pred` in-place by applying a global similarity transform.
+
+            Uses an ICP-like 1-2 iteration closest matching between detections and
+            predicted tracks, then estimates a similarity transform (rotation+scale+translation).
+            """
+            if not getattr(self.cfg, "compensate_camera_similarity", True):
+                return
+            if len(track_ids) < 2 or len(centers) < 2:
+                return
+
+            # Start from current predicted positions
+            pred_pts = np.array([pred[tid] for tid in track_ids], dtype=np.float64)  # (T,2)
+            det_pts = np.array(centers, dtype=np.float64)  # (D,2)
+
+            # Iteratively re-match and re-estimate transform.
+            scale_acc = 1.0
+            R_acc = np.eye(2, dtype=np.float64)
+            t_acc = np.zeros(2, dtype=np.float64)
+
+            iters = int(getattr(self.cfg, "camera_icp_iters", 2))
+            inlier_px = float(getattr(self.cfg, "camera_icp_inlier_px", 120.0))
+            max_scale = float(getattr(self.cfg, "camera_scale_max", 1.25))
+            max_rot = float(getattr(self.cfg, "camera_rot_max_deg", 18.0))
+
+            for _ in range(max(0, iters)):
+                # transformed predicted points
+                pred_t = (scale_acc * (pred_pts @ R_acc.T)) + t_acc  # (T,2)
+
+                # Greedy unique matching (closest pairs) for correspondence proposal.
+                candidates = []
+                for di in range(det_pts.shape[0]):
+                    for ti in range(pred_t.shape[0]):
+                        d = float(np.hypot(det_pts[di, 0] - pred_t[ti, 0], det_pts[di, 1] - pred_t[ti, 1]))
+                        candidates.append((d, di, ti))
+                candidates.sort(key=lambda x: x[0])
+                used_d = set()
+                used_t = set()
+                pairs = []
+                for d, di, ti in candidates:
+                    if di in used_d or ti in used_t:
+                        continue
+                    used_d.add(di)
+                    used_t.add(ti)
+                    pairs.append((di, ti, d))
+                    if len(used_d) >= min(det_pts.shape[0], pred_t.shape[0]):
+                        break
+
+                if len(pairs) < 2:
+                    return
+
+                src = np.array([pred_t[ti] for (_, ti, _) in pairs], dtype=np.float64)
+                dst = np.array([det_pts[di] for (di, _, _) in pairs], dtype=np.float64)
+
+                est = _estimate_similarity_umeyama(src, dst)
+                if not est:
+                    return
+                s, R, t = est
+
+                # Quick sanity checks (per-step bounds).
+                angle = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+                if abs(angle) > max_rot:
+                    return
+                if s < (1.0 / max_scale) or s > max_scale:
+                    return
+
+                # Inlier refinement
+                pred_m = (s * (src @ R.T)) + t
+                residuals = np.hypot(pred_m[:, 0] - dst[:, 0], pred_m[:, 1] - dst[:, 1])
+                inliers = residuals <= inlier_px
+                if np.sum(inliers) >= 2 and np.sum(inliers) < len(pairs):
+                    est2 = _estimate_similarity_umeyama(src[inliers], dst[inliers])
+                    if est2:
+                        s, R, t = est2
+                        angle = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+                        if abs(angle) > max_rot or s < (1.0 / max_scale) or s > max_scale:
+                            return
+                        pred_m = (s * (src[inliers] @ R.T)) + t
+                        src_use = src[inliers]
+                    else:
+                        src_use = src
+                else:
+                    src_use = src
+
+                # Reject wildly large motion (typically caused by wrong correspondences).
+                max_shift = float(getattr(self.cfg, "camera_shift_max_px", 600.0))
+                disp = np.hypot(pred_m[:, 0] - src_use[:, 0], pred_m[:, 1] - src_use[:, 1])
+                if disp.size:
+                    med_disp = float(np.median(disp))
+                    if med_disp > max_shift:
+                        return
+
+                # Compose delta into accumulator: new = (s*R)*old + t
+                scale_acc = float(s) * scale_acc
+                R_acc = R @ R_acc
+                t_acc = (float(s) * (R @ t_acc)) + t
+                # Overall per-frame bounds
+                if scale_acc < (1.0 / max_scale) or scale_acc > max_scale:
+                    return
+                ang_acc = float(np.degrees(np.arctan2(R_acc[1, 0], R_acc[0, 0])))
+                if abs(ang_acc) > max_rot:
+                    return
+
+            # Apply accumulated transform to all predicted track positions.
+            for tid in track_ids:
+                pred[tid] = _apply_similarity_to_point(pred[tid], scale_acc, R_acc, t_acc)
+
+        # Optional: compensate a global camera translation or similarity motion.
+        #
+        # - Multi-face case (>=2): estimate shift by robust median of
+        #   nearest-neighbor deltas.
+        # - Single-face case (1 track, 1 detection): allow shift only when the
+        #   track was continuously present (miss_count==0), otherwise it's too
+        #   ambiguous and may cause wrong re-attachment.
+        if getattr(self.cfg, "compensate_camera_shift", True) and len(track_ids) == 1 and len(centers) == 1:
+            tid = track_ids[0]
+            st = self.tracks[tid]
+            if getattr(st, "miss_count", 0) == 0:
+                c = centers[0]
+                pc = pred[tid]
+                dx = float(c[0] - pc[0])
+                dy = float(c[1] - pc[1])
+                shift = float(np.hypot(dx, dy))
+                max_shift = float(getattr(self.cfg, "camera_shift_max_px", 600.0))
+                if shift > max_shift and shift > 1e-6:
+                    scale = max_shift / shift
+                    dx *= scale
+                    dy *= scale
+                pred[tid] = (pc[0] + dx, pc[1] + dy)
+        elif getattr(self.cfg, "compensate_camera_shift", True) and len(track_ids) >= 2 and len(centers) >= 2:
+            # First do a cheap translation estimate (helps ICP initialize well).
             deltas = []
             for c in centers:
-                best_tid, best_d = None, 1e9
+                best_tid, best_d = None, 1e18
                 for tid in track_ids:
                     pc = pred[tid]
                     d = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
@@ -401,12 +606,15 @@ class FaceAnalyzer:
                 shift = float(np.hypot(dx, dy))
                 max_shift = float(getattr(self.cfg, "camera_shift_max_px", 600.0))
                 if shift > max_shift and shift > 1e-6:
-                    scale = max_shift / shift
-                    dx *= scale
-                    dy *= scale
+                    scl = max_shift / shift
+                    dx *= scl
+                    dy *= scl
                 for tid in track_ids:
                     pc = pred[tid]
                     pred[tid] = (pc[0] + dx, pc[1] + dy)
+
+            # Then attempt similarity compensation (rotation + zoom + translation).
+            _try_camera_similarity_compensation()
 
         # Build all candidate pairs and do a global greedy assignment by distance.
         candidates: List[Tuple[float, int, int]] = []  # (dist, det_i, tid)
@@ -424,7 +632,8 @@ class FaceAnalyzer:
                 continue
             st = self.tracks[tid]
             dt = max(0.0, float(timestamp - (st.last_ts or timestamp)))
-            slack = dt * float(getattr(self.cfg, "match_speed_px_per_sec", 0.0))
+            dt_cap = float(getattr(self.cfg, "match_slack_max_secs", 0.8))
+            slack = min(dt, dt_cap) * float(getattr(self.cfg, "match_speed_px_per_sec", 0.0))
             threshold = float(self.cfg.match_max_px) + slack
             if d <= threshold:
                 assign[i] = tid
@@ -552,7 +761,8 @@ class _Poster:
 
             payload = {"type": "batch", "events": batch}
             try:
-                requests.post(self.url, json=payload, timeout=3)
+                if requests is not None:
+                    requests.post(self.url, json=payload, timeout=3)
             except Exception:
                 pass
 
@@ -564,6 +774,8 @@ class _Poster:
 
 def open_camera(index: int = 0, width: int = 640, height: int = 480, backend: Optional[int] = None) -> cv2.VideoCapture:
     """Open and configure a camera, returning the cv2.VideoCapture instance."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV (cv2) is not available.")
     cap = cv2.VideoCapture(index) if backend is None else cv2.VideoCapture(index, backend)
     if not cap.isOpened():
         return cap

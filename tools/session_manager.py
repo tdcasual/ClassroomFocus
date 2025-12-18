@@ -35,9 +35,13 @@ class SessionManager:
         
         self.video_thread = None
         self.audio_thread = None
+        self.session_start_wall = None
+        self.video_start_wall = None
+        self.audio_start_wall = None
         
         self.face_analyzer = None
         self.on_data_callback = None # Function to call with frame data for web viz
+        self.audio_error = None
         
         # Audio buffer
         self.audio_queue = Queue()
@@ -60,6 +64,10 @@ class SessionManager:
 
         self.stop_event.clear()
         self.is_recording = True
+        self.audio_error = None
+        self.session_start_wall = time.time()
+        self.video_start_wall = None
+        self.audio_start_wall = None
         
         # Initialize FaceAnalyzer
         cfg = FaceAnalyzerConfig() # Use defaults or allow tuning
@@ -86,6 +94,30 @@ class SessionManager:
             self.video_thread.join()
         if self.audio_thread:
             self.audio_thread.join()
+
+        # Persist sync metadata to align CV timestamps with audio/ASR timestamps.
+        try:
+            if self.output_dir:
+                sync = {
+                    "session_start_wall": float(self.session_start_wall) if self.session_start_wall else None,
+                    "video_start_wall": float(self.video_start_wall) if self.video_start_wall else None,
+                    "audio_start_wall": float(self.audio_start_wall) if self.audio_start_wall else None,
+                    "audio_offset_sec": (float(self.audio_start_wall) - float(self.session_start_wall)) if (self.audio_start_wall and self.session_start_wall) else 0.0,
+                    "video_offset_sec": (float(self.video_start_wall) - float(self.session_start_wall)) if (self.video_start_wall and self.session_start_wall) else 0.0,
+                    "sample_rate": int(self.sample_rate),
+                    "channels": int(self.channels),
+                }
+                with open(self.output_dir / "sync.json", "w", encoding="utf-8") as fh:
+                    json.dump(sync, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        # Ensure we actually captured audio for the whole session.
+        audio_path = (self.output_dir / "temp_audio.wav") if self.output_dir else None
+        if self.audio_error:
+            raise RuntimeError(f"Audio recording failed: {self.audio_error}")
+        if audio_path and (not audio_path.exists() or audio_path.stat().st_size <= 0):
+            raise RuntimeError("Audio recording output is missing/empty (temp_audio.wav).")
             
         # Post-processing: Mux video and audio
         self._mux_files()
@@ -94,6 +126,8 @@ class SessionManager:
         return str(self.output_dir)
 
     def _video_loop(self):
+        if self.video_start_wall is None:
+            self.video_start_wall = time.time()
         cap = cv2.VideoCapture(self.camera_index)
         if not cap.isOpened():
             logger.error("Could not open camera")
@@ -114,7 +148,7 @@ class SessionManager:
         events_path = self.output_dir / "cv_events.jsonl"
         
         frame_idx = 0
-        start_time = time.time()
+        start_time = self.session_start_wall or time.time()
         last_preview_ts = -1e9
         preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))  # ~6-7 fps by default
 
@@ -142,7 +176,8 @@ class SessionManager:
                     # For now, let's just pass the data to callback
                 
                 for e in events:
-                    e['ts'] = ts
+                    if 'ts' not in e or e['ts'] is None:
+                        e['ts'] = ts
                     f_events.write(json.dumps(e, ensure_ascii=False) + "\n")
 
                 # Write video
@@ -187,13 +222,23 @@ class SessionManager:
                     dtype="int16",
                     callback=self._audio_callback,
                 ):
+                    if self.audio_start_wall is None:
+                        self.audio_start_wall = time.time()
                     while not self.stop_event.is_set():
                         try:
                             block = self.audio_queue.get(timeout=0.2)
                         except Empty:
                             continue
                         file.write(block)
+                    # Drain any remaining buffered audio frames.
+                    while True:
+                        try:
+                            block = self.audio_queue.get_nowait()
+                        except Empty:
+                            break
+                        file.write(block)
         except Exception as e:
+            self.audio_error = str(e)
             logger.error(f"Audio recording failed: {e}")
 
     def _audio_callback(self, indata, frames, time, status):

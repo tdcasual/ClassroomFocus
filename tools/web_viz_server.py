@@ -4,6 +4,8 @@ import base64
 import os
 import time
 import re
+import tempfile
+import shutil
 from typing import List
 from pathlib import Path
 
@@ -18,6 +20,7 @@ PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 from tools.session_manager import SessionManager
+from tools.openai_compat import OpenAICompat
 
 app = FastAPI()
 
@@ -36,12 +39,6 @@ session_mgr = SessionManager(ffmpeg_path=FFMPEG_PATH)
 
 # Processing state for background jobs
 _proc_jobs = {}
-
-try:
-    import openai
-    _have_openai = True
-except Exception:
-    _have_openai = False
 # runtime stats
 stats = {
     'received': 0,
@@ -204,33 +201,34 @@ def _read_jsonl(path):
 
 
 def _summarize_text(text: str, max_points: int = 6):
-    """Attempt to summarize text into knowledge points using OpenAI if available,
-    otherwise fall back to simple keyword extraction."""
+    """Summarize text into knowledge points.
+
+    Uses an OpenAI-compatible LLM when configured, otherwise falls back to
+    lightweight extraction.
+    """
     if not text or text.strip() == "":
         return []
-    if _have_openai and os.getenv('OPENAI_API_KEY'):
+    # Keep LLM prompt bounded for long intervals.
+    max_chars = int(os.getenv("INTERVAL_LLM_MAX_CHARS", "6000"))
+    if len(text) > max_chars:
+        half = max(500, max_chars // 2)
+        text = text[:half].rstrip() + "\n...\n" + text[-half:].lstrip()
+    llm = OpenAICompat.from_env()
+    if llm:
         try:
-            openai.api_key = os.getenv('OPENAI_API_KEY')
-            prompt = (
-                "Extract up to {} concise knowledge points from the following classroom transcript. "
-                "Return a JSON array of short strings, each a single knowledge point.\n\n".format(max_points)
-            ) + text
-            resp = openai.ChatCompletion.create(
-                model=os.getenv('OPENAI_MODEL', 'gpt-3.5-turbo'),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
-                temperature=0.2,
-            )
-            content = resp['choices'][0]['message']['content']
-            # Try to parse JSON array from response
-            try:
-                pts = json.loads(content)
-                if isinstance(pts, list):
-                    return [str(p).strip() for p in pts if p]
-            except Exception:
-                # Fallback: split by lines and return top lines
-                lines = [l.strip('-* \t') for l in content.splitlines() if l.strip()]
-                return lines[:max_points]
+            messages = [
+                {"role": "system", "content": "你从课堂讲解中提炼知识点。只输出 JSON 数组（字符串数组），不要输出任何额外文字。"},
+                {"role": "user", "content": f"从下面转录内容中提炼最多 {int(max_points)} 条知识点（尽量中文、短语化、去重）：\n\n{text}"},
+            ]
+            pts = llm.generate_json_array(messages=messages, max_tokens=500, temperature=0.2)
+            out = []
+            for p in pts:
+                if not p:
+                    continue
+                s = str(p).strip()
+                if s:
+                    out.append(s)
+            return out[:max_points]
         except Exception:
             pass
 
@@ -265,6 +263,219 @@ def _summarize_text(text: str, max_points: int = 6):
     return [w for w, _ in items]
 
 
+def _chunk_asr_segments(asr_segments: List[dict], chunk_secs: float) -> List[dict]:
+    """Group ASR segments into coarse time buckets for lesson topic summarization."""
+    chunk_secs = max(30.0, float(chunk_secs))
+    chunks = []
+    cur = None
+    for seg in asr_segments:
+        if not isinstance(seg, dict):
+            continue
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start + 1.0))
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        if cur is None:
+            cur = {"start": start, "end": end, "texts": [text]}
+            continue
+        if (end - cur["start"]) > chunk_secs and cur["texts"]:
+            chunks.append({"start": float(cur["start"]), "end": float(cur["end"]), "text": "\n".join(cur["texts"]).strip()})
+            cur = {"start": start, "end": end, "texts": [text]}
+            continue
+        cur["end"] = max(float(cur["end"]), end)
+        cur["texts"].append(text)
+    if cur and cur.get("texts"):
+        chunks.append({"start": float(cur["start"]), "end": float(cur["end"]), "text": "\n".join(cur["texts"]).strip()})
+    return chunks
+
+
+def _llm_summarize_lesson(asr_segments: List[dict]) -> dict:
+    """Summarize the whole lesson and produce a timeline of topics."""
+    llm = OpenAICompat.from_env()
+    if not llm:
+        return {}
+    chunk_secs = float(os.getenv("SUMMARY_CHUNK_SECONDS", "180"))
+    chunks = _chunk_asr_segments(asr_segments, chunk_secs=chunk_secs)
+    if not chunks:
+        return {}
+
+    timeline = []
+    for ch in chunks:
+        messages = [
+            {"role": "system", "content": "你要总结课堂讲解内容。只输出 JSON 对象，不要输出任何额外文字。"},
+            {
+                "role": "user",
+                "content": (
+                    "根据下面这一段课堂转录，提取：\n"
+                    "- topic：该时间段主题（短标题）\n"
+                    "- summary：2-3 句话总结\n"
+                    "- key_points：3-6 条知识点（短语化，去重）\n\n"
+                    "只返回 JSON，字段为：topic, summary, key_points。\n\n"
+                    f"[时间 {ch['start']:.2f}s - {ch['end']:.2f}s]\n{ch['text']}"
+                ),
+            },
+        ]
+        try:
+            obj = llm.generate_json_object(messages=messages, max_tokens=700, temperature=0.2)
+        except Exception:
+            obj = {}
+        timeline.append({
+            "start": float(ch["start"]),
+            "end": float(ch["end"]),
+            "topic": str(obj.get("topic", "")).strip() if isinstance(obj, dict) else "",
+            "summary": str(obj.get("summary", "")).strip() if isinstance(obj, dict) else "",
+            "key_points": [str(x).strip() for x in (obj.get("key_points") or [])] if isinstance(obj, dict) else [],
+        })
+
+    # Merge timeline summaries into an overall lesson summary.
+    compact = []
+    for t in timeline:
+        compact.append({
+            "start": t["start"],
+            "end": t["end"],
+            "topic": t["topic"],
+            "key_points": t["key_points"][:6],
+            "summary": t["summary"],
+        })
+    messages = [
+        {"role": "system", "content": "你要生成用于课堂专注度分析的课程结构化总结。只输出 JSON 对象，不要输出任何额外文字。"},
+        {
+            "role": "user",
+            "content": (
+                "根据下面按时间分段的总结，生成整节课的总结。\n"
+                "只返回 JSON，字段为：\n"
+                "- title：课程标题\n"
+                "- overview：3-6 句概览\n"
+                "- key_points：6-12 条关键要点（短语化）\n"
+                "- outline：大纲（章节标题数组）\n"
+                "要求中文。\n\n"
+                + json.dumps(compact, ensure_ascii=False)
+            ),
+        },
+    ]
+    try:
+        overall = llm.generate_json_object(messages=messages, max_tokens=900, temperature=0.2)
+    except Exception:
+        overall = {}
+
+    out = {
+        "title": str(overall.get("title", "")).strip() if isinstance(overall, dict) else "",
+        "overview": str(overall.get("overview", "")).strip() if isinstance(overall, dict) else "",
+        "key_points": [str(x).strip() for x in (overall.get("key_points") or [])] if isinstance(overall, dict) else [],
+        "outline": [str(x).strip() for x in (overall.get("outline") or [])] if isinstance(overall, dict) else [],
+        "timeline": timeline,
+    }
+    return out
+
+
+def _transcribe_audio_to_segments(session_dir: Path, job_id: str) -> List[dict]:
+    """Ensure `asr.jsonl` exists by transcribing the full-session WAV.
+
+    Returns normalized ASR segments: [{start,end,text,raw}, ...]
+    """
+    wav_in = session_dir / "temp_audio.wav"
+    if not wav_in.exists() or wav_in.stat().st_size <= 0:
+        raise RuntimeError(f"audio file missing or empty: {wav_in}")
+
+    # Align audio timeline to CV timeline (both relative to session start).
+    sync_offset = 0.0
+    try:
+        sync_path = session_dir / "sync.json"
+        if sync_path.exists():
+            with open(sync_path, "r", encoding="utf-8") as fh:
+                sync = json.load(fh)
+            sync_offset = float(sync.get("audio_offset_sec", 0.0) or 0.0)
+    except Exception:
+        sync_offset = 0.0
+
+    # If already have ASR, just load it (do not re-transcribe).
+    asr_path = session_dir / "asr.jsonl"
+    if asr_path.exists() and asr_path.stat().st_size > 0:
+        try:
+            from analysis.teacher_labeler import load_asr_jsonl
+            return load_asr_jsonl(str(asr_path))
+        except Exception:
+            return _read_jsonl(asr_path)
+
+    llm = OpenAICompat.from_env()
+    if not llm:
+        raise RuntimeError("OPENAI_API_KEY not set: cannot transcribe audio to text.")
+
+    import soundfile as sf
+
+    # Segment audio to avoid provider size limits.
+    chunk_sec = float(os.getenv("ASR_CHUNK_SECONDS", "60"))
+    chunk_sec = max(15.0, min(300.0, chunk_sec))
+    keep_chunks = os.getenv("KEEP_ASR_CHUNKS", "0").lower() in ("1", "true", "yes")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="asr_chunks_", dir=str(session_dir)))
+    segments_out: List[dict] = []
+    offset = 0.0
+    idx = 0
+    try:
+        with sf.SoundFile(str(wav_in), "r") as f:
+            sr = int(f.samplerate)
+            ch = int(f.channels)
+            frames_per_chunk = int(sr * chunk_sec)
+            while True:
+                data = f.read(frames_per_chunk, dtype="int16", always_2d=True)
+                if data is None or len(data) == 0:
+                    break
+                dur = float(len(data) / max(1, sr))
+                # Ensure mono (most ASR endpoints assume mono).
+                if ch > 1:
+                    data = data[:, 0:1]
+                chunk_path = tmp_dir / f"chunk_{idx:04d}.wav"
+                sf.write(str(chunk_path), data, sr, subtype="PCM_16")
+                _proc_jobs[job_id]["status"] = f"running:asr chunk {idx} ({offset:.0f}s)"
+
+                try:
+                    resp = llm.transcribe_audio(str(chunk_path), response_format="verbose_json")
+                except Exception as exc:
+                    raise RuntimeError(f"audio transcription failed at chunk {idx}: {exc}") from exc
+
+                if isinstance(resp, dict) and isinstance(resp.get("segments"), list):
+                    for s in resp["segments"]:
+                        if not isinstance(s, dict):
+                            continue
+                        local_start = float(s.get("start", 0.0))
+                        local_end = float(s.get("end", local_start + 1.0))
+                        st = local_start + offset + sync_offset
+                        en = local_end + offset + sync_offset
+                        txt = str(s.get("text", "")).strip()
+                        if not txt:
+                            continue
+                        segments_out.append({"start": st, "end": max(en, st + 0.2), "text": txt, "raw": s})
+                else:
+                    txt = ""
+                    if isinstance(resp, dict) and isinstance(resp.get("text"), str):
+                        txt = resp.get("text") or ""
+                    elif isinstance(resp, str):
+                        txt = resp
+                    txt = str(txt).strip()
+                    if txt:
+                        segments_out.append({"start": offset + sync_offset, "end": offset + sync_offset + max(0.2, dur), "text": txt, "raw": resp})
+
+                offset += dur
+                idx += 1
+    finally:
+        if not keep_chunks:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    segments_out.sort(key=lambda s: float(s.get("start", 0.0)))
+    try:
+        with open(asr_path, "w", encoding="utf-8") as fh:
+            for s in segments_out:
+                fh.write(json.dumps(s, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return segments_out
+
+
 @app.post('/api/session/process')
 async def process_session(request: Request, background_tasks: BackgroundTasks):
     """Process the last session outputs: produce transcript, stats and knowledge points.
@@ -292,145 +503,29 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             video_candidates = list(session_dir.glob('session.mp4')) + list(session_dir.glob('*.mp4')) + list(session_dir.glob('temp_video.avi'))
             video_path = video_candidates[0] if video_candidates else None
 
-            def _as_text(obj) -> str:
-                if obj is None:
-                    return ""
-                if isinstance(obj, str):
-                    return obj.strip()
-                if isinstance(obj, dict):
-                    if obj.get("text"):
-                        return str(obj.get("text")).strip()
-                    words = obj.get("words")
-                    if isinstance(words, list):
-                        return "".join(str(w.get("text", "")) for w in words).strip()
-                return str(obj).strip()
-
-            def _maybe_generate_asr_from_audio() -> None:
-                """Optional: if `asr.jsonl` is missing but we have `temp_audio.wav`,
-                try to run DashScope file transcription to produce ASR segments.
-                """
-                asr_path = session_dir / "asr.jsonl"
-                if asr_path.exists():
-                    return
-                wav_in = session_dir / "temp_audio.wav"
-                if not wav_in.exists():
-                    return
-
-                # Map DASH_SCOPE_API_KEY -> DASHSCOPE_API_KEY for compatibility
-                if os.getenv("DASH_SCOPE_API_KEY") and not os.getenv("DASHSCOPE_API_KEY"):
-                    os.environ["DASHSCOPE_API_KEY"] = os.environ["DASH_SCOPE_API_KEY"]
-                if not os.getenv("DASHSCOPE_API_KEY"):
-                    return
-
-                try:
-                    from asr.asr_client import transcribe_file
-                except Exception:
-                    return
-
-                wav_for_asr = wav_in
-                try:
-                    import soundfile as sf
-                    import numpy as np
-                    data, sr = sf.read(str(wav_in), dtype="float32", always_2d=True)
-                    if data.size == 0:
-                        return
-                    mono = data[:, 0] if data.ndim == 2 else data.reshape(-1)
-                    mono = np.clip(mono, -1.0, 1.0)
-                    pcm = (mono * 32767.0).astype(np.int16)
-                    pcm_wav = session_dir / "asr_audio_pcm16.wav"
-                    sf.write(str(pcm_wav), pcm, sr, subtype="PCM_16")
-                    wav_for_asr = pcm_wav
-                except Exception:
-                    wav_for_asr = wav_in
-
-                _proc_jobs[job_id]["status"] = "running:asr"
-                events = []
-                cur_sec = 0.0
-                last_sec = -1
-
-                def progress_hook(sec: float):
-                    nonlocal cur_sec, last_sec
-                    cur_sec = float(sec or 0.0)
-                    sec_i = int(cur_sec)
-                    if sec_i != last_sec:
-                        last_sec = sec_i
-                        _proc_jobs[job_id]["status"] = f"running:asr {sec_i}s"
-
-                def time_base():
-                    return cur_sec
-
-                def on_sentence(ev: dict):
-                    if isinstance(ev, dict):
-                        events.append(ev)
-
-                try:
-                    transcribe_file(
-                        api_key=None,
-                        wav_path=str(wav_for_asr),
-                        time_base=time_base,
-                        on_sentence=on_sentence,
-                        progress_hook=progress_hook,
-                    )
-                except Exception:
-                    _proc_jobs[job_id]["status"] = "running"
-                    return
-
-                events.sort(key=lambda e: float(e.get("ts", 0.0)))
-                segments = []
-                for idx, ev in enumerate(events):
-                    start = float(ev.get("ts", 0.0))
-                    nxt = events[idx + 1] if idx + 1 < len(events) else None
-                    end = float(nxt.get("ts", start + 2.0)) if nxt else (start + 2.0)
-                    segments.append({
-                        "start": float(start),
-                        "end": float(max(end, start + 0.2)),
-                        "text": _as_text(ev.get("text")),
-                        "raw": ev.get("raw"),
-                    })
-
-                try:
-                    with open(asr_path, "w", encoding="utf-8") as fh:
-                        for seg in segments:
-                            fh.write(json.dumps(seg, ensure_ascii=False) + "\n")
-                except Exception:
-                    return
-
-            # Load/Generate ASR segments
-            _maybe_generate_asr_from_audio()
-            _proc_jobs[job_id]["status"] = "running:load_asr"
+            # 1) Ensure whole-class audio -> text (ASR)
+            _proc_jobs[job_id]["status"] = "running:asr"
+            asr_segments = _transcribe_audio_to_segments(session_dir, job_id)
             transcript_txt = session_dir / "transcript.txt"
-            asr_segments = []
             try:
-                from analysis.teacher_labeler import load_asr_jsonl
+                with open(transcript_txt, "w", encoding="utf-8") as fh:
+                    for seg in asr_segments:
+                        if not isinstance(seg, dict):
+                            continue
+                        txt = str(seg.get("text", "")).strip()
+                        if txt:
+                            fh.write(txt + "\n")
             except Exception:
-                load_asr_jsonl = None
+                pass
 
-            # Prefer session_dir/asr.jsonl; else fall back to any *.asr.jsonl
-            asr_candidates = []
-            if (session_dir / "asr.jsonl").exists():
-                asr_candidates.append(session_dir / "asr.jsonl")
-            asr_candidates.extend(session_dir.glob("*.asr.jsonl"))
-
-            for p in asr_candidates:
+            # 2) Summarize the whole lesson via OpenAI-compatible LLM (if configured)
+            _proc_jobs[job_id]["status"] = "running:lesson_summary"
+            lesson_summary = _llm_summarize_lesson(asr_segments)
+            lesson_summary_path = session_dir / "lesson_summary.json"
+            if lesson_summary:
                 try:
-                    if load_asr_jsonl:
-                        asr_segments = load_asr_jsonl(str(p))
-                    else:
-                        # minimal compatibility: accept already-normalized segment dicts
-                        asr_segments = _read_jsonl(p)
-                    if asr_segments:
-                        break
-                except Exception:
-                    continue
-
-            if asr_segments:
-                try:
-                    with open(transcript_txt, "w", encoding="utf-8") as fh:
-                        for seg in asr_segments:
-                            if isinstance(seg, dict):
-                                fh.write((_as_text(seg.get("text")) + "\n").strip() + "\n")
-                            else:
-                                fh.write((_as_text(seg) + "\n").strip() + "\n")
+                    with open(lesson_summary_path, "w", encoding="utf-8") as fh:
+                        json.dump(lesson_summary, fh, ensure_ascii=False, indent=2)
                 except Exception:
                     pass
 
@@ -475,10 +570,14 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
 
             # Associate ASR segments to intervals
             _proc_jobs[job_id]["status"] = "running:align_asr"
+            lesson_timeline = lesson_summary.get("timeline") if isinstance(lesson_summary, dict) else None
+            if not isinstance(lesson_timeline, list):
+                lesson_timeline = []
             for sid_ev, info in per_student.items():
                 for it in info['intervals']:
                     # gather ASR segments that overlap interval
                     txts = []
+                    segs = []
                     for seg in asr_segments:
                         if not isinstance(seg, dict):
                             continue
@@ -487,24 +586,51 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                         # overlap if seg midpoint inside interval or any overlap
                         mid = (s+e)/2.0
                         if (mid >= it['start'] and mid <= it['end']) or (s < it['end'] and e > it['start']):
-                            txts.append(_as_text(seg.get('text', '')))
+                            t = str(seg.get("text", "")).strip()
+                            if t:
+                                txts.append(t)
+                                segs.append({"start": s, "end": e, "text": t})
                     joined = '\n'.join([t for t in txts if t])
                     it['asr_text'] = joined
-                    # summarize into knowledge points
+                    it['asr_segments'] = segs[:50]
+                    # Link sleeping to lesson topics (coarse)
+                    topics = []
+                    for ch in lesson_timeline:
+                        if not isinstance(ch, dict):
+                            continue
+                        cs = float(ch.get("start", 0.0))
+                        ce = float(ch.get("end", cs))
+                        if (cs < it["end"]) and (ce > it["start"]):
+                            tp = str(ch.get("topic", "")).strip()
+                            if tp:
+                                topics.append(tp)
+                    # keep unique in order
+                    seen = set()
+                    it["lecture_topics"] = [t for t in topics if not (t in seen or seen.add(t))]
+                    # Summarize interval into knowledge points (fine-grained)
                     it['knowledge_points'] = _summarize_text(joined or '')
 
             # Save stats file
             _proc_jobs[job_id]["status"] = "running:write_stats"
             stats_out = session_dir / 'stats.json'
             with open(stats_out, 'w', encoding='utf-8') as fh:
-                json.dump({'session_id': session_dir.name, 'video': str(video_path.name) if video_path else None, 'transcript': str(transcript_txt.name) if transcript_txt.exists() else None, 'per_student': per_student}, fh, ensure_ascii=False, indent=2)
+                json.dump({
+                    'session_id': session_dir.name,
+                    'video': str(video_path.name) if video_path else None,
+                    'audio': 'temp_audio.wav' if (session_dir / 'temp_audio.wav').exists() else None,
+                    'transcript': str(transcript_txt.name) if transcript_txt.exists() else None,
+                    'lesson_summary': lesson_summary if lesson_summary else None,
+                    'per_student': per_student,
+                }, fh, ensure_ascii=False, indent=2)
 
             # mark complete
             _proc_jobs[job_id]['status'] = 'done'
             _proc_jobs[job_id]['result'] = {
                 'video': f"/out/{session_dir.name}/{video_path.name}" if video_path else None,
+                'audio': f"/out/{session_dir.name}/temp_audio.wav" if (session_dir / 'temp_audio.wav').exists() else None,
                 'transcript': f"/out/{session_dir.name}/{transcript_txt.name}" if transcript_txt.exists() else None,
                 'stats': f"/out/{session_dir.name}/{stats_out.name}",
+                'lesson_summary': f"/out/{session_dir.name}/{lesson_summary_path.name}" if lesson_summary else None,
             }
         except Exception as exc:
             _proc_jobs[job_id]['status'] = 'error'

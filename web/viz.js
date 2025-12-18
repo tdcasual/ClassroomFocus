@@ -889,15 +889,76 @@
       reportLinks.appendChild(a);
     };
     add(result?.video, "下载视频");
+    add(result?.audio, "下载音频");
     add(result?.transcript, "下载转录");
+    add(result?.lesson_summary, "下载课程总结");
     add(result?.stats, "下载统计 JSON");
   }
 
   function renderReportBody(stats) {
+    const lesson = stats?.lesson_summary || null;
     const per = stats?.per_student || {};
     const studentIds = Object.keys(per).sort((a, b) => Number(a) - Number(b));
+    const head = document.createElement("div");
+    head.style.display = "flex";
+    head.style.flexDirection = "column";
+    head.style.gap = "10px";
+
+    if (lesson && typeof lesson === "object") {
+      const title = String(lesson.title || "").trim();
+      const overview = String(lesson.overview || "").trim();
+      const keyPoints = Array.isArray(lesson.key_points) ? lesson.key_points : [];
+      const outline = Array.isArray(lesson.outline) ? lesson.outline : [];
+      const timeline = Array.isArray(lesson.timeline) ? lesson.timeline : [];
+
+      const box = document.createElement("div");
+      box.className = "interval";
+      box.innerHTML = `
+        <div class="interval-head">
+          <div class="interval-title">${escapeHtml(title || "本节课总结")}</div>
+          <div class="interval-time">${escapeHtml(stats?.session_id || "")}</div>
+        </div>
+        <div class="interval-body">
+          <div><strong>概览：</strong> ${overview ? escapeHtml(overview) : '<span class="muted">（未生成）</span>'}</div>
+          <div>
+            <strong>关键要点：</strong>
+            ${
+              keyPoints.length
+                ? `<div class="chips">${keyPoints.slice(0, 12).map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
+                : '<span class="muted">（无）</span>'
+            }
+          </div>
+          <div>
+            <strong>大纲：</strong>
+            ${
+              outline.length
+                ? `<div class="muted">${outline.slice(0, 12).map((x) => `• ${escapeHtml(x)}`).join("<br/>")}</div>`
+                : '<span class="muted">（无）</span>'
+            }
+          </div>
+          <div>
+            <strong>时间线：</strong>
+            ${
+              timeline.length
+                ? `<div class="muted">${timeline
+                    .slice(0, 12)
+                    .map((t) => `${escapeHtml(formatSec(t.start))}–${escapeHtml(formatSec(t.end))} · ${escapeHtml(t.topic || "（未命名主题）")}`)
+                    .join("<br/>")}</div>`
+                : '<span class="muted">（无）</span>'
+            }
+          </div>
+        </div>
+      `;
+      head.appendChild(box);
+    }
+
     if (studentIds.length === 0) {
-      reportBody.innerHTML = `<div class="muted">没有检测到非清醒状态区间。</div>`;
+      reportBody.innerHTML = "";
+      reportBody.appendChild(head);
+      const info = document.createElement("div");
+      info.className = "muted";
+      info.textContent = "没有检测到非清醒状态区间。";
+      head.appendChild(info);
       return;
     }
 
@@ -935,6 +996,7 @@
           const dur = Math.max(0, end - start);
           const asr = String(it.asr_text || "").trim();
           const kps = Array.isArray(it.knowledge_points) ? it.knowledge_points : [];
+          const topics = Array.isArray(it.lecture_topics) ? it.lecture_topics : [];
 
           const item = document.createElement("div");
           item.className = "interval";
@@ -945,6 +1007,14 @@
             </div>
             <div class="interval-body">
               <div><strong>当时讲解：</strong> ${asr ? escapeHtml(asr) : '<span class="muted">（无 ASR 文本）</span>'}</div>
+              <div>
+                <strong>课程主题：</strong>
+                ${
+                  topics.length
+                    ? `<div class="chips">${topics.slice(0, 8).map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
+                    : '<span class="muted">（未生成/无匹配）</span>'
+                }
+              </div>
               <div>
                 <strong>知识点：</strong>
                 ${
@@ -963,6 +1033,7 @@
     }
 
     reportBody.innerHTML = "";
+    reportBody.appendChild(head);
     reportBody.appendChild(wrap);
   }
 
@@ -1057,7 +1128,13 @@
       state.report.lastSessionId = sid;
       state.report.lastStatsUrl = statsUrl;
       btnOpenReport.style.display = "inline-flex";
-      renderReportLinks({ stats: statsUrl, video: stats.video ? `/out/${sid}/${stats.video}` : null, transcript: stats.transcript ? `/out/${sid}/${stats.transcript}` : null });
+      renderReportLinks({
+        stats: statsUrl,
+        video: stats.video ? `/out/${sid}/${stats.video}` : null,
+        audio: stats.audio ? `/out/${sid}/${stats.audio}` : null,
+        transcript: stats.transcript ? `/out/${sid}/${stats.transcript}` : null,
+        lesson_summary: stats.lesson_summary ? `/out/${sid}/lesson_summary.json` : null,
+      });
       renderReportKpis(stats);
       renderReportBody(stats);
       return;

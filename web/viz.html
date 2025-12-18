@@ -17,21 +17,25 @@
           </div>
         </div>
 
-        <div class="topbar-right">
-          <div class="pill" title="WebSocket 连接状态">
-            <span class="dot unknown" id="wsDot"></span>
-            <span id="wsStatus">disconnected</span>
-          </div>
-          <div class="pill" title="当前会话">
-            <span class="dot unknown" id="recDot"></span>
-            <span id="recStatusText">idle</span>
-            <span class="mono" id="sessionIdText" style="display:none;"></span>
-          </div>
+	        <div class="topbar-right">
+	          <div class="pill" title="WebSocket 连接状态">
+	            <span class="dot unknown" id="wsDot"></span>
+	            <span id="wsStatus">disconnected</span>
+	          </div>
+	          <div class="pill" title="当前会话">
+	            <span class="dot unknown" id="recDot"></span>
+	            <span id="recStatusText">idle</span>
+	            <span class="mono" id="sessionIdText" style="display:none;"></span>
+	          </div>
+	          <button class="pill pill-btn" id="btnModelCenter" title="模型中心：录制前检测/切换在线/离线/ASR">
+	            <span class="dot unknown" id="modelDot"></span>
+	            <span id="modelStatusText">models</span>
+	          </button>
 
-          <button class="btn primary" id="btnStart">开始录制</button>
-          <button class="btn danger" id="btnStop" disabled>停止</button>
-          <button class="btn" id="btnReport" disabled>生成报告</button>
-          <button class="btn ghost" id="btnOpenReport" style="display:none;">查看报告</button>
+	          <button class="btn primary" id="btnStart">开始录制</button>
+	          <button class="btn danger" id="btnStop" disabled>停止</button>
+	          <button class="btn" id="btnReport" disabled>生成报告</button>
+	          <button class="btn ghost" id="btnOpenReport" style="display:none;">查看报告</button>
         </div>
       </header>
 
@@ -106,24 +110,103 @@
         </main>
       </div>
 
-      <div class="modal" id="reportModal" role="dialog" aria-modal="true" aria-labelledby="reportTitle">
-        <div class="drawer">
-          <div class="drawer-head">
-            <div class="drawer-title" id="reportTitle">学习情况报告（睡眠区间 × 讲解内容/知识点）</div>
-            <div style="display:flex; gap:10px; align-items:center;">
-              <button class="btn small" id="btnReloadReport" title="重新拉取统计结果">重载</button>
-              <button class="btn small" id="btnCloseReport">关闭</button>
-            </div>
-          </div>
-          <div class="drawer-body">
-            <div class="kpi-row" id="reportKpis"></div>
-            <div class="links" id="reportLinks"></div>
-            <div id="reportBody" class="muted">尚未生成报告。停止录制后点击“生成报告”。</div>
-          </div>
-        </div>
-      </div>
-    </div>
+	      <div class="modal" id="reportModal" role="dialog" aria-modal="true" aria-labelledby="reportTitle">
+	        <div class="drawer">
+	          <div class="drawer-head">
+	            <div class="drawer-title" id="reportTitle">学习情况报告（睡眠区间 × 讲解内容/知识点）</div>
+	            <div style="display:flex; gap:10px; align-items:center;">
+	              <button class="btn small" id="btnReloadReport" title="重新拉取统计结果">重载</button>
+	              <button class="btn small" id="btnCloseReport">关闭</button>
+	            </div>
+	          </div>
+	          <div class="drawer-body">
+	            <div class="kpi-row" id="reportKpis"></div>
+	            <div class="links" id="reportLinks"></div>
+	            <div id="reportBody" class="muted">尚未生成报告。停止录制后点击“生成报告”。</div>
+	          </div>
+	        </div>
+	      </div>
 
-    <script src="./viz.js" defer></script>
-  </body>
-</html>
+	      <div class="modal" id="modelModal" role="dialog" aria-modal="true" aria-labelledby="modelTitle">
+	        <div class="drawer">
+	          <div class="drawer-head">
+	            <div class="drawer-title" id="modelTitle">模型中心（录制前检测）</div>
+	            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+	              <button class="btn small" id="btnModelsSave" title="保存并应用到下一次录制">保存/应用</button>
+	              <button class="btn small" id="btnModelsCheck" title="快速检测（推荐）">检测</button>
+	              <button class="btn small" id="btnModelsCheckDeep" title="深度检测（会触发真实 ASR 调用）">深度检测</button>
+	              <button class="btn small" id="btnModelsClose">关闭</button>
+	            </div>
+	          </div>
+	          <div class="drawer-body">
+	            <div class="form-card">
+	              <div class="form-grid">
+	                <div class="field">
+	                  <div class="field-label">模式</div>
+	                  <div class="select">
+	                    <span>Mode</span>
+	                    <select id="modelModeSel">
+	                      <option value="online">online（调用模型）</option>
+	                      <option value="offline">offline（不调用模型）</option>
+	                    </select>
+	                  </div>
+	                  <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但不会做 ASR/LLM 调用。</div>
+	                </div>
+
+	                <div class="field">
+	                  <div class="field-label">语音识别（ASR）</div>
+	                  <div class="select">
+	                    <span>Provider</span>
+	                    <select id="asrProviderSel">
+	                      <option value="openai_compat">OpenAI-compatible（Whisper）</option>
+	                      <option value="dashscope">阿里 DashScope（文件识别）</option>
+	                      <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
+	                      <option value="none">none（不转写）</option>
+	                    </select>
+	                  </div>
+	                  <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
+	                    <input id="asrModelInput" placeholder="ASR 模型（如 whisper-1 / fun-asr-realtime）" autocomplete="off" />
+	                  </div>
+	                  <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
+	                </div>
+	              </div>
+	            </div>
+
+	            <div class="form-card">
+	              <div class="field-row">
+	                <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用课程总结/知识点（LLM）</label>
+	              </div>
+	              <div class="form-grid">
+	                <div class="field">
+	                  <div class="field-label">OpenAI Base URL</div>
+	                  <div class="input">
+	                    <input id="llmBaseUrlInput" placeholder="https://api.openai.com" autocomplete="off" />
+	                  </div>
+	                </div>
+	                <div class="field">
+	                  <div class="field-label">模型名</div>
+	                  <div class="input">
+	                    <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / ..." autocomplete="off" />
+	                  </div>
+	                  <div class="field-help">兼容 GPT-5+ 与旧式 Chat Completions（由后端自动回退）。</div>
+	                </div>
+	              </div>
+	            </div>
+
+	            <div class="form-card">
+	              <div class="field-label">检测结果</div>
+	              <div id="modelCheckBox" class="muted">尚未检测。</div>
+	            </div>
+
+	            <div class="form-card">
+	              <div class="field-label">环境摘要（.env）</div>
+	              <div id="modelEnvBox" class="muted">（加载中…）</div>
+	            </div>
+	          </div>
+	        </div>
+	      </div>
+	    </div>
+
+	    <script src="./viz.js" defer></script>
+	  </body>
+	</html>

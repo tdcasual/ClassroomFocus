@@ -6,7 +6,7 @@ import time
 import re
 import tempfile
 import shutil
-from typing import List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -20,6 +20,8 @@ import sys
 PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
+from asr.dashscope_offline import DashScopeOfflineConfig, transcribe_wav_to_segments as dashscope_transcribe_wav_to_segments
+from asr.xfyun_raasr import XfyunRaasrConfig, transcribe_wav as xfyun_raasr_transcribe_wav
 from tools.session_manager import SessionManager
 from tools.openai_compat import OpenAICompat
 from analysis.inattentive_intervals import infer_not_visible_intervals, merge_inattentive_intervals
@@ -54,6 +56,247 @@ stats = {
     'batches_broadcast': 0,
     'last_batch_size': 0,
 }
+
+# ---- Model config (in-memory defaults for next session) ----
+_MODEL_CFG: Dict[str, Any] = {}
+
+
+def _env_summary() -> Dict[str, Any]:
+    openai_base = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_ENDPOINT") or "https://api.openai.com"
+    openai_model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    openai_asr_model = os.getenv("OPENAI_ASR_MODEL") or "whisper-1"
+    return {
+        "openai_base_url": openai_base,
+        "openai_model": openai_model,
+        "openai_asr_model": openai_asr_model,
+        "has_openai_key": bool(os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")),
+        "has_dashscope_key": bool(os.getenv("DASH_SCOPE_API_KEY") or os.getenv("DASHSCOPE_API_KEY")),
+        "has_xfyun": bool(os.getenv("XFYUN_APP_ID") and os.getenv("XFYUN_SECRET_KEY")),
+    }
+
+
+def _default_model_cfg() -> Dict[str, Any]:
+    env = _env_summary()
+    has_openai = bool(env.get("has_openai_key"))
+    return {
+        "mode": "online" if has_openai else "offline",
+        "llm": {
+            "enabled": bool(has_openai),
+            "provider": "openai_compat",
+            "model": str(env.get("openai_model") or "gpt-4o-mini"),
+            "base_url": str(env.get("openai_base_url") or "https://api.openai.com"),
+        },
+        "asr": {
+            "provider": "openai_compat" if has_openai else "none",
+            "model": str(env.get("openai_asr_model") or "whisper-1"),
+        },
+    }
+
+
+def _sanitize_model_cfg(cfg: Any) -> Dict[str, Any]:
+    base = _default_model_cfg()
+    if not isinstance(cfg, dict):
+        return base
+    out = {
+        "mode": cfg.get("mode", base["mode"]),
+        "llm": dict(base["llm"]),
+        "asr": dict(base["asr"]),
+    }
+    if out["mode"] not in ("online", "offline"):
+        out["mode"] = base["mode"]
+
+    llm = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    out["llm"]["enabled"] = bool(llm.get("enabled", out["llm"]["enabled"]))
+    provider = str(llm.get("provider", out["llm"]["provider"]) or "").strip()
+    if provider not in ("openai_compat", "none"):
+        provider = out["llm"]["provider"]
+    out["llm"]["provider"] = provider
+    model = str(llm.get("model", out["llm"]["model"]) or "").strip()
+    if model:
+        out["llm"]["model"] = model[:120]
+    base_url = str(llm.get("base_url", out["llm"]["base_url"]) or "").strip()
+    if base_url:
+        out["llm"]["base_url"] = base_url[:300]
+
+    asr = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
+    asr_provider = str(asr.get("provider", out["asr"]["provider"]) or "").strip()
+    if asr_provider not in ("openai_compat", "dashscope", "xfyun_raasr", "none"):
+        asr_provider = out["asr"]["provider"]
+    out["asr"]["provider"] = asr_provider
+    asr_model = str(asr.get("model", out["asr"]["model"]) or "").strip()
+    if asr_model:
+        out["asr"]["model"] = asr_model[:120]
+    return out
+
+
+def _get_model_cfg() -> Dict[str, Any]:
+    global _MODEL_CFG
+    if not _MODEL_CFG:
+        _MODEL_CFG = _default_model_cfg()
+    return dict(_MODEL_CFG)
+
+
+def _set_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    global _MODEL_CFG
+    _MODEL_CFG = _sanitize_model_cfg(cfg)
+    return dict(_MODEL_CFG)
+
+
+def _openai_client_from_cfg(llm_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
+    if not api_key:
+        return None
+    base_url = str(llm_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com")
+    model = str(llm_cfg.get("model") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
+    try:
+        timeout = float(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
+    except Exception:
+        timeout = 60.0
+    from tools.openai_compat import OpenAICompatConfig
+
+    return OpenAICompat(OpenAICompatConfig(base_url=base_url, api_key=api_key, model=model, timeout_sec=timeout))
+
+
+def _write_session_config(session_dir: Path, cfg: Dict[str, Any]) -> None:
+    try:
+        with open(session_dir / "session_config.json", "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "model_config": cfg,
+                    "env_summary": _env_summary(),
+                    "ts": time.time(),
+                },
+                fh,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+
+def _read_session_config(session_dir: Path) -> Dict[str, Any]:
+    try:
+        p = session_dir / "session_config.json"
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as fh:
+                j = json.load(fh)
+            cfg = j.get("model_config") if isinstance(j, dict) else None
+            return _sanitize_model_cfg(cfg)
+    except Exception:
+        pass
+    return _get_model_cfg()
+
+
+def _make_silence_wav(path: Path, seconds: float = 0.6, sr: int = 16000) -> None:
+    import wave
+
+    seconds = max(0.2, float(seconds))
+    sr = max(8000, int(sr))
+    n = int(seconds * sr)
+    pcm = b"\x00\x00" * n
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm)
+
+
+def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
+    mode = cfg.get("mode", "offline")
+    out: Dict[str, Any] = {"mode": mode, "llm": {}, "asr": {}}
+    env = _env_summary()
+    out["env"] = env
+
+    if mode == "offline":
+        out["llm"] = {"ok": True, "skipped": True, "reason": "offline mode"}
+        out["asr"] = {"ok": True, "skipped": True, "reason": "offline mode"}
+        return out
+
+    # LLM check (OpenAI compatible)
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    llm_enabled = bool(llm_cfg.get("enabled"))
+    llm_provider = str(llm_cfg.get("provider") or "none")
+    if not llm_enabled or llm_provider == "none":
+        out["llm"] = {"ok": True, "skipped": True, "reason": "llm disabled"}
+    else:
+        t0 = time.time()
+        client = _openai_client_from_cfg(llm_cfg)
+        if not client:
+            out["llm"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
+        else:
+            try:
+                txt = client.generate_text(messages=[{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0)
+                out["llm"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "sample": (txt or "")[:60]}
+            except Exception as exc:
+                out["llm"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+
+    # ASR check
+    asr_cfg = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
+    asr_provider = str(asr_cfg.get("provider") or "none")
+    asr_model = str(asr_cfg.get("model") or "")
+    if asr_provider == "none":
+        out["asr"] = {"ok": True, "skipped": True, "reason": "asr disabled"}
+        return out
+
+    # create a tiny wav for check
+    tmp_dir = Path(tempfile.mkdtemp(prefix="model_check_", dir=str(OUT_DIR)))
+    wav = tmp_dir / "silence.wav"
+    try:
+        _make_silence_wav(wav)
+        if asr_provider == "openai_compat":
+            t0 = time.time()
+            client = _openai_client_from_cfg(cfg.get("llm") or {})
+            if not client:
+                out["asr"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
+            else:
+                try:
+                    resp = client.transcribe_audio(str(wav), model=asr_model or None, response_format="verbose_json")
+                    ok = isinstance(resp, dict) and ("text" in resp or "segments" in resp)
+                    out["asr"] = {"ok": bool(ok), "latency_ms": int((time.time() - t0) * 1000)}
+                except Exception as exc:
+                    out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+        elif asr_provider == "dashscope":
+            # Quick: validate key+deps, Deep: run a tiny file transcription.
+            key = os.getenv("DASH_SCOPE_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
+            if not key:
+                out["asr"] = {"ok": False, "error": "DASH_SCOPE_API_KEY not set"}
+            else:
+                if not deep:
+                    out["asr"] = {"ok": True, "skipped": True, "reason": "dashscope key present (deep check disabled)"}
+                else:
+                    t0 = time.time()
+                    try:
+                        segs = dashscope_transcribe_wav_to_segments(str(wav), DashScopeOfflineConfig(api_key=key, model=asr_model or "fun-asr-realtime"))
+                        out["asr"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "segments": len(segs)}
+                    except Exception as exc:
+                        out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+        elif asr_provider == "xfyun_raasr":
+            app_id = os.getenv("XFYUN_APP_ID") or ""
+            secret = os.getenv("XFYUN_SECRET_KEY") or ""
+            if not app_id or not secret:
+                out["asr"] = {"ok": False, "error": "XFYUN_APP_ID/XFYUN_SECRET_KEY not set"}
+            else:
+                if not deep:
+                    out["asr"] = {"ok": True, "skipped": True, "reason": "xfyun keys present (deep check disabled)"}
+                else:
+                    t0 = time.time()
+                    try:
+                        segs, meta = xfyun_raasr_transcribe_wav(
+                            str(wav),
+                            XfyunRaasrConfig(app_id=app_id, secret_key=secret),
+                        )
+                        out["asr"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "segments": len(segs), "task_id": meta.get("task_id")}
+                    except Exception as exc:
+                        out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+        else:
+            out["asr"] = {"ok": False, "error": f"unknown asr provider: {asr_provider}"}
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return out
 
 
 class ConnectionManager:
@@ -175,10 +418,24 @@ async def list_sessions():
 
 
 @app.post("/api/session/start")
-async def start_session():
+async def start_session(request: Request):
     try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cfg = _sanitize_model_cfg((body or {}).get("model_config") or (body or {}).get("config") or _get_model_cfg())
+        # Persist as the current default so the UI/session status stays consistent.
+        cfg = _set_model_cfg(cfg)
+
         sid = session_mgr.start(output_dir_base=str(OUT_DIR))
-        return {"ok": True, "session_id": sid}
+        # Persist config snapshot to session dir for report reproducibility.
+        try:
+            session_dir = OUT_DIR / sid
+            _write_session_config(session_dir, cfg)
+        except Exception:
+            pass
+        return {"ok": True, "session_id": sid, "model_config": cfg}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -210,7 +467,7 @@ def _read_jsonl(path):
     return out
 
 
-def _summarize_text(text: str, max_points: int = 6):
+def _summarize_text(text: str, max_points: int = 6, llm: Optional[OpenAICompat] = None, allow_llm: bool = True):
     """Summarize text into knowledge points.
 
     Uses an OpenAI-compatible LLM when configured, otherwise falls back to
@@ -223,8 +480,9 @@ def _summarize_text(text: str, max_points: int = 6):
     if len(text) > max_chars:
         half = max(500, max_chars // 2)
         text = text[:half].rstrip() + "\n...\n" + text[-half:].lstrip()
-    llm = OpenAICompat.from_env()
-    if llm:
+    if allow_llm and llm is None:
+        llm = OpenAICompat.from_env()
+    if allow_llm and llm:
         try:
             messages = [
                 {"role": "system", "content": "你从课堂讲解中提炼知识点。只输出 JSON 数组（字符串数组），不要输出任何额外文字。"},
@@ -300,9 +558,12 @@ def _chunk_asr_segments(asr_segments: List[dict], chunk_secs: float) -> List[dic
     return chunks
 
 
-def _llm_summarize_lesson(asr_segments: List[dict]) -> dict:
+def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] = None, allow_llm: bool = True) -> dict:
     """Summarize the whole lesson and produce a timeline of topics."""
-    llm = OpenAICompat.from_env()
+    if not allow_llm:
+        return {}
+    if llm is None:
+        llm = OpenAICompat.from_env()
     if not llm:
         return {}
     chunk_secs = float(os.getenv("SUMMARY_CHUNK_SECONDS", "180"))
@@ -379,40 +640,47 @@ def _llm_summarize_lesson(asr_segments: List[dict]) -> dict:
     return out
 
 
-def _transcribe_audio_to_segments(session_dir: Path, job_id: str) -> List[dict]:
-    """Ensure `asr.jsonl` exists by transcribing the full-session WAV.
-
-    Returns normalized ASR segments: [{start,end,text,raw}, ...]
-    """
-    wav_in = session_dir / "temp_audio.wav"
-    if not wav_in.exists() or wav_in.stat().st_size <= 0:
-        raise RuntimeError(f"audio file missing or empty: {wav_in}")
-
-    # Align audio timeline to CV timeline (both relative to session start).
-    sync_offset = 0.0
+def _audio_sync_offset_sec(session_dir: Path) -> float:
+    """Align audio timeline to CV timeline (both relative to session start)."""
     try:
         sync_path = session_dir / "sync.json"
         if sync_path.exists():
             with open(sync_path, "r", encoding="utf-8") as fh:
                 sync = json.load(fh)
-            sync_offset = float(sync.get("audio_offset_sec", 0.0) or 0.0)
+            return float(sync.get("audio_offset_sec", 0.0) or 0.0)
     except Exception:
-        sync_offset = 0.0
+        pass
+    return 0.0
 
-    # If already have ASR, just load it (do not re-transcribe).
-    asr_path = session_dir / "asr.jsonl"
-    if asr_path.exists() and asr_path.stat().st_size > 0:
-        try:
-            from analysis.teacher_labeler import load_asr_jsonl
-            return load_asr_jsonl(str(asr_path))
-        except Exception:
-            return _read_jsonl(asr_path)
 
-    llm = OpenAICompat.from_env()
-    if not llm:
-        raise RuntimeError("OPENAI_API_KEY not set: cannot transcribe audio to text.")
+def _load_asr_segments(asr_path: Path) -> List[dict]:
+    if not asr_path.exists() or asr_path.stat().st_size <= 0:
+        return []
+    try:
+        from analysis.teacher_labeler import load_asr_jsonl
+        return load_asr_jsonl(str(asr_path))
+    except Exception:
+        return _read_jsonl(asr_path)
+
+
+def _write_asr_segments(asr_path: Path, segments: List[dict]) -> None:
+    try:
+        with open(asr_path, "w", encoding="utf-8") as fh:
+            for s in segments:
+                fh.write(json.dumps(s, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _transcribe_openai_audio_to_segments(session_dir: Path, job_id: str, client: OpenAICompat, asr_model: Optional[str]) -> List[dict]:
+    """Transcribe `temp_audio.wav` via OpenAI-compatible `/audio/transcriptions`."""
+    wav_in = session_dir / "temp_audio.wav"
+    if not wav_in.exists() or wav_in.stat().st_size <= 0:
+        raise RuntimeError(f"audio file missing or empty: {wav_in}")
 
     import soundfile as sf
+
+    sync_offset = _audio_sync_offset_sec(session_dir)
 
     # Segment audio to avoid provider size limits.
     chunk_sec = float(os.getenv("ASR_CHUNK_SECONDS", "60"))
@@ -438,12 +706,12 @@ def _transcribe_audio_to_segments(session_dir: Path, job_id: str) -> List[dict]:
                     data = data[:, 0:1]
                 chunk_path = tmp_dir / f"chunk_{idx:04d}.wav"
                 sf.write(str(chunk_path), data, sr, subtype="PCM_16")
-                _proc_jobs[job_id]["status"] = f"running:asr chunk {idx} ({offset:.0f}s)"
+                _proc_jobs[job_id]["status"] = f"running:asr(openai) chunk {idx} ({offset:.0f}s)"
 
                 try:
-                    resp = llm.transcribe_audio(str(chunk_path), response_format="verbose_json")
+                    resp = client.transcribe_audio(str(chunk_path), model=asr_model or None, response_format="verbose_json")
                 except Exception as exc:
-                    raise RuntimeError(f"audio transcription failed at chunk {idx}: {exc}") from exc
+                    raise RuntimeError(f"openai-compatible transcription failed at chunk {idx}: {exc}") from exc
 
                 if isinstance(resp, dict) and isinstance(resp.get("segments"), list):
                     for s in resp["segments"]:
@@ -477,13 +745,100 @@ def _transcribe_audio_to_segments(session_dir: Path, job_id: str) -> List[dict]:
                 pass
 
     segments_out.sort(key=lambda s: float(s.get("start", 0.0)))
+    return segments_out
+
+
+def _transcribe_dashscope_audio_to_segments(session_dir: Path, job_id: str, model: Optional[str]) -> List[dict]:
+    wav_in = session_dir / "temp_audio.wav"
+    if not wav_in.exists() or wav_in.stat().st_size <= 0:
+        raise RuntimeError(f"audio file missing or empty: {wav_in}")
+    key = os.getenv("DASH_SCOPE_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
+    if not key:
+        raise RuntimeError("DASH_SCOPE_API_KEY not set.")
+    _proc_jobs[job_id]["status"] = "running:asr(dashscope)"
+    segs = dashscope_transcribe_wav_to_segments(
+        str(wav_in),
+        DashScopeOfflineConfig(api_key=key, model=model or (os.getenv("ALI_ASR_MODEL") or "fun-asr-realtime")),
+    )
+    sync_offset = _audio_sync_offset_sec(session_dir)
+    for s in segs:
+        try:
+            s["start"] = float(s.get("start", 0.0)) + sync_offset
+            s["end"] = float(s.get("end", s["start"] + 0.2)) + sync_offset
+        except Exception:
+            pass
+    segs.sort(key=lambda s: float(s.get("start", 0.0)))
+    return segs
+
+
+def _transcribe_xfyun_audio_to_segments(session_dir: Path, job_id: str) -> List[dict]:
+    wav_in = session_dir / "temp_audio.wav"
+    if not wav_in.exists() or wav_in.stat().st_size <= 0:
+        raise RuntimeError(f"audio file missing or empty: {wav_in}")
+    app_id = os.getenv("XFYUN_APP_ID") or ""
+    secret = os.getenv("XFYUN_SECRET_KEY") or ""
+    if not app_id or not secret:
+        raise RuntimeError("XFYUN_APP_ID/XFYUN_SECRET_KEY not set.")
+    _proc_jobs[job_id]["status"] = "running:asr(xfyun)"
+    segs, meta = xfyun_raasr_transcribe_wav(
+        str(wav_in),
+        XfyunRaasrConfig(
+            app_id=app_id,
+            secret_key=secret,
+            host=os.getenv("XFYUN_RAASR_HOST") or "https://raasr.xfyun.cn/v2/api",
+        ),
+    )
     try:
-        with open(asr_path, "w", encoding="utf-8") as fh:
-            for s in segments_out:
-                fh.write(json.dumps(s, ensure_ascii=False) + "\n")
+        with open(session_dir / "asr_xfyun_meta.json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    return segments_out
+    sync_offset = _audio_sync_offset_sec(session_dir)
+    for s in segs:
+        try:
+            s["start"] = float(s.get("start", 0.0)) + sync_offset
+            s["end"] = float(s.get("end", s["start"] + 0.2)) + sync_offset
+        except Exception:
+            pass
+    segs.sort(key=lambda s: float(s.get("start", 0.0)))
+    return segs
+
+
+def _ensure_asr_segments(session_dir: Path, job_id: str, model_cfg: Dict[str, Any], warnings: List[str]) -> List[dict]:
+    """Get ASR segments according to config, avoiding re-transcription when possible."""
+    asr_path = session_dir / "asr.jsonl"
+    existing = _load_asr_segments(asr_path)
+    if existing:
+        return existing
+
+    mode = str(model_cfg.get("mode") or "offline")
+    if mode == "offline":
+        return []
+
+    asr_cfg = model_cfg.get("asr") if isinstance(model_cfg.get("asr"), dict) else {}
+    provider = str(asr_cfg.get("provider") or "none")
+    model = str(asr_cfg.get("model") or "").strip() or None
+
+    try:
+        if provider == "none":
+            return []
+        if provider == "openai_compat":
+            client = _openai_client_from_cfg(model_cfg.get("llm") or {})
+            if not client:
+                raise RuntimeError("OPENAI_API_KEY not set.")
+            segs = _transcribe_openai_audio_to_segments(session_dir, job_id, client, model)
+        elif provider == "dashscope":
+            segs = _transcribe_dashscope_audio_to_segments(session_dir, job_id, model)
+        elif provider == "xfyun_raasr":
+            segs = _transcribe_xfyun_audio_to_segments(session_dir, job_id)
+        else:
+            raise RuntimeError(f"unknown ASR provider: {provider}")
+    except Exception as exc:
+        warnings.append(f"ASR failed ({provider}): {exc}")
+        return []
+
+    _write_asr_segments(asr_path, segs)
+    return segs
 
 
 @app.post('/api/session/process')
@@ -510,28 +865,53 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
     def _do_work(job_id, session_dir):
         try:
             _proc_jobs[job_id]['status'] = 'running'
+            warnings: List[str] = []
+            model_cfg = _read_session_config(session_dir)
+            llm_cfg = model_cfg.get("llm") if isinstance(model_cfg.get("llm"), dict) else {}
+            allow_llm = (
+                str(model_cfg.get("mode") or "offline") == "online"
+                and bool(llm_cfg.get("enabled"))
+                and str(llm_cfg.get("provider") or "none") != "none"
+            )
+            llm_client: Optional[OpenAICompat] = None
+            if allow_llm:
+                llm_client = _openai_client_from_cfg(llm_cfg)
+                if not llm_client:
+                    allow_llm = False
+                    warnings.append("LLM disabled: OPENAI_API_KEY not set or invalid.")
+
             # Find video file (prefer mp4 then avi)
             video_candidates = list(session_dir.glob('session.mp4')) + list(session_dir.glob('*.mp4')) + list(session_dir.glob('temp_video.avi'))
             video_path = video_candidates[0] if video_candidates else None
 
             # 1) Ensure whole-class audio -> text (ASR)
             _proc_jobs[job_id]["status"] = "running:asr"
-            asr_segments = _transcribe_audio_to_segments(session_dir, job_id)
+            asr_segments = _ensure_asr_segments(session_dir, job_id, model_cfg, warnings)
             transcript_txt = session_dir / "transcript.txt"
             try:
                 with open(transcript_txt, "w", encoding="utf-8") as fh:
-                    for seg in asr_segments:
-                        if not isinstance(seg, dict):
-                            continue
-                        txt = str(seg.get("text", "")).strip()
-                        if txt:
-                            fh.write(txt + "\n")
+                    if asr_segments:
+                        for seg in asr_segments:
+                            if not isinstance(seg, dict):
+                                continue
+                            txt = str(seg.get("text", "")).strip()
+                            if txt:
+                                fh.write(txt + "\n")
+                    else:
+                        mode = str(model_cfg.get("mode") or "offline")
+                        asr_provider = str(((model_cfg.get("asr") or {}) if isinstance(model_cfg.get("asr"), dict) else {}).get("provider") or "none")
+                        if mode == "offline":
+                            fh.write("[ASR skipped: offline mode]\n")
+                        elif asr_provider == "none":
+                            fh.write("[ASR disabled]\n")
+                        else:
+                            fh.write("[ASR failed or produced no text]\n")
             except Exception:
                 pass
 
             # 2) Summarize the whole lesson via OpenAI-compatible LLM (if configured)
             _proc_jobs[job_id]["status"] = "running:lesson_summary"
-            lesson_summary = _llm_summarize_lesson(asr_segments)
+            lesson_summary = _llm_summarize_lesson(asr_segments, llm=llm_client, allow_llm=allow_llm)
             lesson_summary_path = session_dir / "lesson_summary.json"
             if lesson_summary:
                 try:
@@ -707,7 +1087,7 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                     seen = set()
                     it["lecture_topics"] = [t for t in topics if not (t in seen or seen.add(t))]
                     # Summarize interval into knowledge points (fine-grained)
-                    it['knowledge_points'] = _summarize_text(joined or '')
+                    it['knowledge_points'] = _summarize_text(joined or '', llm=llm_client, allow_llm=allow_llm)
 
             # Save stats file
             _proc_jobs[job_id]["status"] = "running:write_stats"
@@ -718,6 +1098,8 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                     'video': str(video_path.name) if video_path else None,
                     'audio': 'temp_audio.wav' if (session_dir / 'temp_audio.wav').exists() else None,
                     'transcript': str(transcript_txt.name) if transcript_txt.exists() else None,
+                    'model_config': model_cfg,
+                    'warnings': warnings,
                     'lesson_summary': lesson_summary if lesson_summary else None,
                     'per_student': per_student,
                 }, fh, ensure_ascii=False, indent=2)
@@ -753,8 +1135,54 @@ async def process_status(job_id: str):
 async def session_status():
     return {
         "is_recording": session_mgr.is_recording,
-        "session_id": session_mgr.session_id
+        "session_id": session_mgr.session_id,
+        "model_config": _get_model_cfg(),
     }
+
+
+@app.get("/api/models/config")
+async def get_models_config():
+    return {
+        "ok": True,
+        "config": _get_model_cfg(),
+        "env": _env_summary(),
+        "providers": {
+            "llm": ["openai_compat", "none"],
+            "asr": ["openai_compat", "dashscope", "xfyun_raasr", "none"],
+        },
+    }
+
+
+@app.post("/api/models/config")
+async def set_models_config(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cfg = _sanitize_model_cfg((body or {}).get("config") or body)
+    cfg = _set_model_cfg(cfg)
+    return {"ok": True, "config": cfg, "env": _env_summary()}
+
+
+@app.post("/api/models/check")
+async def check_models(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cfg = _sanitize_model_cfg((body or {}).get("config") or _get_model_cfg())
+    deep = bool((body or {}).get("deep", False))
+    res = _check_models(cfg, deep=deep)
+    # Suggest offline if a required provider fails.
+    suggested = "online"
+    if cfg.get("mode") == "online":
+        if (cfg.get("asr") or {}).get("provider") not in ("none", ""):
+            if not bool((res.get("asr") or {}).get("ok", False)) and not bool((res.get("asr") or {}).get("skipped", False)):
+                suggested = "offline"
+        if bool((cfg.get("llm") or {}).get("enabled")) and (cfg.get("llm") or {}).get("provider") != "none":
+            if not bool((res.get("llm") or {}).get("ok", False)) and not bool((res.get("llm") or {}).get("skipped", False)):
+                suggested = "offline"
+    return {"ok": True, "result": res, "suggested_mode": suggested}
 
 
 @app.post("/push")

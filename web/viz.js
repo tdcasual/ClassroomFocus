@@ -17,6 +17,24 @@
   const recStatusText = document.getElementById("recStatusText");
   const sessionIdText = document.getElementById("sessionIdText");
 
+  const btnModelCenter = document.getElementById("btnModelCenter");
+  const modelDot = document.getElementById("modelDot");
+  const modelStatusText = document.getElementById("modelStatusText");
+
+  const modelModal = document.getElementById("modelModal");
+  const btnModelsSave = document.getElementById("btnModelsSave");
+  const btnModelsCheck = document.getElementById("btnModelsCheck");
+  const btnModelsCheckDeep = document.getElementById("btnModelsCheckDeep");
+  const btnModelsClose = document.getElementById("btnModelsClose");
+  const modelModeSel = document.getElementById("modelModeSel");
+  const asrProviderSel = document.getElementById("asrProviderSel");
+  const asrModelInput = document.getElementById("asrModelInput");
+  const llmEnabledToggle = document.getElementById("llmEnabledToggle");
+  const llmBaseUrlInput = document.getElementById("llmBaseUrlInput");
+  const llmModelInput = document.getElementById("llmModelInput");
+  const modelCheckBox = document.getElementById("modelCheckBox");
+  const modelEnvBox = document.getElementById("modelEnvBox");
+
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
   const btnReport = document.getElementById("btnReport");
@@ -96,6 +114,16 @@
       lastStatsUrl: null,
       lastSessionId: null,
       polling: false,
+    },
+
+    models: {
+      config: null,
+      env: null,
+      providers: null,
+      lastCheck: null,
+      suggestedMode: null,
+      dirty: false,
+      checking: false,
     },
   };
 
@@ -207,6 +235,7 @@
     btnStop.disabled = !state.isRecording;
     btnReport.disabled = state.isRecording || !state.sessionId;
     btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
+    btnModelCenter.disabled = state.isRecording;
 
     recStatusText.textContent = state.isRecording ? "recording" : "idle";
     recDot.className = `dot ${state.isRecording ? "bad" : "unknown"}`;
@@ -815,16 +844,312 @@
     return data;
   }
 
+  function isOkOrSkipped(obj) {
+    if (!obj || typeof obj !== "object") return false;
+    return obj.ok === true || obj.skipped === true;
+  }
+
+  function updateModelPill() {
+    const cfg = state.models.config;
+    if (!cfg) {
+      modelDot.className = "dot unknown";
+      modelStatusText.textContent = "models";
+      return;
+    }
+
+    const mode = String(cfg.mode || "offline");
+    if (mode === "offline") {
+      modelDot.className = "dot warn";
+      modelStatusText.textContent = state.models.dirty ? "offline*" : "offline";
+      return;
+    }
+
+    const check = state.models.lastCheck;
+    if (!check) {
+      modelDot.className = "dot unknown";
+      modelStatusText.textContent = state.models.dirty ? "online*" : "online";
+      return;
+    }
+
+    const llmOk = isOkOrSkipped(check.llm);
+    const asrOk = isOkOrSkipped(check.asr);
+    modelDot.className = `dot ${llmOk && asrOk ? "good" : "bad"}`;
+    modelStatusText.textContent = `${llmOk && asrOk ? "models ok" : "models issue"}${state.models.dirty ? "*" : ""}`;
+  }
+
+  function renderModelEnvBox() {
+    const env = state.models.env;
+    if (!env) {
+      modelEnvBox.textContent = "（未加载 env 信息）";
+      return;
+    }
+    const chips = [
+      `OpenAI key: ${env.has_openai_key ? "yes" : "no"}`,
+      `DashScope key: ${env.has_dashscope_key ? "yes" : "no"}`,
+      `Xfyun: ${env.has_xfyun ? "yes" : "no"}`,
+    ]
+      .map((t) => `<span class="chip">${escapeHtml(t)}</span>`)
+      .join("");
+    modelEnvBox.innerHTML = `
+      <div class="chips">${chips}</div>
+      <div class="muted" style="margin-top:10px; line-height:1.55;">
+        <div><code>OPENAI_BASE_URL</code>: <span class="mono">${escapeHtml(env.openai_base_url || "")}</span></div>
+        <div><code>OPENAI_MODEL</code>: <span class="mono">${escapeHtml(env.openai_model || "")}</span></div>
+        <div><code>OPENAI_ASR_MODEL</code>: <span class="mono">${escapeHtml(env.openai_asr_model || "")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderModelCheckBox() {
+    if (state.models.checking) {
+      modelCheckBox.textContent = "检测中…";
+      return;
+    }
+    const r = state.models.lastCheck;
+    if (!r) {
+      modelCheckBox.textContent = "尚未检测。";
+      return;
+    }
+    const llm = r.llm || {};
+    const asr = r.asr || {};
+    const llmOk = isOkOrSkipped(llm);
+    const asrOk = isOkOrSkipped(asr);
+
+    const lines = [];
+    const llmLine = llm.skipped
+      ? `LLM: skipped (${llm.reason || "disabled"})`
+      : llmOk
+        ? `LLM: ok${llm.latency_ms != null ? ` (${llm.latency_ms}ms)` : ""}`
+        : `LLM: failed (${llm.error || "unknown"})`;
+    const asrLine = asr.skipped
+      ? `ASR: skipped (${asr.reason || "disabled"})`
+      : asrOk
+        ? `ASR: ok${asr.latency_ms != null ? ` (${asr.latency_ms}ms)` : ""}`
+        : `ASR: failed (${asr.error || "unknown"})`;
+    lines.push(llmLine);
+    lines.push(asrLine);
+
+    const suggested = state.models.suggestedMode;
+    const suggestHtml =
+      suggested === "offline"
+        ? `<div class="warn-text" style="margin-top:8px;">建议切换为 offline（录制不受影响，但报告将跳过 ASR/LLM）。</div>`
+        : "";
+
+    modelCheckBox.innerHTML = `
+      <div class="chips">
+        <span class="chip">mode: ${escapeHtml(String(r.mode || ""))}</span>
+        <span class="chip">${escapeHtml(llmOk ? "LLM ✅" : "LLM ❌")}</span>
+        <span class="chip">${escapeHtml(asrOk ? "ASR ✅" : "ASR ❌")}</span>
+      </div>
+      <div class="codebox" style="margin-top:10px;">${escapeHtml(lines.join("\n"))}</div>
+      ${suggestHtml}
+    `;
+  }
+
+  function applyModelFormFromState() {
+    const cfg = state.models.config;
+    if (!cfg) return;
+    modelModeSel.value = String(cfg.mode || "offline");
+    asrProviderSel.value = String(cfg.asr?.provider || "none");
+    asrModelInput.value = String(cfg.asr?.model || "");
+    llmEnabledToggle.checked = Boolean(cfg.llm?.enabled);
+    llmBaseUrlInput.value = String(cfg.llm?.base_url || "");
+    llmModelInput.value = String(cfg.llm?.model || "");
+    updateModelFormDisabledState();
+  }
+
+  function updateModelFormDisabledState() {
+    const cfg = state.models.config || {};
+    const mode = String(cfg.mode || "offline");
+    const offline = mode === "offline";
+    const llmEnabled = Boolean(cfg.llm?.enabled);
+    const asrProvider = String(cfg.asr?.provider || "none");
+
+    llmEnabledToggle.disabled = offline;
+    llmBaseUrlInput.disabled = offline || !llmEnabled;
+    llmModelInput.disabled = offline || !llmEnabled;
+
+    asrProviderSel.disabled = offline;
+    asrModelInput.disabled = offline || asrProvider === "none" || asrProvider === "xfyun_raasr";
+
+    btnModelsSave.disabled = state.models.checking;
+    btnModelsCheck.disabled = state.models.checking;
+    btnModelsCheckDeep.disabled = state.models.checking;
+  }
+
+  function syncModelStateFromForm() {
+    const existing = state.models.config && typeof state.models.config === "object" ? state.models.config : {};
+    const cfg = {
+      mode: String(modelModeSel.value || existing.mode || "offline"),
+      llm: {
+        ...(existing.llm && typeof existing.llm === "object" ? existing.llm : {}),
+        enabled: Boolean(llmEnabledToggle.checked),
+        provider: "openai_compat",
+        base_url: String(llmBaseUrlInput.value || "").trim(),
+        model: String(llmModelInput.value || "").trim(),
+      },
+      asr: {
+        ...(existing.asr && typeof existing.asr === "object" ? existing.asr : {}),
+        provider: String(asrProviderSel.value || "none"),
+        model: String(asrModelInput.value || "").trim(),
+      },
+    };
+    state.models.config = cfg;
+    state.models.dirty = true;
+    updateModelFormDisabledState();
+    updateModelPill();
+  }
+
+  async function loadModelsConfig() {
+    const j = await fetchJson("/api/models/config");
+    if (!j || !j.ok) throw new Error(j?.error || "load models config failed");
+    state.models.config = j.config || null;
+    state.models.env = j.env || null;
+    state.models.providers = j.providers || null;
+    state.models.dirty = false;
+    applyModelFormFromState();
+    renderModelEnvBox();
+    updateModelPill();
+  }
+
+  async function saveModelsConfig() {
+    if (!state.models.config) await loadModelsConfig();
+    const j = await fetchJson("/api/models/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: state.models.config }),
+    });
+    if (!j || !j.ok) throw new Error(j?.error || "save models config failed");
+    state.models.config = j.config || state.models.config;
+    state.models.env = j.env || state.models.env;
+    state.models.dirty = false;
+    applyModelFormFromState();
+    renderModelEnvBox();
+    updateModelPill();
+  }
+
+  async function checkModels({ deep = false } = {}) {
+    if (!state.models.config) await loadModelsConfig();
+    state.models.checking = true;
+    renderModelCheckBox();
+    updateModelFormDisabledState();
+    try {
+      const j = await fetchJson("/api/models/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: state.models.config, deep: Boolean(deep) }),
+      });
+      if (!j || !j.ok) throw new Error(j?.error || "check models failed");
+      state.models.lastCheck = j.result || null;
+      state.models.suggestedMode = j.suggested_mode || null;
+      renderModelCheckBox();
+      updateModelPill();
+      return j;
+    } finally {
+      state.models.checking = false;
+      renderModelCheckBox();
+      updateModelFormDisabledState();
+    }
+  }
+
+  function openModelModal() {
+    modelModal.classList.add("open");
+    applyModelFormFromState();
+    renderModelEnvBox();
+    renderModelCheckBox();
+    modelModal.addEventListener(
+      "click",
+      (e) => {
+        if (e.target === modelModal) closeModelModal();
+      },
+      { once: true },
+    );
+  }
+
+  function closeModelModal() {
+    modelModal.classList.remove("open");
+  }
+
+  async function ensureModelsReadyBeforeRecording() {
+    if (!state.models.config) {
+      try {
+        await loadModelsConfig();
+      } catch (e) {
+        // If the backend is old or the endpoint is missing, don't block recording.
+        console.warn(e);
+        return null;
+      }
+    }
+
+    if (state.models.dirty) {
+      await saveModelsConfig();
+    }
+
+    const cfg = state.models.config || {};
+    const mode = String(cfg.mode || "offline");
+    if (mode !== "online") return null;
+
+    let chk = null;
+    try {
+      chk = await checkModels({ deep: false });
+    } catch (e) {
+      state.models.suggestedMode = "offline";
+      renderModelCheckBox();
+      updateModelPill();
+      const ok = confirm(`模型检测请求失败：${String(e)}\n\n是否切换 offline 继续录制？`);
+      if (!ok) throw new Error(`模型检测失败，已取消开始录制：${String(e)}`);
+
+      const cur = state.models.config || {};
+      state.models.config = {
+        ...cur,
+        mode: "offline",
+        llm: { ...(cur.llm || {}), enabled: false, provider: "openai_compat" },
+        asr: { ...(cur.asr || {}), provider: "none" },
+      };
+      state.models.dirty = true;
+      applyModelFormFromState();
+      await saveModelsConfig();
+      return null;
+    }
+
+    if (String(chk?.suggested_mode || "") === "offline") {
+      const ok = confirm("模型检测未通过，建议切换 offline 继续录制（仍会录制音视频并生成 CV 统计）。\n\n确定切换为 offline 吗？");
+      if (!ok) throw new Error("模型不可用，已取消开始录制。");
+
+      state.models.config = {
+        ...cfg,
+        mode: "offline",
+        llm: { ...(cfg.llm || {}), enabled: false, provider: "openai_compat" },
+        asr: { ...(cfg.asr || {}), provider: "none" },
+      };
+      state.models.dirty = true;
+      applyModelFormFromState();
+      await saveModelsConfig();
+    }
+    return chk;
+  }
+
   async function startRecording() {
     btnStart.disabled = true;
     try {
-      const j = await fetchJson("/api/session/start", { method: "POST" });
+      await ensureModelsReadyBeforeRecording();
+      const j = await fetchJson("/api/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_config: state.models.config }),
+      });
       if (!j || !j.ok) throw new Error(j?.error || "start failed");
       clearAllLiveState();
       setRecording(true, j.session_id);
       state.report.lastStatsUrl = null;
       state.report.lastSessionId = j.session_id;
       btnOpenReport.style.display = "none";
+      if (j.model_config) {
+        state.models.config = j.model_config;
+        state.models.dirty = false;
+        applyModelFormFromState();
+        updateModelPill();
+      }
     } finally {
       btnStart.disabled = state.isRecording;
     }
@@ -910,6 +1235,8 @@
   function renderReportBody(stats) {
     const lesson = stats?.lesson_summary || null;
     const per = stats?.per_student || {};
+    const warnings = Array.isArray(stats?.warnings) ? stats.warnings : [];
+    const modelCfg = stats?.model_config && typeof stats.model_config === "object" ? stats.model_config : null;
     const studentIds = Object.keys(per).sort((a, b) => {
       const na = Number(a);
       const nb = Number(b);
@@ -924,6 +1251,46 @@
     head.style.display = "flex";
     head.style.flexDirection = "column";
     head.style.gap = "10px";
+
+    if (modelCfg || warnings.length) {
+      const mode = String(modelCfg?.mode || "");
+      const asrProvider = String(modelCfg?.asr?.provider || "");
+      const asrModel = String(modelCfg?.asr?.model || "");
+      const llmEnabled = Boolean(modelCfg?.llm?.enabled);
+      const llmModel = String(modelCfg?.llm?.model || "");
+      const llmBase = String(modelCfg?.llm?.base_url || "");
+
+      const chips = [];
+      if (mode) chips.push(`mode: ${mode}`);
+      if (asrProvider) chips.push(`asr: ${asrProvider}${asrModel ? ` (${asrModel})` : ""}`);
+      chips.push(llmEnabled ? `llm: on${llmModel ? ` (${llmModel})` : ""}` : "llm: off");
+
+      const box = document.createElement("div");
+      box.className = "interval";
+      box.innerHTML = `
+        <div class="interval-head">
+          <div class="interval-title">模型/告警</div>
+          <div class="interval-time">${escapeHtml(stats?.session_id || "")}</div>
+        </div>
+        <div class="interval-body">
+          <div><strong>配置：</strong> <div class="chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div></div>
+          ${
+            llmEnabled && llmBase
+              ? `<div><strong>LLM Base URL：</strong> <span class="mono">${escapeHtml(llmBase)}</span></div>`
+              : ""
+          }
+          ${
+            warnings.length
+              ? `<div><strong>告警：</strong><div class="muted">${warnings
+                  .slice(0, 12)
+                  .map((w) => `• ${escapeHtml(String(w))}`)
+                  .join("<br/>")}</div></div>`
+              : '<div><strong>告警：</strong> <span class="muted">（无）</span></div>'
+          }
+        </div>
+      `;
+      head.appendChild(box);
+    }
 
     if (lesson && typeof lesson === "object") {
       const title = String(lesson.title || "").trim();
@@ -1219,6 +1586,51 @@
   }
 
   function bindUi() {
+    btnModelCenter.addEventListener("click", async () => {
+      try {
+        if (!state.models.config) await loadModelsConfig();
+        openModelModal();
+      } catch (e) {
+        alert(`模型中心不可用：${String(e)}`);
+      }
+    });
+    btnModelsClose.addEventListener("click", closeModelModal);
+    btnModelsSave.addEventListener("click", async () => {
+      try {
+        syncModelStateFromForm();
+        await saveModelsConfig();
+        modelCheckBox.innerHTML = `<span class="ok-text">已保存并应用。</span>`;
+        updateModelPill();
+      } catch (e) {
+        alert(`保存失败：${String(e)}`);
+      }
+    });
+    btnModelsCheck.addEventListener("click", async () => {
+      try {
+        syncModelStateFromForm();
+        if (state.models.dirty) await saveModelsConfig();
+        await checkModels({ deep: false });
+      } catch (e) {
+        modelCheckBox.innerHTML = `<span class="danger-text">检测失败：${escapeHtml(String(e))}</span>`;
+      }
+    });
+    btnModelsCheckDeep.addEventListener("click", async () => {
+      try {
+        syncModelStateFromForm();
+        if (state.models.dirty) await saveModelsConfig();
+        await checkModels({ deep: true });
+      } catch (e) {
+        modelCheckBox.innerHTML = `<span class="danger-text">深度检测失败：${escapeHtml(String(e))}</span>`;
+      }
+    });
+
+    modelModeSel.addEventListener("change", syncModelStateFromForm);
+    asrProviderSel.addEventListener("change", syncModelStateFromForm);
+    asrModelInput.addEventListener("input", syncModelStateFromForm);
+    llmEnabledToggle.addEventListener("change", syncModelStateFromForm);
+    llmBaseUrlInput.addEventListener("input", syncModelStateFromForm);
+    llmModelInput.addEventListener("input", syncModelStateFromForm);
+
     windowSel.addEventListener("change", () => {
       state.windowSec = toNum(windowSel.value, 60);
       scheduleRender({ timeline: true });
@@ -1325,6 +1737,12 @@
       const j = await fetchJson("/api/session/status");
       const sid = j?.session_id || null;
       setRecording(Boolean(j?.is_recording), sid);
+      if (j?.model_config && typeof j.model_config === "object") {
+        state.models.config = j.model_config;
+        state.models.dirty = false;
+        applyModelFormFromState();
+        updateModelPill();
+      }
     } catch (_) {
       setRecording(false, null);
     }
@@ -1340,6 +1758,14 @@
     connectWs();
     await loadInitialStatus();
     await refreshSessions();
+
+    try {
+      await loadModelsConfig();
+      await checkModels({ deep: false });
+    } catch (e) {
+      console.warn(e);
+      updateModelPill();
+    }
 
     scheduleRender({ preview: true, timeline: true });
   }

@@ -31,7 +31,11 @@ pip install -r requirements.txt
 
 ### Config (.env) | 配置
 创建 `.env`（按需配置）：
-- DashScope（可选实时 ASR）：`DASH_SCOPE_API_KEY=...`（或 `DASHSCOPE_API_KEY`）。
+- DashScope（可选实时/离线文件 ASR）：`DASH_SCOPE_API_KEY=...`（或 `DASHSCOPE_API_KEY`）。
+- 讯飞 RaaSR（离线录音文件识别）：
+  - `XFYUN_APP_ID=...`
+  - `XFYUN_SECRET_KEY=...`
+  - Optional: `XFYUN_RAASR_HOST`（默认 `https://raasr.xfyun.cn/v2/api`）
 - OpenAI-compatible（用于“整节课离线 ASR + 课程总结/知识点整理”）：
   - `OPENAI_BASE_URL=https://api.openai.com`
   - `OPENAI_API_KEY=...`
@@ -55,6 +59,7 @@ pip install -r requirements.txt
 ```
 
 Web UI 交互流程：
+0) 点击右上角 `models` → 先做一次“检测”（若不可用可切换 offline 模式）
 1) Start Session（开始录制）
 2) Stop Session（停止并落盘）
 3) Generate Report（离线 ASR + LLM 总结 + 不专注区间关联讲课内容）
@@ -64,9 +69,10 @@ Web UI 交互流程：
 - 录制：`temp_video.avi`、`temp_audio.wav`、`session.mp4`
 - CV：`faces.jsonl`、`cv_events.jsonl`
 - 同步：`sync.json`（用于把音频/ASR 时间与 CV 时间对齐）
+- 配置快照：`session_config.json`（本次录制使用的模型选择/环境摘要）
 - 报告：`asr.jsonl`、`transcript.txt`、`lesson_summary.json`、`stats.json`
 
-`stats.json` 中会包含每个 track 的不专注区间（走神/疑似睡觉）、区间内的 ASR 文本片段，以及与课程主题（`lesson_summary.timeline`）的关联结果。
+`stats.json` 中会包含每个 track 的不专注区间（走神/疑似睡觉）、区间内的 ASR 文本片段，以及与课程主题（`lesson_summary.timeline`）的关联结果；同时包含 `model_config`/`warnings` 方便排障。
 
 ## Camera Motion | 摄像头平移抖动/旋转变焦
 当前实现采用“时间感知匹配 + 运动预测 + 全局相机位移补偿 +（可选）相似变换补偿”的组合策略来尽量保证同一节课 track 不乱（见 `cv/face_analyzer.py`）。

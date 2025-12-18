@@ -3,11 +3,12 @@ import json
 import base64
 import os
 import time
+import re
 from typing import List
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi import BackgroundTasks
 
@@ -30,8 +31,7 @@ app.mount("/out", StaticFiles(directory="out"), name="out")
 event_queue: asyncio.Queue = asyncio.Queue()
 
 # Session Manager Instance
-# Hardcoded ffmpeg path for now based on user context
-FFMPEG_PATH = r"C:\Users\HP\Downloads\ffmpeg\bin\ffmpeg.exe"
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") or "ffmpeg"
 session_mgr = SessionManager(ffmpeg_path=FFMPEG_PATH)
 
 # Processing state for background jobs
@@ -137,6 +137,37 @@ async def startup():
     asyncio.create_task(stats_logger())
 
 
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/static/viz.html")
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    base = Path("out")
+    sessions = []
+    try:
+        for p in base.iterdir():
+            if not p.is_dir():
+                continue
+            sid = p.name
+            st = p.stat()
+            stats_path = p / "stats.json"
+            transcript_path = p / "transcript.txt"
+            video_path = p / "session.mp4"
+            sessions.append({
+                "session_id": sid,
+                "mtime": float(getattr(st, "st_mtime", 0.0)),
+                "has_stats": stats_path.exists(),
+                "has_transcript": transcript_path.exists(),
+                "has_video": video_path.exists() or any(p.glob("*.mp4")),
+            })
+    except Exception:
+        sessions = []
+    sessions.sort(key=lambda x: x.get("mtime", 0.0), reverse=True)
+    return {"ok": True, "sessions": sessions}
+
+
 @app.post("/api/session/start")
 async def start_session():
     try:
@@ -203,15 +234,35 @@ def _summarize_text(text: str, max_points: int = 6):
         except Exception:
             pass
 
-    # Fallback simple extractor: top frequent non-stopwords
-    stopwords = set(["the","is","and","to","a","of","in","that","it","for","on","with","as","are","this","be","by","an","or","from","at","we","you","they","he","she"]) 
+    # Fallback extractor:
+    # 1) If CJK text dominates, extract frequent 2-8 char phrases.
+    cjk = re.findall(r"[\u4e00-\u9fff]{2,8}", text)
+    if len(cjk) >= 3:
+        freq = {}
+        for tok in cjk:
+            freq[tok] = freq.get(tok, 0) + 1
+        items = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0])))
+        points = []
+        for tok, _ in items:
+            if any(tok in p or p in tok for p in points):
+                continue
+            points.append(tok)
+            if len(points) >= max_points:
+                break
+        return points
+
+    # 2) Otherwise, extract frequent tokens (space-delimited languages)
+    stopwords = set([
+        "the", "is", "and", "to", "a", "of", "in", "that", "it", "for", "on", "with", "as", "are", "this", "be", "by", "an", "or", "from", "at", "we", "you", "they", "he", "she",
+    ])
     words = [w.strip('.,:;?()[]"').lower() for w in text.split() if len(w) > 2]
     freq = {}
     for w in words:
-        if w in stopwords: continue
+        if w in stopwords:
+            continue
         freq[w] = freq.get(w, 0) + 1
     items = sorted(freq.items(), key=lambda x: -x[1])[:max_points]
-    return [w for w, c in items]
+    return [w for w, _ in items]
 
 
 @app.post('/api/session/process')
@@ -241,30 +292,150 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             video_candidates = list(session_dir.glob('session.mp4')) + list(session_dir.glob('*.mp4')) + list(session_dir.glob('temp_video.avi'))
             video_path = video_candidates[0] if video_candidates else None
 
-            # Build transcript from asr.jsonl if present
-            asr_path = session_dir / 'asr.jsonl'
-            transcript_txt = session_dir / 'transcript.txt'
+            def _as_text(obj) -> str:
+                if obj is None:
+                    return ""
+                if isinstance(obj, str):
+                    return obj.strip()
+                if isinstance(obj, dict):
+                    if obj.get("text"):
+                        return str(obj.get("text")).strip()
+                    words = obj.get("words")
+                    if isinstance(words, list):
+                        return "".join(str(w.get("text", "")) for w in words).strip()
+                return str(obj).strip()
+
+            def _maybe_generate_asr_from_audio() -> None:
+                """Optional: if `asr.jsonl` is missing but we have `temp_audio.wav`,
+                try to run DashScope file transcription to produce ASR segments.
+                """
+                asr_path = session_dir / "asr.jsonl"
+                if asr_path.exists():
+                    return
+                wav_in = session_dir / "temp_audio.wav"
+                if not wav_in.exists():
+                    return
+
+                # Map DASH_SCOPE_API_KEY -> DASHSCOPE_API_KEY for compatibility
+                if os.getenv("DASH_SCOPE_API_KEY") and not os.getenv("DASHSCOPE_API_KEY"):
+                    os.environ["DASHSCOPE_API_KEY"] = os.environ["DASH_SCOPE_API_KEY"]
+                if not os.getenv("DASHSCOPE_API_KEY"):
+                    return
+
+                try:
+                    from asr.asr_client import transcribe_file
+                except Exception:
+                    return
+
+                wav_for_asr = wav_in
+                try:
+                    import soundfile as sf
+                    import numpy as np
+                    data, sr = sf.read(str(wav_in), dtype="float32", always_2d=True)
+                    if data.size == 0:
+                        return
+                    mono = data[:, 0] if data.ndim == 2 else data.reshape(-1)
+                    mono = np.clip(mono, -1.0, 1.0)
+                    pcm = (mono * 32767.0).astype(np.int16)
+                    pcm_wav = session_dir / "asr_audio_pcm16.wav"
+                    sf.write(str(pcm_wav), pcm, sr, subtype="PCM_16")
+                    wav_for_asr = pcm_wav
+                except Exception:
+                    wav_for_asr = wav_in
+
+                _proc_jobs[job_id]["status"] = "running:asr"
+                events = []
+                cur_sec = 0.0
+                last_sec = -1
+
+                def progress_hook(sec: float):
+                    nonlocal cur_sec, last_sec
+                    cur_sec = float(sec or 0.0)
+                    sec_i = int(cur_sec)
+                    if sec_i != last_sec:
+                        last_sec = sec_i
+                        _proc_jobs[job_id]["status"] = f"running:asr {sec_i}s"
+
+                def time_base():
+                    return cur_sec
+
+                def on_sentence(ev: dict):
+                    if isinstance(ev, dict):
+                        events.append(ev)
+
+                try:
+                    transcribe_file(
+                        api_key=None,
+                        wav_path=str(wav_for_asr),
+                        time_base=time_base,
+                        on_sentence=on_sentence,
+                        progress_hook=progress_hook,
+                    )
+                except Exception:
+                    _proc_jobs[job_id]["status"] = "running"
+                    return
+
+                events.sort(key=lambda e: float(e.get("ts", 0.0)))
+                segments = []
+                for idx, ev in enumerate(events):
+                    start = float(ev.get("ts", 0.0))
+                    nxt = events[idx + 1] if idx + 1 < len(events) else None
+                    end = float(nxt.get("ts", start + 2.0)) if nxt else (start + 2.0)
+                    segments.append({
+                        "start": float(start),
+                        "end": float(max(end, start + 0.2)),
+                        "text": _as_text(ev.get("text")),
+                        "raw": ev.get("raw"),
+                    })
+
+                try:
+                    with open(asr_path, "w", encoding="utf-8") as fh:
+                        for seg in segments:
+                            fh.write(json.dumps(seg, ensure_ascii=False) + "\n")
+                except Exception:
+                    return
+
+            # Load/Generate ASR segments
+            _maybe_generate_asr_from_audio()
+            _proc_jobs[job_id]["status"] = "running:load_asr"
+            transcript_txt = session_dir / "transcript.txt"
             asr_segments = []
-            if asr_path.exists():
-                asr_segments = _read_jsonl(asr_path)
-                # concatenate
-                with open(transcript_txt, 'w', encoding='utf-8') as fh:
-                    for seg in asr_segments:
-                        text = seg.get('text') if isinstance(seg, dict) else ''
-                        if not text and isinstance(seg, str):
-                            text = seg
-                        fh.write((text or '').strip() + '\n')
-            else:
-                # try to find any *.asr.jsonl or asr*.jsonl
-                found = list(session_dir.glob('*.asr.jsonl')) + list(session_dir.glob('*.asr'))
-                if found:
-                    asr_segments = _read_jsonl(found[0])
-                    with open(transcript_txt, 'w', encoding='utf-8') as fh:
+            try:
+                from analysis.teacher_labeler import load_asr_jsonl
+            except Exception:
+                load_asr_jsonl = None
+
+            # Prefer session_dir/asr.jsonl; else fall back to any *.asr.jsonl
+            asr_candidates = []
+            if (session_dir / "asr.jsonl").exists():
+                asr_candidates.append(session_dir / "asr.jsonl")
+            asr_candidates.extend(session_dir.glob("*.asr.jsonl"))
+
+            for p in asr_candidates:
+                try:
+                    if load_asr_jsonl:
+                        asr_segments = load_asr_jsonl(str(p))
+                    else:
+                        # minimal compatibility: accept already-normalized segment dicts
+                        asr_segments = _read_jsonl(p)
+                    if asr_segments:
+                        break
+                except Exception:
+                    continue
+
+            if asr_segments:
+                try:
+                    with open(transcript_txt, "w", encoding="utf-8") as fh:
                         for seg in asr_segments:
-                            text = seg.get('text') if isinstance(seg, dict) else ''
-                            fh.write((text or '').strip() + '\n')
+                            if isinstance(seg, dict):
+                                fh.write((_as_text(seg.get("text")) + "\n").strip() + "\n")
+                            else:
+                                fh.write((_as_text(seg) + "\n").strip() + "\n")
+                except Exception:
+                    pass
 
             # Parse cv events to build per-student non-awake intervals
+            _proc_jobs[job_id]["status"] = "running:cv_intervals"
             events_path = session_dir / 'cv_events.jsonl'
             faces_path = session_dir / 'faces.jsonl'
             events = _read_jsonl(events_path) if events_path.exists() else []
@@ -303,23 +474,27 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                 per_student[sid_ev].pop('open', None)
 
             # Associate ASR segments to intervals
+            _proc_jobs[job_id]["status"] = "running:align_asr"
             for sid_ev, info in per_student.items():
                 for it in info['intervals']:
                     # gather ASR segments that overlap interval
                     txts = []
                     for seg in asr_segments:
-                        s = float(seg.get('start', 0.0))
-                        e = float(seg.get('end', s + 2.0))
+                        if not isinstance(seg, dict):
+                            continue
+                        s = float(seg.get('start', seg.get('ts', 0.0)))
+                        e = float(seg.get('end', s + float(seg.get('duration', 2.0))))
                         # overlap if seg midpoint inside interval or any overlap
                         mid = (s+e)/2.0
                         if (mid >= it['start'] and mid <= it['end']) or (s < it['end'] and e > it['start']):
-                            txts.append(seg.get('text',''))
+                            txts.append(_as_text(seg.get('text', '')))
                     joined = '\n'.join([t for t in txts if t])
                     it['asr_text'] = joined
                     # summarize into knowledge points
                     it['knowledge_points'] = _summarize_text(joined or '')
 
             # Save stats file
+            _proc_jobs[job_id]["status"] = "running:write_stats"
             stats_out = session_dir / 'stats.json'
             with open(stats_out, 'w', encoding='utf-8') as fh:
                 json.dump({'session_id': session_dir.name, 'video': str(video_path.name) if video_path else None, 'transcript': str(transcript_txt.name) if transcript_txt.exists() else None, 'per_student': per_student}, fh, ensure_ascii=False, indent=2)

@@ -50,6 +50,7 @@ def _ear_from_pts(pts2d: np.ndarray,
 class TrackState:
     id: int
     last_ts: Optional[float] = None
+    prev_ts: Optional[float] = None
     center: Tuple[float, float] = (0.0, 0.0)
     prev_center: Tuple[float, float] = (0.0, 0.0)
     miss_count: int = 0
@@ -98,6 +99,11 @@ class FaceAnalyzerConfig:
     # allowed extra pixels per second of absence when matching (time-aware slack)
     match_speed_px_per_sec: float = 200.0
     max_miss_count: int = 10
+    # Optional stabilization against camera motion (pan/tilt).
+    # When enabled, we estimate a global translation between the previous tracks
+    # and current detections and compensate before matching.
+    compensate_camera_shift: bool = True
+    camera_shift_max_px: float = 600.0
 
     debug_draw: bool = False
 
@@ -155,6 +161,7 @@ class FaceAnalyzer:
             dt = 0.0 if st.last_ts is None else max(0.0, timestamp - st.last_ts)
             # remember previous center before updating (useful for prediction/heuristics)
             st.prev_center = st.center
+            st.prev_ts = st.last_ts
             st.last_ts = timestamp
             st.center = center
             st.miss_count = 0
@@ -339,38 +346,93 @@ class FaceAnalyzer:
             return None
 
     def _associate(self, centers: List[Tuple[float, float]], timestamp: float) -> Dict[int, int]:
-        """Greedy nearest-neighbor face-to-track assignment with time-aware tolerance.
+        """Assign detections to existing tracks.
 
-        If a track was last seen some time ago, allow a larger matching radius
-        proportional to the elapsed time (pixels/sec configured by
-        `match_speed_px_per_sec`). This reduces ID churn when subjects move
-        quickly or are briefly occluded.
+        This matcher is designed to be robust to:
+        - Normal subject motion (constant-velocity prediction).
+        - Small/medium camera pan/tilt (optional global translation compensation).
+        - Brief occlusions (time-aware slack in gating threshold).
+
+        NOTE: We intentionally keep this dependency-free (no SciPy/Hungarian),
+        because `max_faces` is small and this runs on-device.
         """
         assign: Dict[int, int] = {}
         if not centers:
             return assign
-        unused_tracks = set(self.tracks.keys())
-        for i, c in enumerate(centers):
-            best_tid, best_d = None, 1e9
-            for tid in list(unused_tracks):
-                st = self.tracks[tid]
-                d = np.hypot(c[0] - st.center[0], c[1] - st.center[1])
-                if d < best_d:
-                    best_d, best_tid = d, tid
+        track_ids = list(self.tracks.keys())
+        if not track_ids:
+            for i in range(len(centers)):
+                assign[i] = None
+            return assign
 
-            if best_tid is not None:
-                st = self.tracks[best_tid]
-                # time since last seen; if None, treat as just-seen (dt=0)
-                dt = max(0.0, timestamp - (st.last_ts or timestamp))
-                # allow extra slack proportional to time since last seen
-                slack = dt * float(getattr(self.cfg, 'match_speed_px_per_sec', 0.0))
-                threshold = float(self.cfg.match_max_px) + slack
-                if best_d <= threshold:
-                    assign[i] = best_tid
-                    unused_tracks.remove(best_tid)
-                else:
-                    assign[i] = None
-            else:
+        def _predict_center(st: TrackState) -> Tuple[float, float]:
+            """Constant-velocity prediction from (prev_center, center) with timestamps."""
+            if st.last_ts is None:
+                return st.center
+            if st.prev_ts is None or st.prev_ts >= st.last_ts:
+                return st.center
+            dt_hist = float(st.last_ts - st.prev_ts)
+            if dt_hist <= 1e-6:
+                return st.center
+            vx = (st.center[0] - st.prev_center[0]) / dt_hist
+            vy = (st.center[1] - st.prev_center[1]) / dt_hist
+            dt_fwd = max(0.0, float(timestamp - st.last_ts))
+            return (st.center[0] + vx * dt_fwd, st.center[1] + vy * dt_fwd)
+
+        pred = {tid: _predict_center(self.tracks[tid]) for tid in track_ids}
+
+        # Optional: compensate a global camera translation (pan/tilt) using a
+        # robust median of nearest-neighbor deltas.
+        if getattr(self.cfg, "compensate_camera_shift", True) and len(track_ids) >= 2 and len(centers) >= 2:
+            deltas = []
+            for c in centers:
+                best_tid, best_d = None, 1e9
+                for tid in track_ids:
+                    pc = pred[tid]
+                    d = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
+                    if d < best_d:
+                        best_d, best_tid = d, tid
+                if best_tid is not None:
+                    pc = pred[best_tid]
+                    deltas.append((c[0] - pc[0], c[1] - pc[1]))
+            if deltas:
+                dx = float(np.median([d[0] for d in deltas]))
+                dy = float(np.median([d[1] for d in deltas]))
+                shift = float(np.hypot(dx, dy))
+                max_shift = float(getattr(self.cfg, "camera_shift_max_px", 600.0))
+                if shift > max_shift and shift > 1e-6:
+                    scale = max_shift / shift
+                    dx *= scale
+                    dy *= scale
+                for tid in track_ids:
+                    pc = pred[tid]
+                    pred[tid] = (pc[0] + dx, pc[1] + dy)
+
+        # Build all candidate pairs and do a global greedy assignment by distance.
+        candidates: List[Tuple[float, int, int]] = []  # (dist, det_i, tid)
+        for i, c in enumerate(centers):
+            for tid in track_ids:
+                pc = pred[tid]
+                d = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
+                candidates.append((d, i, tid))
+        candidates.sort(key=lambda x: x[0])
+
+        assigned_dets = set()
+        assigned_tracks = set()
+        for d, i, tid in candidates:
+            if i in assigned_dets or tid in assigned_tracks:
+                continue
+            st = self.tracks[tid]
+            dt = max(0.0, float(timestamp - (st.last_ts or timestamp)))
+            slack = dt * float(getattr(self.cfg, "match_speed_px_per_sec", 0.0))
+            threshold = float(self.cfg.match_max_px) + slack
+            if d <= threshold:
+                assign[i] = tid
+                assigned_dets.add(i)
+                assigned_tracks.add(tid)
+
+        for i in range(len(centers)):
+            if i not in assign:
                 assign[i] = None
 
         return assign

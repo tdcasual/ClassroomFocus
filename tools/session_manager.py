@@ -7,7 +7,7 @@ import sounddevice as sd
 import soundfile as sf
 import numpy as np
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Empty
 import subprocess
 import logging
 
@@ -115,6 +115,8 @@ class SessionManager:
         
         frame_idx = 0
         start_time = time.time()
+        last_preview_ts = -1e9
+        preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))  # ~6-7 fps by default
 
         with open(faces_path, "w", encoding="utf-8") as f_faces, \
              open(events_path, "w", encoding="utf-8") as f_events:
@@ -148,14 +150,15 @@ class SessionManager:
                 
                 # Callback for Web Viz
                 if self.on_data_callback:
-                    # Convert frame to base64 for web display (optional, might be heavy)
-                    # Or just send metadata. For now, let's send metadata + maybe a low-res preview?
-                    # Sending full video over WS might be too much. 
-                    # Let's send just the analysis results for the timeline.
-                    # If we want live preview, we can send a resized jpeg.
-                    
-                    _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
-                    img_str = buffer.tobytes()
+                    img_str = None
+                    # Throttle preview frames to reduce CPU/network usage.
+                    if (ts - last_preview_ts) >= preview_interval_sec:
+                        last_preview_ts = ts
+                        try:
+                            _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
+                            img_str = buffer.tobytes()
+                        except Exception:
+                            img_str = None
                     
                     data = {
                         "type": "frame_data",
@@ -176,10 +179,20 @@ class SessionManager:
         temp_audio_path = self.output_dir / "temp_audio.wav"
         
         try:
-            with sf.SoundFile(str(temp_audio_path), mode='w', samplerate=self.sample_rate, channels=self.channels) as file:
-                with sd.InputStream(samplerate=self.sample_rate, device=self.mic_device, channels=self.channels, callback=self._audio_callback):
+            with sf.SoundFile(str(temp_audio_path), mode='w', samplerate=self.sample_rate, channels=self.channels, subtype="PCM_16") as file:
+                with sd.InputStream(
+                    samplerate=self.sample_rate,
+                    device=self.mic_device,
+                    channels=self.channels,
+                    dtype="int16",
+                    callback=self._audio_callback,
+                ):
                     while not self.stop_event.is_set():
-                        file.write(self.audio_queue.get())
+                        try:
+                            block = self.audio_queue.get(timeout=0.2)
+                        except Empty:
+                            continue
+                        file.write(block)
         except Exception as e:
             logger.error(f"Audio recording failed: {e}")
 

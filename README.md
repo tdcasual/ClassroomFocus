@@ -36,6 +36,8 @@ echo DASH_SCOPE_API_KEY=your_key_here > .env
 - Video replay with overlay: `python tools/run_video_replay.py`（使用 `samples/students.mp4`）。
 - Webcam probing: `python tools/list_cams_probe.py`，`python tools/try_open_by_name.py`。
 - Record classroom ASR + raw audio: `python tools/record_classroom_asr.py [api_key] [duration_secs]`。
+- Web UI (live monitor + report): `python tools/web_viz_server.py` then open `http://localhost:8000/`。
+  - Optional env: `FFMPEG_PATH` (ffmpeg path), `WEB_PREVIEW_INTERVAL_SEC` (preview frame interval, default 0.15s).
 
 ## Tests | 测试
 ```bash

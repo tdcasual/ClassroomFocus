@@ -1,437 +1,1240 @@
-const previewCanvas = document.getElementById('preview');
-const previewCtx = previewCanvas.getContext('2d');
-const canvas = document.getElementById('timeline');
-const ctx = canvas.getContext('2d');
-const sidebar = document.getElementById('sidebar');
-const btnStart = document.getElementById('btnStart');
-const btnStop = document.getElementById('btnStop');
-const recStatus = document.getElementById('recStatus');
-const btnStats = document.getElementById('btnStats');
-const statsPanel = document.getElementById('statsPanel');
-const statsClose = document.getElementById('statsClose');
-const statsLinks = document.getElementById('statsLinks');
-const statsTableWrap = document.getElementById('statsTableWrap');
+(() => {
+  const previewCanvas = document.getElementById("preview");
+  const previewCtx = previewCanvas.getContext("2d", { alpha: false });
+  const timelineCanvas = document.getElementById("timeline");
+  const timelineCtx = timelineCanvas.getContext("2d");
 
-let ws = null;
-let students = new Map(); // track_id -> {id, state, last_seen, img, history: [{ts, state}]}
-let windowSize = 60; // seconds
-let now = Date.now() / 1000;
+  const studentList = document.getElementById("studentList");
+  const studentFilter = document.getElementById("studentFilter");
+  const windowSel = document.getElementById("windowSel");
+  const sessionSelect = document.getElementById("sessionSelect");
+  const btnRefreshSessions = document.getElementById("btnRefreshSessions");
 
-// Colors
-const COLORS = {
-    'awake': '#4CAF50',
-    'drowsy': '#FF9800',
-    'down': '#F44336',
-    'unknown': '#9E9E9E'
-};
+  const wsDot = document.getElementById("wsDot");
+  const wsStatus = document.getElementById("wsStatus");
 
-function init() {
-    resize();
-    window.addEventListener('resize', resize);
-    connect();
-    requestAnimationFrame(loop);
+  const recDot = document.getElementById("recDot");
+  const recStatusText = document.getElementById("recStatusText");
+  const sessionIdText = document.getElementById("sessionIdText");
 
-    document.getElementById('windowSel').onchange = e => windowSize = parseInt(e.target.value);
-    
-    btnStart.onclick = async () => {
+  const btnStart = document.getElementById("btnStart");
+  const btnStop = document.getElementById("btnStop");
+  const btnReport = document.getElementById("btnReport");
+  const btnOpenReport = document.getElementById("btnOpenReport");
+
+  const toggleBoxes = document.getElementById("toggleBoxes");
+  const toggleLabels = document.getElementById("toggleLabels");
+  const toggleAsr = document.getElementById("toggleAsr");
+
+  const fpsDot = document.getElementById("fpsDot");
+  const fpsText = document.getElementById("fpsText");
+
+  const selectedStudentText = document.getElementById("selectedStudentText");
+  const nowText = document.getElementById("nowText");
+  const asrNowText = document.getElementById("asrNowText");
+
+  const btnFollow = document.getElementById("btnFollow");
+  const btnClearCursor = document.getElementById("btnClearCursor");
+  const cursorInspector = document.getElementById("cursorInspector");
+  const cursorTimeText = document.getElementById("cursorTimeText");
+  const cursorStateText = document.getElementById("cursorStateText");
+  const cursorAsrText = document.getElementById("cursorAsrText");
+
+  const reportModal = document.getElementById("reportModal");
+  const btnCloseReport = document.getElementById("btnCloseReport");
+  const btnReloadReport = document.getElementById("btnReloadReport");
+  const reportKpis = document.getElementById("reportKpis");
+  const reportLinks = document.getElementById("reportLinks");
+  const reportBody = document.getElementById("reportBody");
+
+  const COLORS = {
+    awake: "#22c55e",
+    drowsy: "#f59e0b",
+    down: "#ef4444",
+    "drowsy+down": "#8b5cf6",
+    unknown: "rgba(255,255,255,0.45)",
+    teacher: "rgba(56,189,248,0.30)",
+    student: "rgba(255,255,255,0.16)",
+  };
+
+  const state = {
+    ws: null,
+    wsConnected: false,
+    isRecording: false,
+    sessionId: null,
+
+    windowSec: 60,
+    nowSec: 0,
+
+    students: new Map(), // id -> Student
+    selectedStudentId: null,
+
+    followLive: true,
+    cursorTime: null,
+
+    showBoxes: true,
+    showLabels: true,
+    showAsr: true,
+
+    lastFrame: {
+      image: null,
+      ts: 0,
+      faces: [],
+      b64: null,
+    },
+    asrSegments: [], // {start,end,text,label}
+
+    fps: {
+      lastSec: 0,
+      framesThisSec: 0,
+      value: 0,
+    },
+
+    report: {
+      jobId: null,
+      lastResult: null,
+      lastStatsUrl: null,
+      lastSessionId: null,
+      polling: false,
+    },
+  };
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  let rafId = null;
+  let needsPreview = false;
+  let needsTimeline = false;
+  function scheduleRender({ preview = false, timeline = false } = {}) {
+    needsPreview = needsPreview || preview;
+    needsTimeline = needsTimeline || timeline;
+    if (rafId != null) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      if (needsPreview) drawPreview();
+      if (needsTimeline) renderTimeline();
+      needsPreview = false;
+      needsTimeline = false;
+    });
+  }
+
+  function toNum(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function formatSec(sec) {
+    const v = Math.max(0, Number(sec) || 0);
+    return `${v.toFixed(2)}s`;
+  }
+
+  function formatDuration(sec) {
+    const v = Math.max(0, Number(sec) || 0);
+    if (v < 60) return `${v.toFixed(1)}s`;
+    const m = Math.floor(v / 60);
+    const s = v - m * 60;
+    return `${m}m ${s.toFixed(0)}s`;
+  }
+
+  function escapeHtml(str) {
+    if (str == null) return "";
+    return String(str).replace(/[&<>"]/g, (ch) => {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch] || ch;
+    });
+  }
+
+  function normalizeState(s) {
+    const v = String(s || "").trim().toLowerCase();
+    if (!v) return "unknown";
+    if (v === "awake" || v === "drowsy" || v === "down" || v === "drowsy+down") return v;
+    if (v.includes("drowsy") && v.includes("down")) return "drowsy+down";
+    if (v.includes("drowsy")) return "drowsy";
+    if (v.includes("down")) return "down";
+    return "unknown";
+  }
+
+  function stateLabel(s) {
+    switch (s) {
+      case "awake":
+        return "清醒";
+      case "drowsy":
+        return "瞌睡";
+      case "down":
+        return "低头";
+      case "drowsy+down":
+        return "瞌睡+低头";
+      default:
+        return "未知";
+    }
+  }
+
+  function dotClassForState(s) {
+    switch (s) {
+      case "awake":
+        return "good";
+      case "drowsy":
+        return "warn";
+      case "down":
+        return "bad";
+      case "drowsy+down":
+        return "severe";
+      default:
+        return "unknown";
+    }
+  }
+
+  function setWsStatus(connected) {
+    state.wsConnected = connected;
+    wsStatus.textContent = connected ? "connected" : "disconnected";
+    wsDot.className = `dot ${connected ? "good" : "unknown"}`;
+  }
+
+  function setRecording(isRec, sessionId = null) {
+    state.isRecording = Boolean(isRec);
+    if (sessionId != null) state.sessionId = sessionId;
+
+    btnStart.disabled = state.isRecording;
+    btnStop.disabled = !state.isRecording;
+    btnReport.disabled = state.isRecording || !state.sessionId;
+    btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
+
+    recStatusText.textContent = state.isRecording ? "recording" : "idle";
+    recDot.className = `dot ${state.isRecording ? "bad" : "unknown"}`;
+
+    if (state.sessionId) {
+      sessionIdText.textContent = state.sessionId;
+      sessionIdText.style.display = "inline";
+      sessionIdText.className = "mono";
+    } else {
+      sessionIdText.style.display = "none";
+    }
+  }
+
+  function resizeCanvasToElement(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      return true;
+    }
+    return false;
+  }
+
+  function connectWs() {
+    try {
+      if (state.ws) {
         try {
-            const res = await fetch('/api/session/start', {method: 'POST'});
-            if(res.ok) {
-                setRecording(true);
-                students.clear();
-                sidebar.innerHTML = '';
-            }
-        } catch(e) { console.error(e); }
-    };
-
-    btnStop.onclick = async () => {
-        try {
-            const res = await fetch('/api/session/stop', {method: 'POST'});
-            if(res.ok) setRecording(false);
-            // enable stats button when stopped
-            btnStats.style.display = 'inline-block';
-        } catch(e) { console.error(e); }
-    };
-
-    btnStats.onclick = async () => {
-        btnStats.disabled = true;
-        statsLinks.innerHTML = '<div>正在开始统计处理…</div>';
-        statsTableWrap.innerHTML = '';
-        statsPanel.style.display = 'block';
-        try {
-            const startRes = await fetch('/api/session/process', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
-            const j = await startRes.json();
-            if(!j.ok) {
-                statsLinks.innerHTML = `<div style="color:red;">处理失败: ${j.error || 'unknown'}</div>`;
-                btnStats.disabled = false;
-                return;
-            }
-            const job = j.job_id;
-            statsLinks.innerHTML = `<div>任务已提交，job=${job}。处理中，请稍候…</div>`;
-            // poll
-            let done = false;
-            let result = null;
-            for(let i=0;i<120;i++){
-                await new Promise(r=>setTimeout(r, 1000));
-                try{
-                    const st = await fetch(`/api/session/process/status?job_id=${job}`);
-                    const sj = await st.json();
-                    if(sj.ok && sj.job){
-                        const stt = sj.job.status;
-                        if(stt === 'done'){
-                            done = true;
-                            result = sj.job.result;
-                            break;
-                        } else if(stt === 'error'){
-                            statsLinks.innerHTML = `<div style="color:red;">处理出错: ${sj.job.error}</div>`;
-                            break;
-                        }
-                        // else still running
-                        statsLinks.innerHTML = `<div>处理中: ${stt} (轮询 ${i+1})</div>`;
-                    }
-                }catch(e){ console.warn(e); }
-            }
-            if(done && result){
-                // show links
-                let linksHtml = '<div style="margin-bottom:8px;"><strong>下载：</strong></div>';
-                if(result.video) linksHtml += `<div><a href="${result.video}" target="_blank">完整视频</a></div>`;
-                if(result.transcript) linksHtml += `<div><a href="${result.transcript}" target="_blank">完整文字转录</a></div>`;
-                if(result.stats) linksHtml += `<div><a href="${result.stats}" target="_blank">统计 JSON</a></div>`;
-                statsLinks.innerHTML = linksHtml;
-
-                // fetch stats json and render table
-                try{
-                    const sj = await fetch(result.stats);
-                    const data = await sj.json();
-                    renderStatsTable(data.per_student || {});
-                }catch(e){ statsTableWrap.innerHTML = `<div style="color:red">无法加载统计结果：${e}</div>`; }
-            } else {
-                statsLinks.innerHTML = `<div style="color:orange;">处理未在超时时间内完成，请稍后重试或查看服务器日志。</div>`;
-            }
-        } catch(e){
-            statsLinks.innerHTML = `<div style="color:red;">启动处理失败: ${e}</div>`;
-            console.error(e);
+          state.ws.close();
+        } catch (_) {
+          // ignore
         }
-        btnStats.disabled = false;
+        state.ws = null;
+      }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      state.ws = ws;
+      ws.onopen = () => setWsStatus(true);
+      ws.onclose = () => {
+        setWsStatus(false);
+        setTimeout(connectWs, 1200);
+      };
+      ws.onerror = () => setWsStatus(false);
+      ws.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data && data.type === "batch" && Array.isArray(data.events)) {
+            for (const ev of data.events) handleEvent(ev);
+          } else {
+            handleEvent(data);
+          }
+        } catch (_) {
+          // ignore
+        }
+      };
+    } catch (_) {
+      setWsStatus(false);
+      setTimeout(connectWs, 1200);
+    }
+  }
+
+  function handleEvent(ev) {
+    if (!ev || typeof ev !== "object") return;
+    const typ = ev.type;
+    if (typ === "frame_data") {
+      handleFrameData(ev);
+      return;
+    }
+    if (typ === "asr_segment") {
+      handleAsrSegment(ev);
+      return;
+    }
+    if (typ === "ASR_SENTENCE") {
+      const t = toNum(ev.ts, state.nowSec);
+      const text = typeof ev.text === "string" ? ev.text : JSON.stringify(ev.text || "");
+      handleAsrSegment({ start: t, end: t + 2.0, text, label: "teacher" });
+      return;
+    }
+  }
+
+  function ensureStudent(id) {
+    const sid = String(id);
+    const existing = state.students.get(sid);
+    if (existing) return existing;
+
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "student-card";
+    card.dataset.sid = sid;
+
+    const avatar = document.createElement("canvas");
+    avatar.className = "avatar";
+    avatar.width = 46;
+    avatar.height = 46;
+
+    const main = document.createElement("div");
+    main.className = "student-main";
+
+    const top = document.createElement("div");
+    top.className = "student-top";
+
+    const name = document.createElement("div");
+    name.className = "student-name";
+    name.textContent = `学生 ${sid}`;
+
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.innerHTML = `<span class="dot unknown"></span><span>未知</span>`;
+
+    top.appendChild(name);
+    top.appendChild(badge);
+
+    const meta = document.createElement("div");
+    meta.className = "meta-row";
+
+    const metaSeen = document.createElement("span");
+    metaSeen.innerHTML = `last <code>—</code>`;
+
+    const metaEar = document.createElement("span");
+    metaEar.innerHTML = `EAR <code>—</code>`;
+
+    const metaPitch = document.createElement("span");
+    metaPitch.innerHTML = `pitch <code>—</code>`;
+
+    meta.appendChild(metaSeen);
+    meta.appendChild(metaEar);
+    meta.appendChild(metaPitch);
+
+    main.appendChild(top);
+    main.appendChild(meta);
+
+    card.appendChild(avatar);
+    card.appendChild(main);
+
+    card.addEventListener("click", () => {
+      selectStudent(sid);
+    });
+
+    const student = {
+      id: sid,
+      state: "unknown",
+      lastSeen: 0,
+      bbox: null,
+      ear: null,
+      pitch: null,
+      blinkCount: 0,
+      history: [],
+      dom: { card, avatar, name, badge, metaSeen, metaEar, metaPitch },
+      lastAvatarTs: -1e9,
     };
 
-    statsClose.onclick = () => { statsPanel.style.display = 'none'; };
+    state.students.set(sid, student);
+    if (!studentList.querySelector(".student-card")) {
+      studentList.innerHTML = "";
+    }
+    insertStudentCardSorted(card);
+    if (!state.selectedStudentId) selectStudent(sid);
+    return student;
+  }
 
-function renderStatsTable(per_student) {
-    statsTableWrap.innerHTML = '';
-    const keys = Object.keys(per_student).sort();
-    if(keys.length === 0){
-        statsTableWrap.innerHTML = '<div>没有检测到非-awake 状态。</div>';
+  function insertStudentCardSorted(card) {
+    const sid = card.dataset.sid || "";
+    const sidNum = Number(sid);
+    const children = Array.from(studentList.querySelectorAll(".student-card"));
+    const idx = children.findIndex((el) => {
+      const other = el.dataset.sid || "";
+      const otherNum = Number(other);
+      if (Number.isFinite(sidNum) && Number.isFinite(otherNum)) return sidNum < otherNum;
+      return sid.localeCompare(other) < 0;
+    });
+    if (idx === -1) studentList.appendChild(card);
+    else studentList.insertBefore(card, children[idx]);
+  }
+
+  function selectStudent(sid) {
+    state.selectedStudentId = sid;
+    selectedStudentText.textContent = sid ? `学生 ${sid}` : "—";
+
+    for (const s of state.students.values()) {
+      s.dom.card.classList.toggle("selected", s.id === sid);
+    }
+    scheduleRender({ timeline: true });
+  }
+
+  function updateStudentDom(s) {
+    const st = normalizeState(s.state);
+    const dotCls = dotClassForState(st);
+    const badgeText = stateLabel(st);
+    s.dom.badge.innerHTML = `<span class="dot ${dotCls}"></span><span>${badgeText}</span>`;
+
+    s.dom.metaSeen.innerHTML = `last <code>${formatSec(Math.max(0, state.nowSec - (s.lastSeen || 0)))}</code>`;
+    const earTxt = s.ear == null ? "—" : toNum(s.ear).toFixed(3);
+    const pitchTxt = s.pitch == null ? "—" : `${toNum(s.pitch).toFixed(1)}°`;
+    s.dom.metaEar.innerHTML = `EAR <code>${earTxt}</code>`;
+    s.dom.metaPitch.innerHTML = `pitch <code>${pitchTxt}</code>`;
+  }
+
+  function maybeUpdateAvatar(s, img) {
+    if (!img || !s.bbox || !Array.isArray(s.bbox) || s.bbox.length < 4) return;
+    const now = state.nowSec;
+    if (now - s.lastAvatarTs < 0.8) return;
+
+    const [nx, ny, nw, nh] = s.bbox.map((v) => toNum(v, 0));
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+
+    const pad = 0.18;
+    const cx = nx + nw / 2;
+    const cy = ny + nh / 2;
+    const size = Math.max(nw, nh) * (1 + pad * 2);
+
+    const sx0 = clamp(cx - size / 2, 0, 1);
+    const sy0 = clamp(cy - size / 2, 0, 1);
+    const sx1 = clamp(cx + size / 2, 0, 1);
+    const sy1 = clamp(cy + size / 2, 0, 1);
+    const sx = sx0 * iw;
+    const sy = sy0 * ih;
+    const sw = Math.max(1, (sx1 - sx0) * iw);
+    const sh = Math.max(1, (sy1 - sy0) * ih);
+
+    const ctx = s.dom.avatar.getContext("2d");
+    try {
+      ctx.clearRect(0, 0, s.dom.avatar.width, s.dom.avatar.height);
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, s.dom.avatar.width, s.dom.avatar.height);
+    } catch (_) {
+      // ignore
+    }
+    s.lastAvatarTs = now;
+  }
+
+  function handleFrameData(data) {
+    const ts = toNum(data.ts, state.nowSec);
+    state.nowSec = ts;
+    state.lastFrame.ts = ts;
+    nowText.textContent = formatSec(ts);
+
+    const faces = Array.isArray(data.faces) ? data.faces : [];
+    state.lastFrame.faces = faces;
+
+    if (data.image_base64) {
+      const b64 = String(data.image_base64);
+      if (b64 !== state.lastFrame.b64) {
+        state.lastFrame.b64 = b64;
+        updatePreviewImageFromB64(b64);
+      }
+    }
+
+    for (const f of faces) {
+      const sid = String(f.track_id ?? f.student_id ?? "");
+      if (!sid) continue;
+      const s = ensureStudent(sid);
+      const newState = normalizeState(f.state);
+      if (s.state !== newState) {
+        s.history.push({ ts, state: newState });
+        if (s.history.length > 8000) s.history.splice(0, s.history.length - 8000);
+      }
+      s.state = newState;
+      s.lastSeen = ts;
+      s.bbox = f.bbox || null;
+      s.ear = f.ear ?? null;
+      s.pitch = f.pitch ?? null;
+      s.blinkCount = f.blink_count ?? s.blinkCount;
+      updateStudentDom(s);
+    }
+
+    // Mark stale students as "not seen"
+    for (const s of state.students.values()) {
+      if (state.nowSec - (s.lastSeen || 0) > 3.5) {
+        s.dom.metaSeen.innerHTML = `last <code class="warn-text">${formatSec(state.nowSec - (s.lastSeen || 0))}</code>`;
+      }
+    }
+
+    // Update live ASR line if available
+    updateAsrNowLine();
+    scheduleRender({ preview: true, timeline: true });
+  }
+
+  const previewImage = new Image();
+  previewImage.decoding = "async";
+  previewImage.loading = "eager";
+  previewImage.onload = () => {
+    state.lastFrame.image = previewImage;
+    scheduleRender({ preview: true });
+    // update avatars using the latest frame
+    for (const s of state.students.values()) {
+      maybeUpdateAvatar(s, previewImage);
+    }
+  };
+  previewImage.onerror = () => {
+    // ignore
+  };
+
+  function updatePreviewImageFromB64(b64) {
+    previewImage.src = `data:image/jpeg;base64,${b64}`;
+  }
+
+  function drawPreview() {
+    resizeCanvasToElement(previewCanvas);
+
+    const img = state.lastFrame.image;
+    const cw = previewCanvas.width;
+    const ch = previewCanvas.height;
+    previewCtx.clearRect(0, 0, cw, ch);
+
+    if (!img) {
+      previewCtx.fillStyle = "rgba(0,0,0,0.25)";
+      previewCtx.fillRect(0, 0, cw, ch);
+      return;
+    }
+
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+    const scale = Math.min(cw / iw, ch / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    const dx = (cw - dw) / 2;
+    const dy = (ch - dh) / 2;
+    previewCtx.drawImage(img, 0, 0, iw, ih, dx, dy, dw, dh);
+
+    if (!state.showBoxes && !state.showLabels) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    previewCtx.lineWidth = Math.max(1, Math.round(2 * dpr));
+    previewCtx.font = `${Math.max(12, Math.round(13 * dpr))}px ${getComputedStyle(document.body).fontFamily}`;
+    previewCtx.textBaseline = "top";
+
+    const faces = state.lastFrame.faces || [];
+    for (const f of faces) {
+      const sid = String(f.track_id ?? f.student_id ?? "");
+      const bbox = f.bbox;
+      if (!Array.isArray(bbox) || bbox.length < 4) continue;
+      const st = normalizeState(f.state);
+      const color = COLORS[st] || COLORS.unknown;
+      const x = dx + toNum(bbox[0]) * dw;
+      const y = dy + toNum(bbox[1]) * dh;
+      const w = toNum(bbox[2]) * dw;
+      const h = toNum(bbox[3]) * dh;
+
+      if (state.showBoxes) {
+        previewCtx.strokeStyle = color;
+        previewCtx.strokeRect(x, y, w, h);
+      }
+      if (state.showLabels) {
+        const label = sid ? `#${sid} ${stateLabel(st)}` : stateLabel(st);
+        const padX = 6 * dpr;
+        const padY = 4 * dpr;
+        const textW = previewCtx.measureText(label).width;
+        const boxW = textW + padX * 2;
+        const boxH = Math.max(18 * dpr, 18 * dpr);
+        const by = Math.max(0, y - boxH - 4 * dpr);
+        previewCtx.fillStyle = "rgba(0,0,0,0.55)";
+        previewCtx.fillRect(x, by, boxW, boxH);
+        previewCtx.fillStyle = "#fff";
+        previewCtx.fillText(label, x + padX, by + padY);
+      }
+    }
+
+    // FPS update
+    const nowMs = performance.now();
+    const sec = Math.floor(nowMs / 1000);
+    if (sec !== state.fps.lastSec) {
+      state.fps.value = state.fps.framesThisSec;
+      state.fps.framesThisSec = 0;
+      state.fps.lastSec = sec;
+      fpsText.textContent = `${state.fps.value} fps`;
+      fpsDot.className = `dot ${state.fps.value >= 12 ? "good" : state.fps.value >= 6 ? "warn" : "unknown"}`;
+    }
+    state.fps.framesThisSec += 1;
+  }
+
+  function handleAsrSegment(seg) {
+    const start = toNum(seg.start ?? seg.ts, null);
+    if (start == null) return;
+    const end = toNum(seg.end, start + 2.0);
+    const text = String(seg.text || "").trim();
+    const label = String(seg.label || "teacher").trim().toLowerCase();
+    const rec = {
+      start,
+      end: Math.max(end, start + 0.2),
+      text,
+      label: label === "student" ? "student" : "teacher",
+    };
+    state.asrSegments.push(rec);
+    // keep only recent segments
+    const cutoff = state.nowSec - Math.max(600, state.windowSec * 6);
+    if (state.asrSegments.length > 2000) {
+      state.asrSegments = state.asrSegments.filter((s) => s.end >= cutoff);
+    } else {
+      while (state.asrSegments.length > 0 && state.asrSegments[0].end < cutoff) state.asrSegments.shift();
+    }
+
+    updateAsrNowLine();
+    scheduleRender({ timeline: true });
+  }
+
+  function findAsrAt(t) {
+    // most recent segment covering t
+    for (let i = state.asrSegments.length - 1; i >= 0; i--) {
+      const s = state.asrSegments[i];
+      if (t >= s.start && t <= s.end) return s;
+    }
+    return null;
+  }
+
+  function updateAsrNowLine() {
+    if (!state.showAsr) {
+      asrNowText.textContent = "（ASR 已关闭）";
+      return;
+    }
+    const seg = findAsrAt(state.nowSec);
+    if (!seg || !seg.text) {
+      asrNowText.textContent = "（暂无 ASR 段）";
+      return;
+    }
+    const prefix = seg.label === "teacher" ? "老师：" : "学生：";
+    asrNowText.textContent = `${prefix}${seg.text}`;
+  }
+
+  function getStudentStateAt(s, t) {
+    if (!s || !Array.isArray(s.history) || s.history.length === 0) return "unknown";
+    let last = null;
+    for (let i = 0; i < s.history.length; i++) {
+      const h = s.history[i];
+      if (h.ts <= t) last = h;
+      else break;
+    }
+    return normalizeState(last ? last.state : "unknown");
+  }
+
+  function renderTimeline() {
+    resizeCanvasToElement(timelineCanvas);
+    const W = timelineCanvas.width;
+    const H = timelineCanvas.height;
+    timelineCtx.clearRect(0, 0, W, H);
+
+    const endT = state.followLive ? state.nowSec : state.cursorTime ?? state.nowSec;
+    const startT = endT - state.windowSec;
+
+    // background
+    timelineCtx.fillStyle = "rgba(255,255,255,0.03)";
+    timelineCtx.fillRect(0, 0, W, H);
+
+    // grid / axis
+    timelineCtx.strokeStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.lineWidth = 1;
+    timelineCtx.beginPath();
+    const step = state.windowSec >= 300 ? 30 : state.windowSec >= 120 ? 10 : 5;
+    for (let t = Math.ceil(startT / step) * step; t <= endT; t += step) {
+      const x = ((t - startT) / state.windowSec) * W;
+      timelineCtx.moveTo(x, 0);
+      timelineCtx.lineTo(x, H);
+    }
+    timelineCtx.stroke();
+
+    const dpr = window.devicePixelRatio || 1;
+    timelineCtx.font = `${Math.max(11, Math.round(12 * dpr))}px ${getComputedStyle(document.body).fontFamily}`;
+    timelineCtx.fillStyle = "rgba(255,255,255,0.65)";
+    timelineCtx.textBaseline = "top";
+    for (let t = Math.ceil(startT / step) * step; t <= endT; t += step) {
+      const x = ((t - startT) / state.windowSec) * W;
+      const label = `${Math.max(0, t).toFixed(0)}s`;
+      timelineCtx.fillText(label, x + 4 * dpr, 6 * dpr);
+    }
+
+    // rows
+    const rowStateY = 34 * dpr;
+    const rowStateH = 46 * dpr;
+    const rowAsrY = rowStateY + rowStateH + 14 * dpr;
+    const rowAsrH = 38 * dpr;
+
+    // selected student state segments
+    const sid = state.selectedStudentId;
+    const s = sid ? state.students.get(sid) : null;
+    timelineCtx.fillStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.fillRect(0, rowStateY, W, rowStateH);
+
+    if (s && Array.isArray(s.history) && s.history.length > 0) {
+      // ensure sorted (history should be chronological)
+      const hist = s.history;
+      for (let i = 0; i < hist.length; i++) {
+        const cur = hist[i];
+        const next = hist[i + 1] || { ts: endT };
+        const segStart = clamp(cur.ts, startT, endT);
+        const segEnd = clamp(next.ts, startT, endT);
+        if (segEnd <= segStart) continue;
+
+        const x1 = ((segStart - startT) / state.windowSec) * W;
+        const x2 = ((segEnd - startT) / state.windowSec) * W;
+        const st = normalizeState(cur.state);
+        timelineCtx.fillStyle = COLORS[st] || COLORS.unknown;
+        timelineCtx.fillRect(x1, rowStateY, Math.max(2, x2 - x1), rowStateH);
+      }
+
+      timelineCtx.fillStyle = "rgba(0,0,0,0.45)";
+      timelineCtx.fillRect(10 * dpr, rowStateY + 10 * dpr, 150 * dpr, 22 * dpr);
+      timelineCtx.fillStyle = "#fff";
+      timelineCtx.fillText(`学生 ${sid} 状态`, 16 * dpr, rowStateY + 14 * dpr);
+    } else {
+      timelineCtx.fillStyle = "rgba(255,255,255,0.55)";
+      timelineCtx.fillText("未选择学生或暂无状态数据", 14 * dpr, rowStateY + 14 * dpr);
+    }
+
+    // ASR row
+    timelineCtx.fillStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.fillRect(0, rowAsrY, W, rowAsrH);
+
+    if (state.showAsr && state.asrSegments.length > 0) {
+      const segs = state.asrSegments;
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        if (seg.end < startT || seg.start > endT) continue;
+        const segStart = clamp(seg.start, startT, endT);
+        const segEnd = clamp(seg.end, startT, endT);
+        const x1 = ((segStart - startT) / state.windowSec) * W;
+        const x2 = ((segEnd - startT) / state.windowSec) * W;
+        const color = seg.label === "teacher" ? COLORS.teacher : COLORS.student;
+        timelineCtx.fillStyle = color;
+        timelineCtx.fillRect(x1, rowAsrY, Math.max(2, x2 - x1), rowAsrH);
+      }
+
+      const segNow = findAsrAt(endT);
+      timelineCtx.fillStyle = "rgba(0,0,0,0.45)";
+      timelineCtx.fillRect(10 * dpr, rowAsrY + 8 * dpr, 150 * dpr, 22 * dpr);
+      timelineCtx.fillStyle = "#fff";
+      timelineCtx.fillText("ASR 讲解", 16 * dpr, rowAsrY + 12 * dpr);
+
+      if (segNow && segNow.text) {
+        timelineCtx.fillStyle = "rgba(255,255,255,0.70)";
+        const snippet = segNow.text.length > 28 ? `${segNow.text.slice(0, 28)}…` : segNow.text;
+        timelineCtx.fillText(snippet, 170 * dpr, rowAsrY + 12 * dpr);
+      }
+    } else {
+      timelineCtx.fillStyle = "rgba(255,255,255,0.55)";
+      timelineCtx.fillText(state.showAsr ? "暂无 ASR 段（可通过 /push 注入 asr_segment）" : "ASR 显示已关闭", 14 * dpr, rowAsrY + 12 * dpr);
+    }
+
+    // cursor marker
+    if (state.cursorTime != null) {
+      const x = ((state.cursorTime - startT) / state.windowSec) * W;
+      timelineCtx.strokeStyle = "rgba(56,189,248,0.9)";
+      timelineCtx.lineWidth = Math.max(1, Math.round(2 * dpr));
+      timelineCtx.beginPath();
+      timelineCtx.moveTo(x, 0);
+      timelineCtx.lineTo(x, H);
+      timelineCtx.stroke();
+    }
+
+    // update cursor inspector (if any)
+    updateCursorInspector();
+  }
+
+  function updateCursorInspector() {
+    if (state.cursorTime == null) {
+      cursorInspector.style.display = "none";
+      btnClearCursor.disabled = true;
+      btnFollow.textContent = "跟随实时";
+      return;
+    }
+
+    btnClearCursor.disabled = false;
+    btnFollow.textContent = "回到实时";
+    cursorInspector.style.display = "flex";
+
+    const t = state.cursorTime;
+    cursorTimeText.textContent = formatSec(t);
+
+    const sid = state.selectedStudentId;
+    const s = sid ? state.students.get(sid) : null;
+    const st = getStudentStateAt(s, t);
+    cursorStateText.textContent = stateLabel(st);
+    cursorStateText.className = dotClassForState(st) === "good" ? "ok-text" : dotClassForState(st) === "warn" ? "warn-text" : "danger-text";
+
+    const seg = state.showAsr ? findAsrAt(t) : null;
+    cursorAsrText.textContent = seg && seg.text ? seg.text : "—";
+  }
+
+  function clearAllLiveState() {
+    state.students.clear();
+    state.selectedStudentId = null;
+    state.asrSegments = [];
+    state.lastFrame = { image: null, ts: 0, faces: [], b64: null };
+    studentList.innerHTML = `<div class="muted" style="padding:8px 4px;">等待人脸轨迹数据…</div>`;
+    selectedStudentText.textContent = "—";
+    nowText.textContent = "0.00s";
+    asrNowText.textContent = "（暂无 ASR 段）";
+    state.cursorTime = null;
+    state.followLive = true;
+    updateCursorInspector();
+  }
+
+  async function fetchJson(url, options) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (_) {
+      data = null;
+    }
+    if (!res.ok) {
+      const err = (data && (data.error || data.detail)) || text || res.statusText;
+      throw new Error(err);
+    }
+    return data;
+  }
+
+  async function startRecording() {
+    btnStart.disabled = true;
+    try {
+      const j = await fetchJson("/api/session/start", { method: "POST" });
+      if (!j || !j.ok) throw new Error(j?.error || "start failed");
+      clearAllLiveState();
+      setRecording(true, j.session_id);
+      state.report.lastStatsUrl = null;
+      state.report.lastSessionId = j.session_id;
+      btnOpenReport.style.display = "none";
+    } finally {
+      btnStart.disabled = state.isRecording;
+    }
+  }
+
+  async function stopRecording() {
+    btnStop.disabled = true;
+    try {
+      const j = await fetchJson("/api/session/stop", { method: "POST" });
+      if (!j || !j.ok) throw new Error(j?.error || "stop failed");
+      setRecording(false, state.sessionId);
+      btnReport.disabled = !state.sessionId;
+      await refreshSessions();
+    } finally {
+      btnStop.disabled = !state.isRecording;
+    }
+  }
+
+  function openReportModal() {
+    reportModal.classList.add("open");
+    reportModal.addEventListener(
+      "click",
+      (e) => {
+        if (e.target === reportModal) closeReportModal();
+      },
+      { once: true },
+    );
+  }
+
+  function closeReportModal() {
+    reportModal.classList.remove("open");
+  }
+
+  function renderReportKpis(stats) {
+    reportKpis.innerHTML = "";
+    const per = stats?.per_student || {};
+    const students = Object.keys(per);
+    let totalIntervals = 0;
+    let totalDur = 0;
+    for (const sid of students) {
+      const intervals = per[sid]?.intervals || [];
+      totalIntervals += intervals.length;
+      for (const it of intervals) {
+        totalDur += Math.max(0, toNum(it.end) - toNum(it.start));
+      }
+    }
+
+    const kpis = [
+      { k: "学生数", v: String(students.length), s: "tracks in stats.json" },
+      { k: "异常区间", v: String(totalIntervals), s: "DROWSY / LOOKING_DOWN" },
+      { k: "总异常时长", v: formatDuration(totalDur), s: "累计（秒）" },
+      { k: "会话", v: String(stats?.session_id || "—"), s: "session_id" },
+    ];
+    for (const item of kpis) {
+      const div = document.createElement("div");
+      div.className = "kpi";
+      div.innerHTML = `<div class="k">${escapeHtml(item.k)}</div><div class="v">${escapeHtml(item.v)}</div><div class="s">${escapeHtml(item.s)}</div>`;
+      reportKpis.appendChild(div);
+    }
+  }
+
+  function renderReportLinks(result) {
+    reportLinks.innerHTML = "";
+    const add = (href, label) => {
+      if (!href) return;
+      const a = document.createElement("a");
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = label;
+      reportLinks.appendChild(a);
+    };
+    add(result?.video, "下载视频");
+    add(result?.transcript, "下载转录");
+    add(result?.stats, "下载统计 JSON");
+  }
+
+  function renderReportBody(stats) {
+    const per = stats?.per_student || {};
+    const studentIds = Object.keys(per).sort((a, b) => Number(a) - Number(b));
+    if (studentIds.length === 0) {
+      reportBody.innerHTML = `<div class="muted">没有检测到非清醒状态区间。</div>`;
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.style.display = "flex";
+    wrap.style.flexDirection = "column";
+    wrap.style.gap = "10px";
+
+    for (const sid of studentIds) {
+      const info = per[sid] || {};
+      const intervals = Array.isArray(info.intervals) ? info.intervals : [];
+      const total = intervals.reduce((acc, it) => acc + Math.max(0, toNum(it.end) - toNum(it.start)), 0);
+
+      const det = document.createElement("details");
+      det.open = true;
+      const sum = document.createElement("summary");
+      sum.innerHTML = `
+        <div class="summary-left">
+          <div class="student-name">学生 ${escapeHtml(sid)}</div>
+          <span class="badge"><span class="dot warn"></span><span>${intervals.length} 段</span></span>
+        </div>
+        <div class="summary-right">累计 ${escapeHtml(formatDuration(total))}</div>
+      `;
+      det.appendChild(sum);
+
+      const list = document.createElement("div");
+      list.className = "intervals";
+      if (intervals.length === 0) {
+        list.innerHTML = `<div class="muted">没有检测到异常状态。</div>`;
+      } else {
+        for (const it of intervals) {
+          const type = String(it.type || "UNKNOWN");
+          const start = toNum(it.start);
+          const end = toNum(it.end);
+          const dur = Math.max(0, end - start);
+          const asr = String(it.asr_text || "").trim();
+          const kps = Array.isArray(it.knowledge_points) ? it.knowledge_points : [];
+
+          const item = document.createElement("div");
+          item.className = "interval";
+          item.innerHTML = `
+            <div class="interval-head">
+              <div class="interval-title">${escapeHtml(type)}</div>
+              <div class="interval-time">${escapeHtml(formatSec(start))} → ${escapeHtml(formatSec(end))} · ${escapeHtml(formatDuration(dur))}</div>
+            </div>
+            <div class="interval-body">
+              <div><strong>当时讲解：</strong> ${asr ? escapeHtml(asr) : '<span class="muted">（无 ASR 文本）</span>'}</div>
+              <div>
+                <strong>知识点：</strong>
+                ${
+                  kps.length
+                    ? `<div class="chips">${kps.map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
+                    : '<span class="muted">（无知识点/未配置大模型）</span>'
+                }
+              </div>
+            </div>
+          `;
+          list.appendChild(item);
+        }
+      }
+      det.appendChild(list);
+      wrap.appendChild(det);
+    }
+
+    reportBody.innerHTML = "";
+    reportBody.appendChild(wrap);
+  }
+
+  function setReportStatus(html, kind = "muted") {
+    reportBody.innerHTML = `<div class="${kind}">${html}</div>`;
+  }
+
+  async function startReportJob({ sessionId } = {}) {
+    const sid = sessionId || state.sessionId;
+    if (!sid) {
+      setReportStatus("没有可用的 session_id（请先开始并停止一次录制）。", "warn-text");
+      return;
+    }
+
+    state.report.lastSessionId = sid;
+    openReportModal();
+    reportLinks.innerHTML = "";
+    reportKpis.innerHTML = "";
+    setReportStatus("正在提交统计任务…");
+
+    const j = await fetchJson("/api/session/process", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid }),
+    });
+    if (!j.ok) throw new Error(j.error || "process start failed");
+    state.report.jobId = j.job_id;
+    state.report.polling = true;
+
+    setReportStatus(`任务已提交：<span class="mono">${escapeHtml(j.job_id)}</span>，处理中…`);
+    await pollReportJob(j.job_id);
+  }
+
+  async function pollReportJob(jobId) {
+    const maxPoll = 240; // seconds
+    for (let i = 0; i < maxPoll; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      let st = null;
+      try {
+        st = await fetchJson(`/api/session/process/status?job_id=${encodeURIComponent(jobId)}`);
+      } catch (e) {
+        setReportStatus(`轮询失败：${escapeHtml(String(e))}`, "warn-text");
+        continue;
+      }
+      const job = st?.job;
+      const status = String(job?.status || "unknown");
+      if (status === "done") {
+        state.report.polling = false;
+        state.report.lastResult = job.result || null;
+        state.report.lastStatsUrl = job.result?.stats || null;
+        btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
+        setReportStatus("统计完成，正在加载结果…");
+        await loadReportFromResult(job.result);
         return;
+      }
+      if (status === "error") {
+        state.report.polling = false;
+        setReportStatus(`统计出错：${escapeHtml(String(job?.error || "unknown"))}`, "danger-text");
+        return;
+      }
+      setReportStatus(`处理中：${escapeHtml(status)}（${i + 1}s）`);
     }
-    keys.forEach(sid => {
-        const info = per_student[sid];
-        const container = document.createElement('div');
-        container.style.borderTop = '1px solid #eee';
-        container.style.padding = '8px 0';
-        const title = document.createElement('div');
-        title.innerHTML = `<strong>Student ${sid}</strong>`;
-        container.appendChild(title);
-        const table = document.createElement('div');
-        table.style.fontSize = '13px';
-        if(!info.intervals || info.intervals.length === 0){
-            const none = document.createElement('div'); none.innerText = '没有检测到异常状态'; table.appendChild(none);
+    state.report.polling = false;
+    setReportStatus("统计超时：任务可能仍在后台运行，可稍后点击“重载”。", "warn-text");
+  }
+
+  async function loadReportFromResult(result) {
+    renderReportLinks(result);
+    if (!result?.stats) {
+      setReportStatus("没有找到 stats.json 输出。", "warn-text");
+      return;
+    }
+    state.report.lastStatsUrl = result.stats;
+    btnOpenReport.style.display = "inline-flex";
+
+    const stats = await fetchJson(result.stats);
+    renderReportKpis(stats);
+    renderReportBody(stats);
+  }
+
+  async function loadReportFromSessionId(sessionId) {
+    const sid = String(sessionId || "").trim();
+    if (!sid) return;
+    openReportModal();
+    reportLinks.innerHTML = "";
+    reportKpis.innerHTML = "";
+
+    // try direct stats first
+    const statsUrl = `/out/${encodeURIComponent(sid)}/stats.json`;
+    try {
+      const stats = await fetchJson(statsUrl);
+      state.report.lastSessionId = sid;
+      state.report.lastStatsUrl = statsUrl;
+      btnOpenReport.style.display = "inline-flex";
+      renderReportLinks({ stats: statsUrl, video: stats.video ? `/out/${sid}/${stats.video}` : null, transcript: stats.transcript ? `/out/${sid}/${stats.transcript}` : null });
+      renderReportKpis(stats);
+      renderReportBody(stats);
+      return;
+    } catch (_) {
+      // fall through
+    }
+
+    setReportStatus(`该会话尚未生成 <span class="mono">stats.json</span>，正在为其生成报告…`);
+    await startReportJob({ sessionId: sid });
+  }
+
+  async function refreshSessions() {
+    sessionSelect.disabled = true;
+    btnRefreshSessions.disabled = true;
+    try {
+      const j = await fetchJson("/api/sessions");
+      const items = Array.isArray(j?.sessions) ? j.sessions : [];
+      sessionSelect.innerHTML = "";
+      const opt0 = document.createElement("option");
+      opt0.value = "";
+      opt0.textContent = "选择历史会话…";
+      sessionSelect.appendChild(opt0);
+
+      for (const it of items) {
+        const sid = String(it.session_id || it.id || "");
+        if (!sid) continue;
+        const hasStats = Boolean(it.has_stats);
+        const opt = document.createElement("option");
+        opt.value = sid;
+        opt.textContent = `${sid}${hasStats ? " · stats✅" : ""}`;
+        sessionSelect.appendChild(opt);
+      }
+      sessionSelect.disabled = false;
+    } catch (e) {
+      sessionSelect.innerHTML = `<option value="">（无法加载：${String(e)}）</option>`;
+      sessionSelect.disabled = true;
+    } finally {
+      btnRefreshSessions.disabled = false;
+    }
+  }
+
+  function applyStudentFilter() {
+    const q = String(studentFilter.value || "").trim().toLowerCase();
+    const cards = studentList.querySelectorAll(".student-card");
+    for (const card of cards) {
+      const sid = String(card.dataset.sid || "").toLowerCase();
+      card.style.display = !q || sid.includes(q) ? "" : "none";
+    }
+  }
+
+  function bindUi() {
+    windowSel.addEventListener("change", () => {
+      state.windowSec = toNum(windowSel.value, 60);
+      scheduleRender({ timeline: true });
+    });
+
+    studentFilter.addEventListener("input", applyStudentFilter);
+
+    sessionSelect.addEventListener("change", async () => {
+      const sid = String(sessionSelect.value || "").trim();
+      if (!sid) return;
+      await loadReportFromSessionId(sid);
+    });
+    btnRefreshSessions.addEventListener("click", refreshSessions);
+
+    btnStart.addEventListener("click", async () => {
+      try {
+        await startRecording();
+      } catch (e) {
+        alert(`开始录制失败：${e}`);
+        setRecording(false, state.sessionId);
+      }
+    });
+    btnStop.addEventListener("click", async () => {
+      try {
+        await stopRecording();
+      } catch (e) {
+        alert(`停止失败：${e}`);
+        setRecording(false, state.sessionId);
+      }
+    });
+
+    btnReport.addEventListener("click", async () => {
+      try {
+        await startReportJob({ sessionId: state.sessionId });
+      } catch (e) {
+        setReportStatus(`生成报告失败：${escapeHtml(String(e))}`, "danger-text");
+      }
+    });
+    btnOpenReport.addEventListener("click", openReportModal);
+    btnCloseReport.addEventListener("click", closeReportModal);
+    btnReloadReport.addEventListener("click", async () => {
+      try {
+        if (state.report.lastStatsUrl) {
+          const stats = await fetchJson(state.report.lastStatsUrl);
+          renderReportKpis(stats);
+          renderReportBody(stats);
+        } else if (state.report.lastSessionId) {
+          await loadReportFromSessionId(state.report.lastSessionId);
         } else {
-            info.intervals.forEach(it => {
-                const row = document.createElement('div');
-                row.style.padding = '6px 0';
-                row.style.borderBottom = '1px dashed #f0f0f0';
-                const hdr = document.createElement('div');
-                hdr.innerHTML = `<em>${it.type}</em> — ${it.start.toFixed(2)}s → ${it.end.toFixed(2)}s`;
-                row.appendChild(hdr);
-                if(it.asr_text){
-                    const p = document.createElement('div');
-                    p.style.marginTop = '6px';
-                    p.style.whiteSpace = 'pre-wrap';
-                    p.innerHTML = `<strong>当时讲解:</strong> ${escapeHtml(it.asr_text)}`;
-                    row.appendChild(p);
-                }
-                if(it.knowledge_points && it.knowledge_points.length){
-                    const kp = document.createElement('div');
-                    kp.style.marginTop = '6px';
-                    kp.innerHTML = `<strong>知识点:</strong> <ul>${it.knowledge_points.map(k => `<li>${escapeHtml(k)}</li>`).join('')}</ul>`;
-                    row.appendChild(kp);
-                }
-                table.appendChild(row);
-            });
+          setReportStatus("没有可重载的报告。", "warn-text");
         }
-        container.appendChild(table);
-        statsTableWrap.appendChild(container);
+      } catch (e) {
+        setReportStatus(`重载失败：${escapeHtml(String(e))}`, "danger-text");
+      }
     });
-}
 
-function escapeHtml(str){
-    if(!str) return '';
-    return String(str).replace(/[&<>"]+/g, function(s){
-        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[s];
+    toggleBoxes.addEventListener("change", () => {
+      state.showBoxes = toggleBoxes.checked;
+      scheduleRender({ preview: true });
     });
-}
-    
-    // Check initial status
-    fetch('/api/session/status').then(r=>r.json()).then(d => {
-        if(d.is_recording) setRecording(true);
+    toggleLabels.addEventListener("change", () => {
+      state.showLabels = toggleLabels.checked;
+      scheduleRender({ preview: true });
     });
-}
+    toggleAsr.addEventListener("change", () => {
+      state.showAsr = toggleAsr.checked;
+      updateAsrNowLine();
+      scheduleRender({ timeline: true });
+    });
 
-function setRecording(isRec) {
-    btnStart.disabled = isRec;
-    btnStop.disabled = !isRec;
-    recStatus.style.display = isRec ? 'inline' : 'none';
-}
+    btnFollow.addEventListener("click", () => {
+      state.followLive = true;
+      state.cursorTime = null;
+      scheduleRender({ timeline: true });
+    });
+    btnClearCursor.addEventListener("click", () => {
+      state.cursorTime = null;
+      state.followLive = true;
+      scheduleRender({ timeline: true });
+    });
 
-function resize() {
-    // preview: take previewWrap size
-    const previewWrap = document.getElementById('previewWrap');
-    const timelineWrap = document.getElementById('timelineWrap');
-    const pw = previewWrap.clientWidth;
-    const ph = previewWrap.clientHeight;
-    previewCanvas.width = pw;
-    previewCanvas.height = ph;
+    timelineCanvas.addEventListener("click", (e) => {
+      const rect = timelineCanvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const W = rect.width;
+      if (W <= 0) return;
 
-    const tw = timelineWrap.clientWidth;
-    const th = timelineWrap.clientHeight;
-    canvas.width = tw;
-    canvas.height = th;
-}
+      const endT = state.followLive ? state.nowSec : state.cursorTime ?? state.nowSec;
+      const startT = endT - state.windowSec;
+      const t = startT + (x / W) * state.windowSec;
 
-function connect() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => document.getElementById('status').innerText = 'connected';
-    ws.onclose = () => {
-        document.getElementById('status').innerText = 'disconnected';
-        setTimeout(connect, 2000);
-    };
-    ws.onmessage = msg => {
-        try {
-            const data = JSON.parse(msg.data);
-            if (data.type === 'batch' && Array.isArray(data.events)) {
-                data.events.forEach(e => processEvent(e));
-            } else {
-                processEvent(data);
-            }
-        } catch(e) { console.warn(e); }
-    };
-}
+      state.cursorTime = clamp(t, startT, endT);
+      state.followLive = false;
+      scheduleRender({ timeline: true });
+    });
 
-function processEvent(data) {
-    if (data.type === 'frame_data') {
-        handleFrameData(data);
-        // draw preview image immediately if provided
-        if (data.image_base64) drawPreviewImage(data.image_base64, data.faces);
+    window.addEventListener("resize", () => {
+      scheduleRender({ preview: true, timeline: true });
+    });
+  }
+
+  async function loadInitialStatus() {
+    try {
+      const j = await fetchJson("/api/session/status");
+      const sid = j?.session_id || null;
+      setRecording(Boolean(j?.is_recording), sid);
+    } catch (_) {
+      setRecording(false, null);
     }
-}
+  }
 
-function handleFrameData(data) {
-    now = data.ts;
-    
-    // Update students
-    data.faces.forEach(face => {
-        const tid = face.track_id;
-        if (!students.has(tid)) {
-            students.set(tid, {
-                id: tid,
-                state: face.state,
-                last_seen: now,
-                img: null,
-                history: []
-            });
-            createStudentCard(tid);
-        }
-        
-        const s = students.get(tid);
-        s.state = face.state;
-        s.last_seen = now;
-        s.history.push({ts: now, state: face.state});
-        
-        // Keep history manageable
-        if(s.history.length > 1000) s.history.shift();
-        
-        // Update DOM
-        updateStudentCard(s, data.image_base64);
-    });
-}
+  async function init() {
+    state.windowSec = toNum(windowSel.value, 60);
+    state.showBoxes = toggleBoxes.checked;
+    state.showLabels = toggleLabels.checked;
+    state.showAsr = toggleAsr.checked;
 
-function drawPreviewImage(b64, faces) {
-    const img = new Image();
-    img.onload = () => {
-        // draw image to preview canvas
-        previewCtx.clearRect(0,0,previewCanvas.width, previewCanvas.height);
-        // fit image preserving aspect
-        const iw = img.width, ih = img.height;
-        const cw = previewCanvas.width, ch = previewCanvas.height;
-        // compute scale
-        const scale = Math.min(cw/iw, ch/ih);
-        const dw = iw * scale, dh = ih * scale;
-        const dx = (cw - dw)/2, dy = (ch - dh)/2;
-        previewCtx.drawImage(img, 0, 0, iw, ih, dx, dy, dw, dh);
+    bindUi();
+    connectWs();
+    await loadInitialStatus();
+    await refreshSessions();
 
-        // overlay faces
-        if (Array.isArray(faces)) {
-            faces.forEach(f => {
-                // try to find bbox
-                let bbox = null;
-                if (f.bbox) bbox = f.bbox;
-                else if (f.box) bbox = f.box;
-                else if (f.rect) bbox = f.rect;
-                else if (f.bounding_box) bbox = f.bounding_box;
+    scheduleRender({ preview: true, timeline: true });
+  }
 
-                if (!bbox) return;
-
-                // bbox can be dict or array
-                let x=0,y=0,w=0,h=0;
-                if (Array.isArray(bbox) || bbox instanceof Array) {
-                    [x,y,w,h] = bbox;
-                } else if (typeof bbox === 'object') {
-                    x = bbox.x ?? bbox.left ?? bbox[0] ?? 0;
-                    y = bbox.y ?? bbox.top ?? bbox[1] ?? 0;
-                    w = bbox.w ?? bbox.width ?? bbox[2] ?? 0;
-                    h = bbox.h ?? bbox.height ?? bbox[3] ?? 0;
-                }
-
-                // determine if normalized (0..1)
-                let norm = false;
-                if (x <= 1 && y <=1 && w <=1 && h <=1) norm = true;
-
-                let drawX = x, drawY = y, drawW = w, drawH = h;
-                if (norm) {
-                    drawX = dx + x * dw;
-                    drawY = dy + y * dh;
-                    drawW = w * dw;
-                    drawH = h * dh;
-                } else {
-                    // assume bbox in original image pixel coords; need to scale
-                    const sx = scale; // mapping image->canvas
-                    drawX = dx + x * sx;
-                    drawY = dy + y * sx;
-                    drawW = w * sx;
-                    drawH = h * sx;
-                }
-
-                // draw rectangle and label
-                previewCtx.strokeStyle = 'lime';
-                previewCtx.lineWidth = 2;
-                previewCtx.strokeRect(drawX, drawY, drawW, drawH);
-
-                const state = (f.state || '').toUpperCase() || '';
-                if (state) {
-                    previewCtx.fillStyle = 'rgba(0,0,0,0.6)';
-                    previewCtx.fillRect(drawX, drawY - 18, previewCtx.measureText(state).width + 8, 18);
-                    previewCtx.fillStyle = '#fff';
-                    previewCtx.font = '14px Arial';
-                    previewCtx.fillText(state, drawX + 4, drawY - 4);
-                }
-            });
-        }
-    };
-    img.src = 'data:image/jpeg;base64,' + b64;
-}
-
-function createStudentCard(tid) {
-    const div = document.createElement('div');
-    div.className = 'student-card';
-    div.id = `student-${tid}`;
-    div.innerHTML = `
-        <div class="student-img-wrap" style="width:40px;height:40px;background:#eee;border-radius:50%;overflow:hidden; display:none">
-        </div>
-        <div class="student-info">
-            <div>ID: ${tid}</div>
-            <div class="student-state" id="state-${tid}">Unknown</div>
-        </div>
-    `;
-    sidebar.appendChild(div);
-}
-
-function updateStudentCard(s, b64Img) {
-    const elState = document.getElementById(`state-${s.id}`);
-    if(elState) {
-        elState.innerText = s.state.toUpperCase();
-        elState.className = `student-state state-${s.state}`;
-    }
-    
-    if (b64Img) {
-        const img = document.getElementById(`img-${s.id}`);
-        if(img) {
-            img.src = `data:image/jpeg;base64,${b64Img}`;
-            img.style.display = 'block';
-        }
-    }
-}
-
-function loop() {
-    render();
-    requestAnimationFrame(loop);
-}
-
-function render() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    const W = canvas.width;
-    const H = canvas.height;
-    const rowHeight = 60;
-    const endTime = now;
-    const startTime = endTime - windowSize;
-    
-    // Draw Grid
-    ctx.strokeStyle = '#eee';
-    ctx.beginPath();
-    for(let t = Math.ceil(startTime); t <= endTime; t++) {
-        if(t % 5 === 0) {
-            const x = ((t - startTime) / windowSize) * W;
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, H);
-        }
-    }
-    ctx.stroke();
-
-    // Draw Student Timelines
-    let y = 10;
-    students.forEach(s => {
-        // Draw row background
-        ctx.fillStyle = '#fafafa';
-        ctx.fillRect(0, y, W, rowHeight - 10);
-        
-        // Draw history blocks
-        if (s.history.length > 0) {
-            let blockStart = s.history[0].ts;
-            let blockState = s.history[0].state;
-            
-            for(let i=1; i<s.history.length; i++) {
-                const h = s.history[i];
-                // If state changed or gap too large (>1s), draw previous block
-                if (h.state !== blockState || (h.ts - s.history[i-1].ts) > 1.0) {
-                    drawBlock(blockStart, s.history[i-1].ts, blockState, y, rowHeight-10, startTime, windowSize, W);
-                    blockStart = h.ts;
-                    blockState = h.state;
-                }
-            }
-            // Draw last block
-            drawBlock(blockStart, s.history[s.history.length-1].ts, blockState, y, rowHeight-10, startTime, windowSize, W);
-        }
-        
-        // Label
-        ctx.fillStyle = '#333';
-        ctx.font = '12px Arial';
-        ctx.fillText(`Student ${s.id}`, 5, y + 15);
-        
-        y += rowHeight;
-    });
-}
-
-function drawBlock(t1, t2, state, y, h, startT, winSize, W) {
-    if (t2 < startT) return;
-    
-    const x1 = ((t1 - startT) / winSize) * W;
-    const x2 = ((t2 - startT) / winSize) * W;
-    const w = Math.max(x2 - x1, 2); // min width
-    
-    ctx.fillStyle = COLORS[state] || COLORS['unknown'];
-    ctx.fillRect(x1, y + 20, w, h - 20);
-}
-
-init();
+  init().catch((e) => {
+    console.error(e);
+  });
+})();

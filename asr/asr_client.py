@@ -1,10 +1,25 @@
+from __future__ import annotations
+
 import threading
 import time
 from typing import Callable, Optional
 
-import pyaudio
-import dashscope
-from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
+try:
+    import pyaudio  # type: ignore
+except Exception:  # pragma: no cover
+    pyaudio = None
+try:
+    import dashscope  # type: ignore
+    from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult  # type: ignore
+except Exception:  # pragma: no cover
+    dashscope = None
+    Recognition = None  # type: ignore
+
+    class RecognitionCallback:  # type: ignore
+        pass
+
+    class RecognitionResult:  # type: ignore
+        pass
 
 
 class AliASRClient:
@@ -44,6 +59,10 @@ class AliASRClient:
         """Start ASR in a background thread."""
         if self._thread and self._thread.is_alive():
             return
+        if dashscope is None or Recognition is None:
+            raise RuntimeError("dashscope is required for AliASRClient (pip install dashscope).")
+        if self.auto_open_mic and pyaudio is None:
+            raise RuntimeError("pyaudio is required for streaming mic capture (pip install pyaudio).")
         if self.api_key:
             dashscope.api_key = self.api_key
         self._stop_flag.clear()
@@ -59,6 +78,8 @@ class AliASRClient:
 
     # ---- internal ----
     def _run_loop(self):
+        if Recognition is None:
+            raise RuntimeError("dashscope Recognition is not available.")
         callback = _AliCallback(self)
         self._recog = Recognition(
             model=self.model,
@@ -99,6 +120,8 @@ class _AliCallback(RecognitionCallback):
             return
         if not getattr(self.outer, "auto_open_mic", True):
             return
+        if pyaudio is None:
+            raise RuntimeError("pyaudio is required to open microphone stream.")
         self.outer._mic = pyaudio.PyAudio()
         self.outer._stream = self.outer._mic.open(
             format=pyaudio.paInt16,
@@ -147,10 +170,10 @@ def transcribe_file(api_key: Optional[str], wav_path: str, time_base: Callable[[
     the environment has no audio input device. It will call `on_sentence`
     with the same event structure as the live client.
     """
-    try:
-        recog_cb = _AliCallback(type("_dummy", (), {})())
-    except Exception:
-        recog_cb = None
+    if dashscope is None or Recognition is None:
+        raise RuntimeError("dashscope is required for transcribe_file (pip install dashscope).")
+    if api_key:
+        dashscope.api_key = api_key
     # Create a fresh Recognition + callback that routes to provided on_sentence
     class _LocalCB(RecognitionCallback):
         def on_open(self):
@@ -175,12 +198,12 @@ def transcribe_file(api_key: Optional[str], wav_path: str, time_base: Callable[[
 
     recog = Recognition(model=model, format="pcm", sample_rate=sample_rate, callback=_LocalCB())
     recog.start()
+    frames_sent = 0
     try:
         import wave as _wave
         with _wave.open(wav_path, 'rb') as wf:
             bytes_per_frame = wf.getsampwidth() * wf.getnchannels()
             frames_per_chunk = int(sample_rate * (chunk_ms / 1000.0))
-            frames_sent = 0
             while True:
                 chunk = wf.readframes(frames_per_chunk)
                 if not chunk:

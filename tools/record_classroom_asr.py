@@ -1,77 +1,102 @@
-"""Record classroom audio to WAV and run DashScope ASR on the recorded file.
+"""Record classroom audio and run DashScope ASR.
 
-Produces:
-  - {out_prefix}.wav
-  - {out_prefix}.asr.jsonl
+This repo's recommended path is `tools/web_viz_server.py` (record → report).
+This script is a standalone utility for DashScope ASR and audio capture.
 
-Notes:
-  - Requires `sounddevice` (for recording) and `dashscope` for transcription.
-  - If `dashscope` is not available, the script will still record WAV but will write a placeholder JSONL.
+Modes:
+  - file: record WAV (sounddevice) then transcribe the WAV by sending chunks to DashScope.
+  - stream: stream microphone to DashScope in real time (pyaudio) while also recording WAV (sounddevice).
+
+Examples:
+  - Record then transcribe (offline):
+      ./.venv/bin/python tools/record_classroom_asr.py file --out-prefix logs/demo --duration 60
+
+  - Streaming ASR + record WAV, and push events to web server:
+      ./.venv/bin/python tools/record_classroom_asr.py stream --duration 60 --push-url http://localhost:8000/push
 """
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
 import time
 import wave
-import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
 
 
-def list_audio_devices():
+PROJ_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJ_ROOT / ".env")
+
+if str(PROJ_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJ_ROOT))
+
+
+def _default_dashscope_key() -> str:
+    return os.getenv("DASH_SCOPE_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
+
+
+def list_audio_devices() -> List[Dict[str, Any]]:
     try:
-        import sounddevice as sd
-    except Exception as e:
-        print("sounddevice not available:", e)
-        return []
+        import sounddevice as sd  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"sounddevice not available: {exc}") from exc
     devs = sd.query_devices()
-    out = []
+    out: List[Dict[str, Any]] = []
     for i, d in enumerate(devs):
-        out.append({"index": i, "name": d.get('name'), "max_input_channels": d.get('max_input_channels'), "default_samplerate": d.get('default_samplerate')})
+        out.append(
+            {
+                "index": i,
+                "name": d.get("name"),
+                "max_input_channels": d.get("max_input_channels"),
+                "default_samplerate": d.get("default_samplerate"),
+            }
+        )
     return out
 
 
-def record_wav(path: str, duration: float, samplerate: int = 16000, channels: int = 1, device: Optional[int] = None):
+def record_wav(path: Path, duration: float, samplerate: int = 16000, channels: int = 1, device: Optional[int] = None) -> None:
     try:
-        import sounddevice as sd
-        import numpy as np
-    except Exception as e:
-        raise RuntimeError("sounddevice and numpy are required to record audio: %s" % e)
+        import numpy as np  # type: ignore
+        import sounddevice as sd  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"recording requires sounddevice+numpy: {exc}") from exc
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Recording {duration:.1f}s -> {path} @ {samplerate}Hz (device={device})")
-    kwargs = {}
+
+    kwargs: Dict[str, Any] = {}
     if device is not None:
-        kwargs['device'] = device
-    frames = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels, dtype='int16', **kwargs)
+        kwargs["device"] = device
+
+    frames = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels, dtype="int16", **kwargs)
     sd.wait()
-    data = frames.astype('int16')
-    with wave.open(path, 'wb') as wf:
+    data = np.asarray(frames, dtype="int16")
+
+    with wave.open(str(path), "wb") as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(2)
         wf.setframerate(samplerate)
         wf.writeframes(data.tobytes())
 
 
-def transcribe_wav_with_dashscope(wav_path: str, out_jsonl: str, api_key: Optional[str], sample_rate: int = 16000, chunk_ms: int = 100):
-    # Prefer to use asr_client.transcribe_file when available (no pyaudio required)
-    try:
-        from asr.asr_client import transcribe_file
-    except Exception:
-        transcribe_file = None
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-    if transcribe_file is not None:
-        try:
-            transcribe_file(api_key, wav_path, lambda: time.time(), lambda ev: append_jsonl(Path(out_jsonl), ev), sample_rate, chunk_ms)
-            return
-        except Exception as e:
-            print('transcribe_file failed, falling back to direct dashscope:', e)
 
+def transcribe_wav_with_dashscope(wav_path: Path, out_jsonl: Path, api_key: str, sample_rate: int = 16000, chunk_ms: int = 100) -> None:
+    """Transcribe WAV by sending frames to DashScope Recognition."""
     try:
-        import dashscope
-        from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
-    except Exception:
-        print("dashscope not available; writing placeholder JSONL")
-        # write placeholder event
-        with open(out_jsonl, 'w', encoding='utf-8') as f:
-            f.write(json.dumps({"ts": time.time(), "text": "(no dashscope)"}, ensure_ascii=False) + "\n")
-        return
+        import dashscope  # type: ignore
+        from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"dashscope not available: {exc}") from exc
 
     if api_key:
         dashscope.api_key = api_key
@@ -79,15 +104,11 @@ def transcribe_wav_with_dashscope(wav_path: str, out_jsonl: str, api_key: Option
     events: List[Dict[str, Any]] = []
 
     class _CB(RecognitionCallback):
-        def __init__(self, time_base_fn):
-            super().__init__()
-            self.time_base_fn = time_base_fn
-
         def on_open(self) -> None:
-            pass
+            return
 
         def on_close(self) -> None:
-            pass
+            return
 
         def on_event(self, result: RecognitionResult) -> None:
             try:
@@ -96,15 +117,12 @@ def transcribe_wav_with_dashscope(wav_path: str, out_jsonl: str, api_key: Option
                 txt = None
             if not txt:
                 return
-            ts = float(self.time_base_fn())
-            events.append({"ts": ts, "text": txt, "raw": result.__dict__})
+            events.append({"ts": time.time(), "type": "ASR_SENTENCE", "text": txt, "raw": result.__dict__})
 
-    recog = Recognition(model="fun-asr-realtime", format="pcm", sample_rate=sample_rate, callback=_CB(lambda: time.time()))
+    recog = Recognition(model="fun-asr-realtime", format="pcm", sample_rate=sample_rate, callback=_CB())
     recog.start()
     try:
-        # read wav in chunks and send
-        with wave.open(wav_path, 'rb') as wf:
-            bytes_per_frame = wf.getsampwidth() * wf.getnchannels()
+        with wave.open(str(wav_path), "rb") as wf:
             frames_per_chunk = int(sample_rate * (chunk_ms / 1000.0))
             while True:
                 chunk = wf.readframes(frames_per_chunk)
@@ -118,247 +136,143 @@ def transcribe_wav_with_dashscope(wav_path: str, out_jsonl: str, api_key: Option
         except Exception:
             pass
 
-    # write events normalized relative to recording start (approx)
-    with open(out_jsonl, 'w', encoding='utf-8') as f:
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_jsonl, "w", encoding="utf-8") as f:
         for ev in events:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--duration', type=float, default=10.0)
-    parser.add_argument('--out-prefix', required=True)
-    parser.add_argument('--sample-rate', type=int, default=16000)
-    parser.add_argument('--api-key', type=str, default=None)
-    parser.add_argument('--list-devices', action='store_true', help='List audio devices and exit')
-    parser.add_argument('--device', type=int, default=None, help='Device index to use for recording (from --list-devices)')
-    args = parser.parse_args()
+class _Poster:
+    """Best-effort event poster to the web viz `/push` endpoint."""
 
-    if args.list_devices:
-        devs = list_audio_devices()
-        if not devs:
-            print('No audio devices found or sounddevice not installed')
+    def __init__(self, url: str):
+        self.url = url
+
+    def post_many(self, events: List[Dict[str, Any]]) -> None:
+        if not self.url or not events:
             return
-        print('Available audio devices:')
+        try:
+            import requests  # type: ignore
+        except Exception:
+            return
+        try:
+            requests.post(self.url, json=events, timeout=3)
+        except Exception:
+            pass
+
+
+def _cmd_file(args: argparse.Namespace) -> int:
+    if args.list_devices:
+        try:
+            devs = list_audio_devices()
+        except Exception as exc:
+            print(str(exc))
+            return 1
+        print("Available audio devices:")
         for d in devs:
             print(f"  {d['index']}: {d['name']} (inputs={d['max_input_channels']}, sr={d['default_samplerate']})")
-        return
+        return 0
 
     out_prefix = Path(args.out_prefix)
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    wav_path = out_prefix.with_suffix(".wav")
+    jsonl_path = out_prefix.with_suffix(".asr.jsonl")
+    api_key = args.api_key or _default_dashscope_key()
+    if not api_key:
+        print("Missing DashScope key. Set DASH_SCOPE_API_KEY (or DASHSCOPE_API_KEY) or pass --api-key.")
+        return 2
 
-    wav_path = str(out_prefix) + '.wav'
-    jsonl_path = str(out_prefix) + '.asr.jsonl'
-
-    start = time.time()
     try:
         record_wav(wav_path, args.duration, samplerate=args.sample_rate, channels=1, device=args.device)
-    except Exception as e:
-        print('Recording failed:', e)
-        return
-    record_end = time.time()
+    except Exception as exc:
+        print("Recording failed:", exc)
+        return 1
 
-    print('Recorded WAV ->', wav_path)
-    print('Starting transcription (may take a few seconds)')
+    print("Recorded WAV ->", wav_path)
+    print("Starting transcription (may take a while)...")
     try:
-        transcribe_wav_with_dashscope(wav_path, jsonl_path, args.api_key, sample_rate=args.sample_rate)
-    except Exception as e:
-        print('Transcription failed:', e)
-        with open(jsonl_path, 'w', encoding='utf-8') as f:
-            f.write(json.dumps({"ts": record_end, "text": "(transcription failed)"}, ensure_ascii=False) + "\n")
+        transcribe_wav_with_dashscope(wav_path, jsonl_path, api_key, sample_rate=args.sample_rate, chunk_ms=args.chunk_ms)
+    except Exception as exc:
+        print("Transcription failed:", exc)
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), "type": "ASR_SENTENCE", "text": "(transcription failed)"}, ensure_ascii=False) + "\n")
+        return 1
 
-    print('Wrote ASR JSONL ->', jsonl_path)
-
-
-if __name__ == '__main__':
-    main()
-"""Record a classroom session: save ASR events (JSONL) and raw audio (WAV).
-
-Usage:
-  - Ensure `.env` contains DASHSCOPE_API_KEY (or pass key as first arg).
-  - Run:
-      .venv\\Scripts\\python.exe tools\\record_classroom_asr.py [api_key] [duration_seconds]
-
-Notes:
-  - This script starts `AliASRClient` to stream audio to DashScope and
-    writes ASR sentence events to `logs/asr_events.jsonl`.
-  - Simultaneously it records raw audio locally using `sounddevice` to
-    `logs/classroom_audio.wav` for the same duration. This allows offline
-    playback and alignment with ASR events.
-  - There can be platform-dependent contention when two audio libraries
-    access the same device. If you see errors, try closing other apps
-    that use the microphone.
-"""
-import os
-import sys
-import time
-import json
-from pathlib import Path
-from typing import Dict, Any, Optional
-import threading
-import queue
-import requests
-
-import sounddevice as sd
-import numpy as np
-import wave
-from dotenv import load_dotenv
-
-# Ensure project root on sys.path
-proj_root = Path(__file__).resolve().parents[1]
-if str(proj_root) not in sys.path:
-    sys.path.insert(0, str(proj_root))
-
-from asr.asr_client import AliASRClient
+    print("Wrote ASR JSONL ->", jsonl_path)
+    return 0
 
 
-def ensure_logs_dir():
-    p = proj_root / 'logs'
-    p.mkdir(exist_ok=True)
-    return p
+def _cmd_stream(args: argparse.Namespace) -> int:
+    api_key = args.api_key or _default_dashscope_key()
+    if not api_key:
+        print("Missing DashScope key. Set DASH_SCOPE_API_KEY (or DASHSCOPE_API_KEY) or pass --api-key.")
+        return 2
 
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_dir / "asr_events.jsonl"
+    wav_path = out_dir / "classroom_audio.wav"
 
-def append_jsonl(path: Path, obj: Dict[str, Any]):
-    with open(path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    try:
+        from asr.asr_client import AliASRClient  # local import (may require pyaudio)
+    except Exception as exc:
+        print(f"AliASRClient is not available: {exc}")
+        return 2
 
-
-class _Poster:
-    """Background poster that batches JSON events and sends them to a HTTP endpoint."""
-    def __init__(self, url: Optional[str], batch_interval: float = 0.1, max_batch: int = 200):
-        self.url = url
-        self._q = queue.Queue()
-        self._thr = None
-        self._stop = threading.Event()
-        self.batch_interval = float(batch_interval)
-        self.max_batch = int(max_batch)
-
-    def start(self):
-        if not self.url:
-            return
-        if self._thr and self._thr.is_alive():
-            return
-        self._thr = threading.Thread(target=self._run, daemon=True)
-        self._thr.start()
-
-    def send(self, obj: Dict[str, Any]):
-        if not self.url:
-            return
-        try:
-            self._q.put_nowait(obj)
-        except Exception:
-            pass
-
-    def _run(self):
-        while not self._stop.is_set():
-            batch = []
-            try:
-                ev = self._q.get(timeout=self.batch_interval)
-                batch.append(ev)
-            except queue.Empty:
-                # timeout, nothing to send
-                continue
-
-            # drain additional items up to max_batch without blocking
-            while len(batch) < self.max_batch:
-                try:
-                    ev = self._q.get_nowait()
-                    batch.append(ev)
-                except queue.Empty:
-                    break
-
-            # send as a single batch payload
-            payload = {"type": "batch", "events": batch}
-            try:
-                requests.post(self.url, json=payload, timeout=3)
-            except Exception:
-                # best-effort; ignore failures
-                pass
-
-    def stop(self):
-        self._stop.set()
-        if self._thr:
-            self._thr.join(timeout=1.0)
-
-
-def record_audio_to_wav(filename: Path, duration: float, samplerate: int = 16000, channels: int = 1):
-    print(f'Recording raw audio to {filename} for {duration:.1f}s...')
-    frames = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels, dtype='int16')
-    sd.wait()
-    # frames shape: (N, channels)
-    frames = np.atleast_2d(frames)
-    with wave.open(str(filename), 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)  # int16
-        wf.setframerate(samplerate)
-        wf.writeframes(frames.tobytes())
-    print('Audio saved.')
-
-
-def main():
-    load_dotenv(proj_root / '.env')
-    api_key = None
-    dur = 60.0
-    push_url = None
-    if len(sys.argv) > 1 and sys.argv[1]:
-        api_key = sys.argv[1]
-    else:
-        api_key = os.getenv('DASHSCOPE_API_KEY') or os.getenv('DASH_SCOPE_API_KEY')
-    if len(sys.argv) > 2:
-        try:
-            dur = float(sys.argv[2])
-        except Exception:
-            pass
-    # optional push url (e.g. http://localhost:8000/push)
-    if len(sys.argv) > 3 and sys.argv[3]:
-        push_url = sys.argv[3]
-
-    logs = ensure_logs_dir()
-    jsonl_path = logs / 'asr_events.jsonl'
-    wav_path = logs / 'classroom_audio.wav'
+    poster = _Poster(args.push_url) if args.push_url else None
 
     def on_sentence(ev: Dict[str, Any]):
-        # Write event and print concise text
-        append_jsonl(jsonl_path, ev)
-        # optionally push to websocket server via HTTP endpoint
-        try:
-            if poster is not None:
-                poster.send(ev)
-        except Exception:
-            pass
-        # extract text similar to test script
-        txt = ''
-        t = ev.get('text') if isinstance(ev, dict) else None
-        if isinstance(t, str):
-            txt = t
-        elif isinstance(t, dict):
-            txt = t.get('text') or ''.join([w.get('text', '') for w in (t.get('words') or [])])
-        if txt and txt.strip():
-            print('ASR:', txt)
+        _append_jsonl(jsonl_path, ev)
+        if poster:
+            poster.post_many([ev])
+        txt = ev.get("text")
+        if isinstance(txt, str) and txt.strip():
+            print("ASR:", txt.strip())
 
     client = AliASRClient(api_key=api_key, time_base=time.time, on_sentence=on_sentence)
-    print('Starting ASR client (streaming to DashScope)...')
+    print("Starting streaming ASR to DashScope…")
     client.start()
 
-    poster = None
-    if push_url:
-        poster = _Poster(push_url)
-        poster.start()
-
     try:
-        # Record raw audio in foreground (blocking) while ASR runs in background
-        record_audio_to_wav(wav_path, duration=dur, samplerate=client.sample_rate, channels=1)
+        record_wav(wav_path, args.duration, samplerate=client.sample_rate, channels=1, device=args.device)
     except KeyboardInterrupt:
-        print('Interrupted by user')
+        print("Interrupted by user")
+    except Exception as exc:
+        print("Recording failed:", exc)
+        return 1
     finally:
-        print('Stopping ASR client...')
+        print("Stopping ASR client…")
         client.stop()
-        if poster is not None:
-            poster.stop()
-        print(f'ASR events saved to: {jsonl_path}')
-        print(f'Raw audio saved to: {wav_path}')
+        print(f"ASR events saved to: {jsonl_path}")
+        print(f"Raw audio saved to: {wav_path}")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Record classroom audio and run DashScope ASR.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_file = sub.add_parser("file", help="Record WAV then transcribe the WAV by sending chunks to DashScope")
+    p_file.add_argument("--out-prefix", required=True, help="Output prefix path (without extension)")
+    p_file.add_argument("--duration", type=float, default=10.0)
+    p_file.add_argument("--sample-rate", type=int, default=16000)
+    p_file.add_argument("--chunk-ms", type=int, default=100)
+    p_file.add_argument("--api-key", type=str, default=None)
+    p_file.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
+    p_file.add_argument("--device", type=int, default=None, help="Audio input device index (see --list-devices)")
+    p_file.set_defaults(func=_cmd_file)
+
+    p_stream = sub.add_parser("stream", help="Stream mic to DashScope in real time (also records WAV)")
+    p_stream.add_argument("--duration", type=float, default=60.0)
+    p_stream.add_argument("--out-dir", type=str, default=str(PROJ_ROOT / "logs"))
+    p_stream.add_argument("--api-key", type=str, default=None)
+    p_stream.add_argument("--push-url", type=str, default=None, help="Optional: POST ASR events to web server `/push`")
+    p_stream.add_argument("--device", type=int, default=None, help="Audio input device index for WAV recording")
+    p_stream.set_defaults(func=_cmd_stream)
+
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

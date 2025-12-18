@@ -13,6 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi import BackgroundTasks
+from dotenv import load_dotenv
 
 # Import SessionManager
 import sys
@@ -21,14 +22,22 @@ if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 from tools.session_manager import SessionManager
 from tools.openai_compat import OpenAICompat
+from analysis.inattentive_intervals import infer_not_visible_intervals, merge_inattentive_intervals
 
 app = FastAPI()
 
+# Load local `.env` (keys/config), if present.
+load_dotenv(PROJ_ROOT / ".env")
+
+# Resolve important dirs relative to repo root so the server can be started from anywhere.
+WEB_DIR = PROJ_ROOT / "web"
+OUT_DIR = PROJ_ROOT / "out"
+
 # serve frontend static files from /static
-app.mount("/static", StaticFiles(directory="web"), name="static")
+app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 # serve output files (videos, images)
-Path("out").mkdir(exist_ok=True)
-app.mount("/out", StaticFiles(directory="out"), name="out")
+OUT_DIR.mkdir(exist_ok=True)
+app.mount("/out", StaticFiles(directory=str(OUT_DIR)), name="out")
 
 # in-memory queue of events
 event_queue: asyncio.Queue = asyncio.Queue()
@@ -141,7 +150,7 @@ async def root():
 
 @app.get("/api/sessions")
 async def list_sessions():
-    base = Path("out")
+    base = OUT_DIR
     sessions = []
     try:
         for p in base.iterdir():
@@ -168,7 +177,7 @@ async def list_sessions():
 @app.post("/api/session/start")
 async def start_session():
     try:
-        sid = session_mgr.start(output_dir_base="out")
+        sid = session_mgr.start(output_dir_base=str(OUT_DIR))
         return {"ok": True, "session_id": sid}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -178,7 +187,8 @@ async def start_session():
 async def stop_session():
     try:
         path = session_mgr.stop()
-        return {"ok": True, "path": path}
+        warn = getattr(session_mgr, "video_error", None) or None
+        return {"ok": True, "path": path, "warning": warn}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -489,7 +499,8 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
     if not sid:
         return JSONResponse({"ok": False, "error": "no session_id available"}, status_code=400)
 
-    session_dir = Path('out') / sid
+    # Use stable repo-root based output dir.
+    session_dir = OUT_DIR / sid
     if not session_dir.exists():
         return JSONResponse({"ok": False, "error": f"session dir not found: {session_dir}"}, status_code=404)
 
@@ -537,36 +548,124 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             faces = _read_jsonl(faces_path) if faces_path.exists() else []
 
             per_student = {}
-            # Build intervals from events (DROWSY_START / DROWSY_END, LOOKING_DOWN_START/END)
+
+            # Determine session end time for closing open intervals / inferring not-visible gaps.
+            session_end_ts = 0.0
+            try:
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    try:
+                        session_end_ts = max(session_end_ts, float(ev.get("ts", 0.0)))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                for fr in faces:
+                    if not isinstance(fr, dict):
+                        continue
+                    try:
+                        session_end_ts = max(session_end_ts, float(fr.get("ts", 0.0)))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                for seg in asr_segments:
+                    if not isinstance(seg, dict):
+                        continue
+                    try:
+                        session_end_ts = max(session_end_ts, float(seg.get("end", seg.get("start", 0.0))))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Inattentive definition:
+            # - DROWSY (eyes closed)
+            # - LOOKING_DOWN (clear distraction)
+            # - NOT_VISIBLE (eyes not visible; e.g. head down/occluded)
+            keep_types = ("DROWSY_START", "DROWSY_END", "LOOKING_DOWN_START", "LOOKING_DOWN_END")
             for ev in events:
-                sid_ev = str(ev.get('student_id', ev.get('track_id', 'unknown')))
-                typ = ev.get('type')
-                ts = float(ev.get('ts', 0.0))
+                if not isinstance(ev, dict):
+                    continue
+                typ = ev.get("type")
+                if typ not in keep_types:
+                    continue
+                sid_ev = str(ev.get("student_id", ev.get("track_id", "unknown")))
+                try:
+                    ts = float(ev.get("ts", 0.0))
+                except Exception:
+                    ts = 0.0
                 if sid_ev not in per_student:
-                    per_student[sid_ev] = {'intervals': []}
-                if typ and typ.endswith('_START'):
-                    # store start; we will look for matching END
-                    per_student[sid_ev].setdefault('open', []).append({'type': typ.replace('_START',''), 'start': ts, 'end': None})
-                elif typ and typ.endswith('_END'):
-                    name = typ.replace('_END','')
-                    # close the most recent open interval of same type
-                    opens = per_student[sid_ev].get('open', [])
+                    per_student[sid_ev] = {}
+                if typ.endswith("_START"):
+                    per_student[sid_ev].setdefault("open", []).append({"type": typ.replace("_START", ""), "start": ts, "end": None})
+                elif typ.endswith("_END"):
+                    name = typ.replace("_END", "")
+                    opens = per_student[sid_ev].get("open", [])
                     for o in reversed(opens):
-                        if o['type'] == name and o['end'] is None:
-                            o['end'] = ts
+                        if o.get("type") == name and o.get("end") is None:
+                            o["end"] = ts
                             break
 
-            # finalize intervals
+            # finalize raw intervals from CV events
             for sid_ev, info in per_student.items():
                 intervals = []
-                for o in info.get('open', []):
-                    start = o.get('start', 0.0)
-                    end = o.get('end') if o.get('end') is not None else (max([ev.get('ts',0) for ev in events]) if events else start+1.0)
+                for o in info.get("open", []):
+                    start = float(o.get("start", 0.0))
+                    end = o.get("end")
+                    if end is None:
+                        end = session_end_ts or (start + 1.0)
+                    end = float(end)
                     if end <= start:
                         end = start + 0.5
-                    intervals.append({'type': o.get('type'), 'start': float(start), 'end': float(end)})
-                per_student[sid_ev]['intervals'] = intervals
-                per_student[sid_ev].pop('open', None)
+                    intervals.append({"type": str(o.get("type") or "UNKNOWN"), "start": float(start), "end": float(end)})
+                info["raw_intervals"] = intervals
+                info.pop("open", None)
+
+            # infer NOT_VISIBLE intervals from face gaps
+            gap_sec = float(os.getenv("NOT_VISIBLE_GAP_SEC", "1.6"))
+            tail_cap = os.getenv("NOT_VISIBLE_TAIL_CAP_SEC", "")
+            tail_cap_sec = None
+            try:
+                if tail_cap != "":
+                    tail_cap_sec = float(tail_cap)
+                else:
+                    tail_cap_sec = 12.0
+            except Exception:
+                tail_cap_sec = 12.0
+            if tail_cap_sec is not None and tail_cap_sec <= 0:
+                tail_cap_sec = None
+
+            face_times = {}
+            for fr in faces:
+                if not isinstance(fr, dict):
+                    continue
+                sid = str(fr.get("student_id", fr.get("track_id", "unknown")))
+                try:
+                    tsv = float(fr.get("ts", 0.0))
+                except Exception:
+                    continue
+                face_times.setdefault(sid, []).append(tsv)
+
+            for sid, times in face_times.items():
+                nv = infer_not_visible_intervals(times, session_end=session_end_ts, gap_sec=gap_sec, tail_cap_sec=tail_cap_sec)
+                if not nv:
+                    continue
+                info = per_student.setdefault(sid, {})
+                info.setdefault("raw_intervals", []).extend(nv)
+
+            # Merge into union inattentive intervals to avoid double-counting overlaps.
+            merge_gap = float(os.getenv("INATTENTIVE_MERGE_GAP_SEC", "0.4"))
+            for sid_ev in list(per_student.keys()):
+                info = per_student[sid_ev]
+                raw = info.get("raw_intervals") or []
+                merged = merge_inattentive_intervals(raw, join_gap_sec=merge_gap, out_type="INATTENTIVE")
+                info["intervals"] = merged
+                if not merged:
+                    per_student.pop(sid_ev, None)
 
             # Associate ASR segments to intervals
             _proc_jobs[job_id]["status"] = "running:align_asr"

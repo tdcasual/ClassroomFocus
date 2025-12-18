@@ -169,6 +169,15 @@
     }
   }
 
+  function intervalTypeLabel(t) {
+    const v = String(t || "").toUpperCase();
+    if (v === "INATTENTIVE") return "走神/疑似睡觉";
+    if (v === "DROWSY") return "睡觉（闭眼）";
+    if (v === "LOOKING_DOWN") return "低头";
+    if (v === "NOT_VISIBLE") return "眼睛不可见（趴下/遮挡）";
+    return v || "UNKNOWN";
+  }
+
   function dotClassForState(s) {
     switch (s) {
       case "awake":
@@ -826,6 +835,9 @@
     try {
       const j = await fetchJson("/api/session/stop", { method: "POST" });
       if (!j || !j.ok) throw new Error(j?.error || "stop failed");
+      if (j.warning) {
+        alert(`录制已停止，但视频存在问题：${j.warning}`);
+      }
       setRecording(false, state.sessionId);
       btnReport.disabled = !state.sessionId;
       await refreshSessions();
@@ -865,8 +877,8 @@
 
     const kpis = [
       { k: "学生数", v: String(students.length), s: "tracks in stats.json" },
-      { k: "异常区间", v: String(totalIntervals), s: "DROWSY / LOOKING_DOWN" },
-      { k: "总异常时长", v: formatDuration(totalDur), s: "累计（秒）" },
+      { k: "走神/睡觉区间", v: String(totalIntervals), s: "闭眼 / 低头 / 眼睛不可见" },
+      { k: "总走神/睡觉时长", v: formatDuration(totalDur), s: "累计（秒）" },
       { k: "会话", v: String(stats?.session_id || "—"), s: "session_id" },
     ];
     for (const item of kpis) {
@@ -898,7 +910,16 @@
   function renderReportBody(stats) {
     const lesson = stats?.lesson_summary || null;
     const per = stats?.per_student || {};
-    const studentIds = Object.keys(per).sort((a, b) => Number(a) - Number(b));
+    const studentIds = Object.keys(per).sort((a, b) => {
+      const na = Number(a);
+      const nb = Number(b);
+      const fa = Number.isFinite(na);
+      const fb = Number.isFinite(nb);
+      if (fa && fb) return na - nb;
+      if (fa && !fb) return -1;
+      if (!fa && fb) return 1;
+      return String(a).localeCompare(String(b), "zh-Hans-CN", { numeric: true });
+    });
     const head = document.createElement("div");
     head.style.display = "flex";
     head.style.flexDirection = "column";
@@ -957,7 +978,7 @@
       reportBody.appendChild(head);
       const info = document.createElement("div");
       info.className = "muted";
-      info.textContent = "没有检测到非清醒状态区间。";
+      info.textContent = "没有检测到走神/疑似睡觉区间。";
       head.appendChild(info);
       return;
     }
@@ -997,15 +1018,27 @@
           const asr = String(it.asr_text || "").trim();
           const kps = Array.isArray(it.knowledge_points) ? it.knowledge_points : [];
           const topics = Array.isArray(it.lecture_topics) ? it.lecture_topics : [];
+          const kinds = Array.isArray(it.kinds) ? it.kinds : [];
 
           const item = document.createElement("div");
           item.className = "interval";
           item.innerHTML = `
             <div class="interval-head">
-              <div class="interval-title">${escapeHtml(type)}</div>
+              <div class="interval-title">${escapeHtml(intervalTypeLabel(type))}</div>
               <div class="interval-time">${escapeHtml(formatSec(start))} → ${escapeHtml(formatSec(end))} · ${escapeHtml(formatDuration(dur))}</div>
             </div>
             <div class="interval-body">
+              <div>
+                <strong>判定：</strong>
+                ${
+                  kinds.length
+                    ? `<div class="chips">${kinds
+                        .slice(0, 6)
+                        .map((k) => `<span class="chip">${escapeHtml(intervalTypeLabel(k))}</span>`)
+                        .join("")}</div>`
+                    : '<span class="muted">（无）</span>'
+                }
+              </div>
               <div><strong>当时讲解：</strong> ${asr ? escapeHtml(asr) : '<span class="muted">（无 ASR 文本）</span>'}</div>
               <div>
                 <strong>课程主题：</strong>

@@ -112,10 +112,12 @@ class FaceAnalyzerConfig:
     # Cap how much time contributes to the matching slack (prevents huge gates
     # after long occlusions; prefer creating a new track over wrong re-attach).
     match_slack_max_secs: float = 0.8
-    max_miss_count: int = 10
+    # Allow temporary occlusions (e.g. head down / eyes not visible) without
+    # killing a track too aggressively; keeps IDs stable within a class.
+    max_miss_count: int = 200
     # Hard cap for how long we keep a track without seeing it (seconds).
     # Useful when FPS varies (miss_count is frame-rate dependent).
-    max_miss_secs: float = 3.0
+    max_miss_secs: float = 12.0
     # Optional stabilization against camera motion (pan/tilt).
     # When enabled, we estimate a global translation between the previous tracks
     # and current detections and compensate before matching.

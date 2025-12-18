@@ -42,6 +42,7 @@ class SessionManager:
         self.face_analyzer = None
         self.on_data_callback = None # Function to call with frame data for web viz
         self.audio_error = None
+        self.video_error = None
         
         # Audio buffer
         self.audio_queue = Queue()
@@ -58,42 +59,89 @@ class SessionManager:
 
         self.session_id = f"session_{int(time.time())}"
         self.output_dir = Path(output_dir_base) / self.session_id
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.video_thread = None
+        self.audio_thread = None
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # Reset state so /api/session/status won't report a phantom session.
+            self.session_id = None
+            self.output_dir = None
+            raise
         
         logger.info(f"Starting session: {self.session_id} in {self.output_dir}")
 
         self.stop_event.clear()
-        self.is_recording = True
         self.audio_error = None
+        self.video_error = None
         self.session_start_wall = time.time()
         self.video_start_wall = None
         self.audio_start_wall = None
-        
-        # Initialize FaceAnalyzer
-        cfg = FaceAnalyzerConfig() # Use defaults or allow tuning
-        self.face_analyzer = FaceAnalyzer(cfg)
 
-        # Start threads
-        self.video_thread = threading.Thread(target=self._video_loop)
-        self.audio_thread = threading.Thread(target=self._audio_loop)
-        
-        self.video_thread.start()
-        self.audio_thread.start()
-        
-        return self.session_id
+        try:
+            # Preflight camera so we fail fast and don't leave the audio thread running.
+            cap = cv2.VideoCapture(self.camera_index)
+            try:
+                if not cap.isOpened():
+                    raise RuntimeError(f"Could not open camera (index={self.camera_index})")
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+            # Initialize FaceAnalyzer
+            cfg = FaceAnalyzerConfig() # Use defaults or allow tuning
+            self.face_analyzer = FaceAnalyzer(cfg)
+
+            self.is_recording = True
+
+            # Start threads
+            self.video_thread = threading.Thread(target=self._video_loop, daemon=True)
+            self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+            
+            self.video_thread.start()
+            self.audio_thread.start()
+            
+            return self.session_id
+        except Exception:
+            # Roll back state; keep output dir for debugging but avoid dangling "recording" state.
+            self.is_recording = False
+            self.stop_event.set()
+            try:
+                if self.video_thread:
+                    self.video_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                if self.audio_thread:
+                    self.audio_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self.video_thread = None
+            self.audio_thread = None
+            # Expose no active session on failures.
+            self.session_id = None
+            self.output_dir = None
+            raise
 
     def stop(self):
-        if not self.is_recording:
+        # Allow stop() even if a worker thread already flipped is_recording due to an error.
+        if not self.session_id or not self.output_dir:
             return None
             
         logger.info("Stopping session...")
-        self.is_recording = False
         self.stop_event.set()
+
+        # Flip state after signaling stop (threads may check is_recording).
+        self.is_recording = False
         
         if self.video_thread:
             self.video_thread.join()
         if self.audio_thread:
             self.audio_thread.join()
+        self.video_thread = None
+        self.audio_thread = None
 
         # Persist sync metadata to align CV timestamps with audio/ASR timestamps.
         try:
@@ -114,13 +162,19 @@ class SessionManager:
 
         # Ensure we actually captured audio for the whole session.
         audio_path = (self.output_dir / "temp_audio.wav") if self.output_dir else None
+            
+        # Post-processing: Mux video and audio
+        self._mux_files()
+
+        # Validate audio/video after mux so artifacts are still produced for debugging.
         if self.audio_error:
             raise RuntimeError(f"Audio recording failed: {self.audio_error}")
         if audio_path and (not audio_path.exists() or audio_path.stat().st_size <= 0):
             raise RuntimeError("Audio recording output is missing/empty (temp_audio.wav).")
-            
-        # Post-processing: Mux video and audio
-        self._mux_files()
+        if self.video_error:
+            # Video problems are reported as warnings so we still keep the audio
+            # and any partial artifacts for debugging/reporting.
+            logger.warning(f"Video recording warning: {self.video_error}")
         
         logger.info("Session stopped and saved.")
         return str(self.output_dir)
@@ -130,8 +184,20 @@ class SessionManager:
             self.video_start_wall = time.time()
         cap = cv2.VideoCapture(self.camera_index)
         if not cap.isOpened():
-            logger.error("Could not open camera")
+            msg = f"Could not open camera (index={self.camera_index})"
+            self.video_error = msg
+            logger.error(msg)
             self.is_recording = False
+            self.stop_event.set()
+            try:
+                if self.on_data_callback:
+                    self.on_data_callback({"type": "error", "ts": 0.0, "error": msg}, None)
+            except Exception:
+                pass
+            try:
+                cap.release()
+            except Exception:
+                pass
             return
 
         # Video Writer setup
@@ -152,63 +218,71 @@ class SessionManager:
         last_preview_ts = -1e9
         preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))  # ~6-7 fps by default
 
-        with open(faces_path, "w", encoding="utf-8") as f_faces, \
-             open(events_path, "w", encoding="utf-8") as f_events:
-            
-            while not self.stop_event.is_set():
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        try:
+            with open(faces_path, "w", encoding="utf-8") as f_faces, \
+                 open(events_path, "w", encoding="utf-8") as f_events:
                 
-                current_time = time.time()
-                ts = current_time - start_time
-                
-                # Analyze
-                results, events = self.face_analyzer.analyze_frame(frame, ts)
-                
-                # Write to files
-                for r in results:
-                    # Add frame index
-                    r['frame'] = frame_idx
-                    f_faces.write(json.dumps(r, ensure_ascii=False) + "\n")
+                while not self.stop_event.is_set():
+                    ret, frame = cap.read()
+                    if not ret:
+                        # Camera disconnected / stream ended.
+                        self.video_error = "camera read failed"
+                        self.stop_event.set()
+                        break
                     
-                    # Save thumbnail if needed (e.g. every 5 seconds or on event)
-                    # For now, let's just pass the data to callback
-                
-                for e in events:
-                    if 'ts' not in e or e['ts'] is None:
-                        e['ts'] = ts
-                    f_events.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-                # Write video
-                out.write(frame)
-                
-                # Callback for Web Viz
-                if self.on_data_callback:
-                    img_str = None
-                    # Throttle preview frames to reduce CPU/network usage.
-                    if (ts - last_preview_ts) >= preview_interval_sec:
-                        last_preview_ts = ts
-                        try:
-                            _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
-                            img_str = buffer.tobytes()
-                        except Exception:
-                            img_str = None
+                    current_time = time.time()
+                    ts = current_time - start_time
                     
-                    data = {
-                        "type": "frame_data",
-                        "ts": ts,
-                        "faces": results,
-                        "events": events,
-                        # "image": img_str # Handle binary separately or base64 encode if needed
-                    }
-                    self.on_data_callback(data, img_str)
-
-                frame_idx += 1
-                # Control FPS if needed, but camera read usually blocks to FPS
-        
-        cap.release()
-        out.release()
+                    # Analyze
+                    results, events = self.face_analyzer.analyze_frame(frame, ts)
+                    
+                    # Write to files
+                    for r in results:
+                        # Add frame index
+                        r['frame'] = frame_idx
+                        f_faces.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    
+                    for e in events:
+                        if 'ts' not in e or e['ts'] is None:
+                            e['ts'] = ts
+                        f_events.write(json.dumps(e, ensure_ascii=False) + "\n")
+    
+                    # Write video
+                    out.write(frame)
+                    
+                    # Callback for Web Viz
+                    if self.on_data_callback:
+                        img_str = None
+                        # Throttle preview frames to reduce CPU/network usage.
+                        if (ts - last_preview_ts) >= preview_interval_sec:
+                            last_preview_ts = ts
+                            try:
+                                _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
+                                img_str = buffer.tobytes()
+                            except Exception:
+                                img_str = None
+                        
+                        data = {
+                            "type": "frame_data",
+                            "ts": ts,
+                            "faces": results,
+                            "events": events,
+                        }
+                        self.on_data_callback(data, img_str)
+    
+                    frame_idx += 1
+        except Exception as exc:
+            self.video_error = str(exc)
+            self.stop_event.set()
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            try:
+                out.release()
+            except Exception:
+                pass
 
     def _audio_loop(self):
         temp_audio_path = self.output_dir / "temp_audio.wav"

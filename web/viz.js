@@ -44,6 +44,7 @@
   const modelContent = document.getElementById("modelContent");
   const modelNavButtons = Array.from(document.querySelectorAll(".model-nav-btn"));
   const modelSections = Array.from(document.querySelectorAll(".model-section"));
+  const modelSectionToggles = Array.from(document.querySelectorAll(".model-section-toggle"));
 
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
@@ -284,6 +285,67 @@
       modelNavRaf = null;
       updateModelNavActive();
     });
+  }
+
+  function isModelSectionOpen(section) {
+    if (!section) return true;
+    return section.dataset.open !== "false";
+  }
+
+  function setModelSectionOpen(section, open) {
+    if (!section) return;
+    const btn = section.querySelector(".model-section-toggle");
+    const panelId = btn ? btn.getAttribute("aria-controls") : null;
+    const panel = panelId ? document.getElementById(panelId) : null;
+
+    if (panel) {
+      if (open) {
+        panel.hidden = false;
+        panel.removeAttribute("inert");
+        panel.setAttribute("aria-hidden", "false");
+      } else {
+        panel.setAttribute("inert", "");
+        panel.setAttribute("aria-hidden", "true");
+        // Hide after collapse transition to avoid tabbing into invisible controls.
+        setTimeout(() => {
+          if (section.dataset.open === "false") panel.hidden = true;
+        }, 220);
+      }
+    }
+    if (open) {
+      // Ensure a layout flush so the open transition runs after un-hiding.
+      if (panel) panel.getBoundingClientRect();
+      section.dataset.open = "true";
+      if (btn) btn.setAttribute("aria-expanded", "true");
+    } else {
+      section.dataset.open = "false";
+      if (btn) btn.setAttribute("aria-expanded", "false");
+    }
+    scheduleModelNavUpdate();
+  }
+
+  function toggleModelSection(section) {
+    setModelSectionOpen(section, !isModelSectionOpen(section));
+  }
+
+  function syncModelSectionsToDom() {
+    for (const section of modelSections) {
+      const open = isModelSectionOpen(section);
+      const btn = section.querySelector(".model-section-toggle");
+      const panelId = btn ? btn.getAttribute("aria-controls") : null;
+      const panel = panelId ? document.getElementById(panelId) : null;
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (panel) {
+        panel.hidden = !open;
+        if (open) {
+          panel.removeAttribute("inert");
+          panel.setAttribute("aria-hidden", "false");
+        } else {
+          panel.setAttribute("inert", "");
+          panel.setAttribute("aria-hidden", "true");
+        }
+      }
+    }
   }
 
   let rafId = null;
@@ -1322,6 +1384,7 @@
     applyModelFormFromState();
     renderModelEnvBox();
     renderModelCheckBox();
+    syncModelSectionsToDom();
     initModelDrawerPos();
     scheduleModelNavUpdate();
     modelModal.addEventListener(
@@ -1875,9 +1938,16 @@
         const target = btn.dataset.target;
         const section = target ? document.getElementById(target) : null;
         if (section && modelContent) {
+          if (!isModelSectionOpen(section)) setModelSectionOpen(section, true);
           modelContent.scrollTo({ top: Math.max(0, section.offsetTop - 8), behavior: "smooth" });
           setActiveModelNav(target);
         }
+      });
+    }
+    for (const toggle of modelSectionToggles) {
+      toggle.addEventListener("click", () => {
+        const section = toggle.closest(".model-section");
+        if (section) toggleModelSection(section);
       });
     }
     if (modelContent) {

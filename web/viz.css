@@ -495,6 +495,11 @@ a{color:inherit}
   scroll-margin-top: 12px;
 }
 .model-section-head{
+  appearance:none;
+  border:none;
+  width:100%;
+  text-align:left;
+  font: inherit;
   padding:12px 14px;
   display:flex;
   align-items:center;
@@ -502,7 +507,39 @@ a{color:inherit}
   gap:12px;
   background: rgba(255,255,255,0.02);
   border-bottom:1px solid var(--border);
+  color: var(--text);
+  cursor:pointer;
 }
+.model-section-head:hover{background: rgba(255,255,255,0.04)}
+.model-section-head:focus-visible{outline:none; box-shadow: var(--ring)}
+.model-section-meta{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  min-width:0;
+}
+.model-section-chevron{
+  width:10px;
+  height:10px;
+  border-right:2px solid var(--muted-2);
+  border-bottom:2px solid var(--muted-2);
+  transform: rotate(45deg);
+  transition: transform 160ms ease, border-color 160ms ease, opacity 160ms ease;
+  opacity:0.85;
+  flex:0 0 auto;
+}
+.model-section-head:hover .model-section-chevron{border-color: var(--muted)}
+.model-section[data-open="false"] .model-section-chevron{
+  transform: rotate(-45deg);
+  opacity:0.65;
+}
+.model-section-panel{
+  display:grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 160ms ease;
+}
+.model-section-panel > .model-section-body{overflow:hidden; min-height:0}
+.model-section[data-open="false"] .model-section-panel{grid-template-rows: 0fr}
 .model-section-body{
   padding:12px 14px 14px;
   display:flex;

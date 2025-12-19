@@ -155,137 +155,162 @@
 		                <button class="model-nav-btn" type="button" data-target="model-section-env">环境摘要</button>
 		              </aside>
 		              <div class="model-content" id="modelContent">
-		                <section class="model-section" id="model-section-check">
-		                  <div class="model-section-head">
+		                <section class="model-section" id="model-section-check" data-open="true">
+		                  <button class="model-section-head model-section-toggle" type="button" aria-expanded="true" aria-controls="model-section-check-panel">
 		                    <div class="summary-left">
 		                      <div class="student-name">检测结果</div>
 		                      <span class="badge"><span class="dot unknown"></span><span>建议录制前检测</span></span>
 		                    </div>
-		                    <div class="summary-right">将检测结果作为“是否需要 offline”的依据</div>
-		                  </div>
-		                  <div class="model-section-body">
-		                    <div id="modelCheckBox" class="muted">尚未检测。</div>
+		                    <div class="model-section-meta">
+		                      <div class="summary-right">将检测结果作为“是否需要 offline”的依据</div>
+		                      <div class="model-section-chevron" aria-hidden="true"></div>
+		                    </div>
+		                  </button>
+		                  <div class="model-section-panel" id="model-section-check-panel">
+		                    <div class="model-section-body">
+		                      <div id="modelCheckBox" class="muted">尚未检测。</div>
+		                    </div>
 		                  </div>
 		                </section>
 
-		                <section class="model-section" id="model-section-mode">
-		                  <div class="model-section-head">
+		                <section class="model-section" id="model-section-mode" data-open="true">
+		                  <button class="model-section-head model-section-toggle" type="button" aria-expanded="true" aria-controls="model-section-mode-panel">
 		                    <div class="summary-left">
 		                      <div class="student-name">模式</div>
 		                      <span class="badge"><span class="dot unknown"></span><span>online / offline</span></span>
 		                    </div>
-		                    <div class="summary-right">offline 不会调用任何模型</div>
-		                  </div>
-		                  <div class="model-section-body">
-		                    <div class="field">
-		                      <div class="field-label">模式（Recording 不受影响）</div>
-		                      <div class="select">
-		                        <span>Mode</span>
-		                        <select id="modelModeSel">
-		                          <option value="online">online（调用模型）</option>
-		                          <option value="offline">offline（不调用模型）</option>
-		                        </select>
+		                    <div class="model-section-meta">
+		                      <div class="summary-right">offline 不会调用任何模型</div>
+		                      <div class="model-section-chevron" aria-hidden="true"></div>
+		                    </div>
+		                  </button>
+		                  <div class="model-section-panel" id="model-section-mode-panel">
+		                    <div class="model-section-body">
+		                      <div class="field">
+		                        <div class="field-label">模式（Recording 不受影响）</div>
+		                        <div class="select">
+		                          <span>Mode</span>
+		                          <select id="modelModeSel">
+		                            <option value="online">online（调用模型）</option>
+		                            <option value="offline">offline（不调用模型）</option>
+		                          </select>
+		                        </div>
+		                        <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。</div>
 		                      </div>
-		                      <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。</div>
 		                    </div>
 		                  </div>
 		                </section>
 
-		                <section class="model-section" id="model-section-llm">
-		                  <div class="model-section-head">
+		                <section class="model-section" id="model-section-llm" data-open="true">
+		                  <button class="model-section-head model-section-toggle" type="button" aria-expanded="true" aria-controls="model-section-llm-panel">
 		                    <div class="summary-left">
 		                      <div class="student-name">LLM（课程总结 / 知识点）</div>
 		                      <span class="badge"><span class="dot unknown"></span><span>OpenAI-compatible</span></span>
 		                    </div>
-		                    <div class="summary-right">可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）</div>
-		                  </div>
-		                  <div class="model-section-body">
-		                    <div class="field-row">
-		                      <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用 LLM（总结+知识点）</label>
+		                    <div class="model-section-meta">
+		                      <div class="summary-right">可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）</div>
+		                      <div class="model-section-chevron" aria-hidden="true"></div>
 		                    </div>
-		                    <div class="form-grid">
-		                      <div class="field">
-		                        <div class="field-label">Base URL</div>
-		                        <div class="input">
-		                          <input id="llmBaseUrlInput" placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" autocomplete="off" />
-		                        </div>
-		                        <div class="field-help">后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。</div>
+		                  </button>
+		                  <div class="model-section-panel" id="model-section-llm-panel">
+		                    <div class="model-section-body">
+		                      <div class="field-row">
+		                        <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用 LLM（总结+知识点）</label>
 		                      </div>
-		                      <div class="field">
-		                        <div class="field-label">API Key</div>
-		                        <div class="input">
-		                          <input id="llmApiKeyInput" type="password" placeholder="sk-...（不会写入 out/ session 输出）" autocomplete="off" />
-		                        </div>
-		                        <div class="field-help">如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。</div>
-		                      </div>
-		                      <div class="field">
-		                        <div class="field-label">可用模型（从 URL 拉取）</div>
-		                        <div style="display:flex; gap:10px; align-items:center;">
-		                          <div class="select" style="flex:1; min-width:0;">
-		                            <span>Model</span>
-		                            <select id="llmModelSel">
-		                              <option value="">（点击“拉取模型”）</option>
-		                            </select>
+		                      <div class="form-grid">
+		                        <div class="field">
+		                          <div class="field-label">Base URL</div>
+		                          <div class="input">
+		                            <input id="llmBaseUrlInput" placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" autocomplete="off" />
 		                          </div>
-		                          <button class="btn small" id="btnLlmPullModels" title="从当前 Base URL 拉取 /v1/models">拉取模型</button>
+		                          <div class="field-help">后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。</div>
 		                        </div>
-		                        <div id="llmModelsStatus" class="muted">（未拉取）</div>
-		                        <div class="field-help">如拉取失败，可直接在下方手动填写模型名。</div>
-		                      </div>
-		                      <div class="field">
-		                        <div class="field-label">模型名（手动/被下拉框填入）</div>
-		                        <div class="input">
-		                          <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." autocomplete="off" />
+		                        <div class="field">
+		                          <div class="field-label">API Key</div>
+		                          <div class="input">
+		                            <input id="llmApiKeyInput" type="password" placeholder="sk-...（不会写入 out/ session 输出）" autocomplete="off" />
+		                          </div>
+		                          <div class="field-help">如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。</div>
+		                        </div>
+		                        <div class="field">
+		                          <div class="field-label">可用模型（从 URL 拉取）</div>
+		                          <div style="display:flex; gap:10px; align-items:center;">
+		                            <div class="select" style="flex:1; min-width:0;">
+		                              <span>Model</span>
+		                              <select id="llmModelSel">
+		                                <option value="">（点击“拉取模型”）</option>
+		                              </select>
+		                            </div>
+		                            <button class="btn small" id="btnLlmPullModels" title="从当前 Base URL 拉取 /v1/models">拉取模型</button>
+		                          </div>
+		                          <div id="llmModelsStatus" class="muted">（未拉取）</div>
+		                          <div class="field-help">如拉取失败，可直接在下方手动填写模型名。</div>
+		                        </div>
+		                        <div class="field">
+		                          <div class="field-label">模型名（手动/被下拉框填入）</div>
+		                          <div class="input">
+		                            <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." autocomplete="off" />
+		                          </div>
 		                        </div>
 		                      </div>
 		                    </div>
 		                  </div>
 		                </section>
 
-		                <section class="model-section" id="model-section-asr">
-		                  <div class="model-section-head">
+		                <section class="model-section" id="model-section-asr" data-open="true">
+		                  <button class="model-section-head model-section-toggle" type="button" aria-expanded="true" aria-controls="model-section-asr-panel">
 		                    <div class="summary-left">
 		                      <div class="student-name">ASR（整节课转写）</div>
 		                      <span class="badge"><span class="dot unknown"></span><span>provider</span></span>
 		                    </div>
-		                    <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
-		                  </div>
-		                  <div class="model-section-body">
-		                    <div class="form-grid">
-		                      <div class="field">
-		                        <div class="field-label">ASR Provider</div>
-		                        <div class="select">
-		                          <span>Provider</span>
-		                          <select id="asrProviderSel">
-		                            <option value="openai_compat">OpenAI-compatible（Whisper）</option>
-		                            <option value="dashscope">阿里 DashScope（文件识别）</option>
-		                            <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
-		                            <option value="none">none（不转写）</option>
-		                          </select>
+		                    <div class="model-section-meta">
+		                      <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
+		                      <div class="model-section-chevron" aria-hidden="true"></div>
+		                    </div>
+		                  </button>
+		                  <div class="model-section-panel" id="model-section-asr-panel">
+		                    <div class="model-section-body">
+		                      <div class="form-grid">
+		                        <div class="field">
+		                          <div class="field-label">ASR Provider</div>
+		                          <div class="select">
+		                            <span>Provider</span>
+		                            <select id="asrProviderSel">
+		                              <option value="openai_compat">OpenAI-compatible（Whisper）</option>
+		                              <option value="dashscope">阿里 DashScope（文件识别）</option>
+		                              <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
+		                              <option value="none">none（不转写）</option>
+		                            </select>
+		                          </div>
+		                          <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
 		                        </div>
-		                        <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
-		                      </div>
-		                      <div class="field">
-		                        <div class="field-label">ASR 模型</div>
-		                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
-		                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
+		                        <div class="field">
+		                          <div class="field-label">ASR 模型</div>
+		                          <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
+		                            <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
+		                          </div>
+		                          <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
 		                        </div>
-		                        <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
 		                      </div>
 		                    </div>
 		                  </div>
 		                </section>
 
-		                <section class="model-section" id="model-section-env">
-		                  <div class="model-section-head">
+		                <section class="model-section" id="model-section-env" data-open="true">
+		                  <button class="model-section-head model-section-toggle" type="button" aria-expanded="true" aria-controls="model-section-env-panel">
 		                    <div class="summary-left">
 		                      <div class="student-name">环境摘要（.env）</div>
 		                      <span class="badge"><span class="dot unknown"></span><span>keys present?</span></span>
 		                    </div>
-		                    <div class="summary-right">仅展示是否存在，不会回显 Key</div>
-		                  </div>
-		                  <div class="model-section-body">
-		                    <div id="modelEnvBox" class="muted">（加载中…）</div>
+		                    <div class="model-section-meta">
+		                      <div class="summary-right">仅展示是否存在，不会回显 Key</div>
+		                      <div class="model-section-chevron" aria-hidden="true"></div>
+		                    </div>
+		                  </button>
+		                  <div class="model-section-panel" id="model-section-env-panel">
+		                    <div class="model-section-body">
+		                      <div id="modelEnvBox" class="muted">（加载中…）</div>
+		                    </div>
 		                  </div>
 		                </section>
 		              </div>

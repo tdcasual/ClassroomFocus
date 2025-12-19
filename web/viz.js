@@ -44,7 +44,6 @@
   const modelContent = document.getElementById("modelContent");
   const modelNavButtons = Array.from(document.querySelectorAll(".model-nav-btn"));
   const modelSections = Array.from(document.querySelectorAll(".model-section"));
-  const modelSectionToggles = Array.from(document.querySelectorAll(".model-section-toggle"));
 
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
@@ -285,67 +284,6 @@
       modelNavRaf = null;
       updateModelNavActive();
     });
-  }
-
-  function isModelSectionOpen(section) {
-    if (!section) return true;
-    return section.dataset.open !== "false";
-  }
-
-  function setModelSectionOpen(section, open) {
-    if (!section) return;
-    const btn = section.querySelector(".model-section-toggle");
-    const panelId = btn ? btn.getAttribute("aria-controls") : null;
-    const panel = panelId ? document.getElementById(panelId) : null;
-
-    if (panel) {
-      if (open) {
-        panel.hidden = false;
-        panel.removeAttribute("inert");
-        panel.setAttribute("aria-hidden", "false");
-      } else {
-        panel.setAttribute("inert", "");
-        panel.setAttribute("aria-hidden", "true");
-        // Hide after collapse transition to avoid tabbing into invisible controls.
-        setTimeout(() => {
-          if (section.dataset.open === "false") panel.hidden = true;
-        }, 220);
-      }
-    }
-    if (open) {
-      // Ensure a layout flush so the open transition runs after un-hiding.
-      if (panel) panel.getBoundingClientRect();
-      section.dataset.open = "true";
-      if (btn) btn.setAttribute("aria-expanded", "true");
-    } else {
-      section.dataset.open = "false";
-      if (btn) btn.setAttribute("aria-expanded", "false");
-    }
-    scheduleModelNavUpdate();
-  }
-
-  function toggleModelSection(section) {
-    setModelSectionOpen(section, !isModelSectionOpen(section));
-  }
-
-  function syncModelSectionsToDom() {
-    for (const section of modelSections) {
-      const open = isModelSectionOpen(section);
-      const btn = section.querySelector(".model-section-toggle");
-      const panelId = btn ? btn.getAttribute("aria-controls") : null;
-      const panel = panelId ? document.getElementById(panelId) : null;
-      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
-      if (panel) {
-        panel.hidden = !open;
-        if (open) {
-          panel.removeAttribute("inert");
-          panel.setAttribute("aria-hidden", "false");
-        } else {
-          panel.setAttribute("inert", "");
-          panel.setAttribute("aria-hidden", "true");
-        }
-      }
-    }
   }
 
   let rafId = null;
@@ -1122,9 +1060,66 @@
       modelCheckBox.textContent = "检测中…";
       return;
     }
+    const cfg = state.models.config || {};
+    const env = state.models.env || {};
+    const mode = String(cfg.mode || "offline");
+    const llmProvider = String(cfg.llm?.provider || "none");
+    const llmEnabled = Boolean(cfg.llm?.enabled) && llmProvider !== "none";
+    const llmModel = String(cfg.llm?.model || "").trim();
+    const llmBaseUrl = String(cfg.llm?.base_url || "").trim();
+    const hasOpenaiKey = Boolean(String(cfg.llm?.api_key || "").trim()) || Boolean(env.has_openai_key);
+    const asrProvider = String(cfg.asr?.provider || "none");
+    const asrModel = String(cfg.asr?.model || "").trim();
+
     const r = state.models.lastCheck;
     if (!r) {
-      modelCheckBox.textContent = "尚未检测。";
+      const chips = [];
+      chips.push(`mode: ${mode}`);
+      chips.push(llmEnabled ? `llm: on${llmModel ? ` (${llmModel})` : ""}` : "llm: off");
+      if (asrProvider && asrProvider !== "none") {
+        chips.push(`asr: ${asrProvider}${asrProvider !== "xfyun_raasr" && asrModel ? ` (${asrModel})` : ""}`);
+      } else {
+        chips.push("asr: none");
+      }
+
+      const hints = [];
+      const envDefaultBaseUrl = String(env.openai_base_url || "https://api.openai.com");
+      const envDefaultModel = String(env.openai_model || "gpt-4o-mini");
+      const envDefaultAsrModel = String(env.openai_asr_model || "whisper-1");
+      if (mode === "online") {
+        if (llmEnabled) {
+          if (!llmModel) hints.push(`LLM：模型名为空会回退为 ${envDefaultModel}`);
+          if (!llmBaseUrl) hints.push(`LLM：Base URL 为空会回退为 ${envDefaultBaseUrl}`);
+          if (!hasOpenaiKey) hints.push("LLM：缺少 API Key（填写或设置 OPENAI_API_KEY/OPENAI_KEY）");
+        }
+        if (asrProvider === "openai_compat" && !hasOpenaiKey) {
+          hints.push("ASR：OpenAI-compatible 需要 OpenAI Key（OPENAI_API_KEY/OPENAI_KEY）");
+        }
+        if (asrProvider === "openai_compat" && !asrModel) {
+          hints.push(`ASR：模型名为空会回退为 ${envDefaultAsrModel}`);
+        }
+        if (asrProvider === "dashscope" && !env.has_dashscope_key) {
+          hints.push("ASR：DashScope 需要 DASH_SCOPE_API_KEY");
+        }
+        if (asrProvider === "xfyun_raasr" && !env.has_xfyun) {
+          hints.push("ASR：讯飞需要 XFYUN_APP_ID/XFYUN_SECRET_KEY");
+        }
+      }
+
+      modelCheckBox.innerHTML = `
+        <div class="chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div>
+        <div class="muted" style="margin-top:10px; line-height:1.55;">
+          尚未检测。点击“检测”可验证当前配置是否可用。
+        </div>
+        ${
+          hints.length
+            ? `<div class="muted" style="margin-top:10px; line-height:1.55;">
+                <div><strong>配置提示：</strong></div>
+                <div>${hints.slice(0, 8).map((t) => `• ${escapeHtml(t)}`).join("<br/>")}</div>
+               </div>`
+            : ""
+        }
+      `;
       return;
     }
     const llm = r.llm || {};
@@ -1149,6 +1144,9 @@
     lines.push(asrLine);
 
     const suggested = state.models.suggestedMode;
+    const dirtyHtml = state.models.dirty
+      ? `<div class="warn-text" style="margin-top:8px;">配置已修改，检测结果可能已过期；建议重新“检测”。</div>`
+      : "";
     const suggestHtml =
       suggested === "offline"
         ? `<div class="warn-text" style="margin-top:8px;">建议切换为 offline（录制不受影响，但报告将跳过 ASR/LLM）。</div>`
@@ -1177,6 +1175,7 @@
       </div>
       <div class="codebox" style="margin-top:10px;">${escapeHtml(lines.join("\n"))}</div>
       ${hintHtml}
+      ${dirtyHtml}
       ${suggestHtml}
     `;
   }
@@ -1325,6 +1324,7 @@
     state.models.dirty = true;
     updateModelFormDisabledState();
     updateModelPill();
+    renderModelCheckBox();
   }
 
   async function loadModelsConfig() {
@@ -1384,7 +1384,6 @@
     applyModelFormFromState();
     renderModelEnvBox();
     renderModelCheckBox();
-    syncModelSectionsToDom();
     initModelDrawerPos();
     scheduleModelNavUpdate();
     modelModal.addEventListener(
@@ -1938,16 +1937,9 @@
         const target = btn.dataset.target;
         const section = target ? document.getElementById(target) : null;
         if (section && modelContent) {
-          if (!isModelSectionOpen(section)) setModelSectionOpen(section, true);
           modelContent.scrollTo({ top: Math.max(0, section.offsetTop - 8), behavior: "smooth" });
           setActiveModelNav(target);
         }
-      });
-    }
-    for (const toggle of modelSectionToggles) {
-      toggle.addEventListener("click", () => {
-        const section = toggle.closest(".model-section");
-        if (section) toggleModelSection(section);
       });
     }
     if (modelContent) {

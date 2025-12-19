@@ -31,6 +31,16 @@ app = FastAPI()
 # Load local `.env` (keys/config), if present.
 load_dotenv(PROJ_ROOT / ".env")
 
+# Avoid confusing stale frontend assets during local iteration.
+@app.middleware("http")
+async def _no_cache_static_assets(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path or ""
+    if path.startswith("/static/") and any(path.endswith(ext) for ext in (".html", ".js", ".css")):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
 # Resolve important dirs relative to repo root so the server can be started from anywhere.
 WEB_DIR = PROJ_ROOT / "web"
 OUT_DIR = PROJ_ROOT / "out"

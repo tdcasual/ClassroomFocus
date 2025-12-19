@@ -286,6 +286,19 @@
     });
   }
 
+  function scrollModelContentToSection(section, { offset = 8, behavior = "smooth" } = {}) {
+    if (!modelContent || !section) return;
+    const containerRect = modelContent.getBoundingClientRect();
+    const sectionRect = section.getBoundingClientRect();
+    const delta = sectionRect.top - containerRect.top;
+    const top = Math.max(0, modelContent.scrollTop + delta - offset);
+    try {
+      modelContent.scrollTo({ top, behavior });
+    } catch (_) {
+      modelContent.scrollTop = top;
+    }
+  }
+
   let rafId = null;
   let needsPreview = false;
   let needsTimeline = false;
@@ -1008,28 +1021,28 @@
     const cfg = state.models.config;
     if (!cfg) {
       modelDot.className = "dot unknown";
-      modelStatusText.textContent = "models";
+      modelStatusText.textContent = "模型设置";
       return;
     }
 
     const mode = String(cfg.mode || "offline");
     if (mode === "offline") {
       modelDot.className = "dot warn";
-      modelStatusText.textContent = state.models.dirty ? "offline*" : "offline";
+      modelStatusText.textContent = state.models.dirty ? "模型设置*" : "模型设置";
       return;
     }
 
     const check = state.models.lastCheck;
     if (!check) {
       modelDot.className = "dot unknown";
-      modelStatusText.textContent = state.models.dirty ? "online*" : "online";
+      modelStatusText.textContent = state.models.dirty ? "模型设置*" : "模型设置";
       return;
     }
 
     const llmOk = isOkOrSkipped(check.llm);
     const asrOk = isOkOrSkipped(check.asr);
     modelDot.className = `dot ${llmOk && asrOk ? "good" : "bad"}`;
-    modelStatusText.textContent = `${llmOk && asrOk ? "models ok" : "models issue"}${state.models.dirty ? "*" : ""}`;
+    modelStatusText.textContent = `模型设置${state.models.dirty ? "*" : ""}`;
   }
 
   function renderModelEnvBox() {
@@ -1937,7 +1950,7 @@
         const target = btn.dataset.target;
         const section = target ? document.getElementById(target) : null;
         if (section && modelContent) {
-          modelContent.scrollTo({ top: Math.max(0, section.offsetTop - 8), behavior: "smooth" });
+          scrollModelContentToSection(section, { offset: 8, behavior: "smooth" });
           setActiveModelNav(target);
         }
       });

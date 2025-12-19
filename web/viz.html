@@ -27,9 +27,9 @@
 	            <span id="recStatusText">idle</span>
 	            <span class="mono" id="sessionIdText" style="display:none;"></span>
 	          </div>
-	          <button class="pill pill-btn" id="btnModelCenter" title="模型中心：录制前检测/切换在线/离线/ASR">
+	          <button class="pill pill-btn" id="btnModelCenter" title="模型设置：录制前检测/切换在线/离线/ASR">
 	            <span class="dot unknown" id="modelDot"></span>
-	            <span id="modelStatusText">models</span>
+	            <span id="modelStatusText">模型设置</span>
 	          </button>
 
 	          <button class="btn primary" id="btnStart">开始录制</button>
@@ -132,8 +132,8 @@
 	          <div class="drawer-head model-head">
 	            <div class="model-head-left">
 	              <div class="drag-handle" id="modelDragHandle" title="拖动窗口"></div>
-	              <div class="model-head-title">
-	                <div class="drawer-title" id="modelTitle">模型中心（录制前检测）</div>
+	            <div class="model-head-title">
+	                <div class="drawer-title" id="modelTitle">模型设置（录制前检测）</div>
 	                <div class="model-subtitle">拖动窗口，可在不遮挡实时画面的情况下调整设置。</div>
 	              </div>
 	            </div>
@@ -141,13 +141,13 @@
 	              <button class="btn small" id="btnModelsSave" title="保存并应用到下一次录制">保存/应用</button>
 	              <button class="btn small" id="btnModelsCheck" title="快速检测（推荐）">检测</button>
 	              <button class="btn small" id="btnModelsCheckDeep" title="深度检测（会触发真实 ASR 调用）">深度检测</button>
-	              <button class="btn small" id="btnModelsResetPos" title="重置模型中心位置">重置位置</button>
+	              <button class="btn small" id="btnModelsResetPos" title="重置窗口位置">重置位置</button>
 	              <button class="btn small" id="btnModelsClose">关闭</button>
 	            </div>
 		          </div>
 		          <div class="drawer-body model-body">
-		            <div class="model-layout">
-		              <aside class="model-nav" aria-label="模型中心导航">
+			            <div class="model-layout">
+			              <aside class="model-nav" aria-label="模型设置导航">
 		                <button class="model-nav-btn active" type="button" data-target="model-section-check">检测结果</button>
 		                <button class="model-nav-btn" type="button" data-target="model-section-mode">模式</button>
 		                <button class="model-nav-btn" type="button" data-target="model-section-llm">LLM</button>

@@ -25,17 +25,38 @@
 	          <div class="pill" title="当前会话">
 	            <span class="dot unknown" id="recDot"></span>
 	            <span id="recStatusText">idle</span>
+	            <span class="rec-timer" id="recTimer" style="display:none;">00:00</span>
 	            <span class="mono" id="sessionIdText" style="display:none;"></span>
 	          </div>
+	          <div class="btn-group-sep"></div>
 	          <button class="pill pill-btn" id="btnModelCenter" title="模型设置：录制前检测/切换在线/离线/ASR">
 	            <span class="dot unknown" id="modelDot"></span>
 	            <span id="modelStatusText">模型设置</span>
 	          </button>
-
-	          <button class="btn primary" id="btnStart">开始录制</button>
-	          <button class="btn danger" id="btnStop" disabled>停止</button>
-	          <button class="btn" id="btnReport" disabled>生成报告</button>
-	          <button class="btn ghost" id="btnOpenReport" style="display:none;">查看报告</button>
+	          <button class="pill pill-btn" id="btnSettingsCenter" title="设置中心：WebDAV/同步">
+	            <span class="dot unknown" id="settingsDot"></span>
+	            <span>设置</span>
+	          </button>
+	          <div class="shortcuts-help" id="shortcutsHelp">
+	            <button class="shortcuts-trigger" id="btnShortcutsHelp" title="键盘快捷键">?</button>
+	            <div class="shortcuts-tooltip" id="shortcutsTooltip">
+	              <div class="shortcuts-title">键盘快捷键</div>
+	              <div class="shortcuts-list">
+	                <div class="shortcut-item"><kbd>Esc</kbd> <span>关闭弹窗</span></div>
+	                <div class="shortcut-item"><kbd>R</kbd> <span>刷新会话列表</span></div>
+	                <div class="shortcut-item"><kbd>T</kbd> <span>切换时间轴</span></div>
+	              </div>
+	            </div>
+	          </div>
+	          <div class="btn-group-sep"></div>
+	          <div class="btn-group">
+	            <button class="btn primary" id="btnStart">开始录制</button>
+	            <button class="btn danger" id="btnStop" disabled>停止</button>
+	          </div>
+	          <div class="btn-group">
+	            <button class="btn" id="btnReport" disabled>生成报告</button>
+	            <button class="btn ghost" id="btnOpenReport" style="display:none;">查看报告</button>
+	          </div>
         </div>
       </header>
 
@@ -72,10 +93,11 @@
         </aside>
 
         <main class="main">
-          <section class="panel">
+          <section class="panel" id="previewPanel">
             <div class="panel-head">
               <div class="panel-title">实时画面</div>
               <div class="panel-actions">
+                <label class="toggle"><input type="checkbox" id="toggleTimeline" />时间轴</label>
                 <label class="toggle"><input type="checkbox" id="toggleBoxes" checked />框选</label>
                 <label class="toggle"><input type="checkbox" id="toggleLabels" checked />状态</label>
                 <label class="toggle"><input type="checkbox" id="toggleAsr" checked />ASR</label>
@@ -92,7 +114,7 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel timeline-panel" id="timelinePanel">
             <div class="panel-head">
               <div class="panel-title">时间轴（点击取点对齐内容）</div>
               <div class="panel-actions">
@@ -111,11 +133,24 @@
       </div>
 
 	      <div class="modal" id="reportModal" role="dialog" aria-modal="true" aria-labelledby="reportTitle">
-	        <div class="drawer">
-	          <div class="drawer-head">
-	            <div class="drawer-title" id="reportTitle">学习情况报告（睡眠区间 × 讲解内容/知识点）</div>
-	            <div style="display:flex; gap:10px; align-items:center;">
+	        <div class="drawer report-drawer" id="reportDrawer">
+	          <div class="drawer-head report-head">
+	            <div class="report-head-left">
+	              <div class="drag-handle" id="reportDragHandle" title="拖动窗口"></div>
+	              <div class="drawer-title" id="reportTitle">学习情况报告</div>
+	            </div>
+	            <div class="report-session-info">
+	              <span class="muted" id="reportSessionId"></span>
+	              <div class="rename-group">
+	                <input type="text" id="reportSessionName" class="session-name-input" placeholder="会话名称（点击编辑）" />
+	                <button class="btn small" id="btnRenameSession" title="保存名称">保存</button>
+	              </div>
+	            </div>
+	            <div class="report-head-actions">
+	              <button class="btn small" id="btnUploadWebdav" title="上传到 WebDAV">上传 WebDAV</button>
 	              <button class="btn small" id="btnReloadReport" title="重新拉取统计结果">重载</button>
+	              <button class="btn small" id="btnMaximizeReport" title="最大化/还原"><span id="maximizeIcon">⤢</span></button>
+	              <button class="btn small" id="btnResetReportPos" title="重置窗口位置">重置位置</button>
 	              <button class="btn small" id="btnCloseReport">关闭</button>
 	            </div>
 	          </div>
@@ -123,6 +158,102 @@
 	            <div class="kpi-row" id="reportKpis"></div>
 	            <div class="links" id="reportLinks"></div>
 	            <div id="reportBody" class="muted">尚未生成报告。停止录制后点击“生成报告”。</div>
+	          </div>
+	        </div>
+	      </div>
+
+	      <!-- Settings Center Modal -->
+	      <div class="modal settings-modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+	        <div class="drawer settings-drawer" id="settingsDrawer">
+	          <div class="drawer-head settings-head">
+	            <div class="settings-head-left">
+	              <div class="drag-handle" id="settingsDragHandle" title="拖动窗口"></div>
+	              <div class="drawer-title" id="settingsTitle">设置中心</div>
+	            </div>
+	            <div class="settings-head-actions">
+	              <button class="btn small" id="btnWebdavReset" title="重置为默认值">重置</button>
+	              <button class="btn small primary" id="btnSettingsSave">保存</button>
+	              <button class="btn small" id="btnSettingsClose">关闭</button>
+	            </div>
+	          </div>
+	          <div class="drawer-body settings-body">
+	            <div class="settings-nav">
+	              <button class="settings-nav-btn active" data-tab="webdav">WebDAV 同步</button>
+	              <button class="settings-nav-btn" data-tab="storage">存储设置</button>
+	            </div>
+	            <div class="settings-content">
+	              <!-- WebDAV Tab -->
+	              <div class="settings-tab active" id="settings-tab-webdav">
+	                <div class="settings-section">
+	                  <div class="settings-section-head">
+	                    <h3>WebDAV 远程同步</h3>
+	                    <label class="toggle"><input type="checkbox" id="webdavEnabled" />启用 WebDAV</label>
+	                  </div>
+	                  <p class="muted">启用后，录制文件可以自动或手动上传到 WebDAV 服务器。</p>
+	                </div>
+	                <div class="form-grid" id="webdavFormGrid">
+	                  <div class="field">
+	                    <div class="field-label">WebDAV URL</div>
+	                    <div class="input">
+	                      <input id="webdavUrl" placeholder="https://your-server.com/webdav" autocomplete="off" />
+	                    </div>
+	                    <div class="field-help">例如：https://dav.jianguoyun.com/dav/</div>
+	                  </div>
+	                  <div class="field">
+	                    <div class="field-label">用户名</div>
+	                    <div class="input">
+	                      <input id="webdavUsername" placeholder="用户名/邮箱" autocomplete="off" />
+	                    </div>
+	                  </div>
+	                  <div class="field">
+	                    <div class="field-label">密码/应用密码</div>
+	                    <div class="input password-input-wrap">
+	                      <input id="webdavPassword" type="password" placeholder="密码或应用专用密码" autocomplete="off" />
+	                      <button type="button" class="btn-toggle-password" id="btnToggleWebdavPassword" title="显示/隐藏密码">◉</button>
+	                    </div>
+	                    <div class="field-help">建议使用应用专用密码，而非主账户密码。</div>
+	                  </div>
+	                  <div class="field">
+	                    <div class="field-label">远程路径</div>
+	                    <div class="input">
+	                      <input id="webdavRemotePath" placeholder="/classroom_focus" autocomplete="off" />
+	                    </div>
+	                    <div class="field-help">文件会保存到此路径下，每个会话一个子文件夹。</div>
+	                  </div>
+	                </div>
+	                <div class="settings-section" style="margin-top: 16px;">
+	                  <h4>上传选项</h4>
+	                  <div class="checkbox-group">
+	                    <label class="toggle"><input type="checkbox" id="webdavAutoUpload" />录制结束后自动上传</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadVideo" checked />上传视频</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadAudio" checked />上传音频</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadStats" checked />上传统计/报告</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadTranscript" checked />上传转写文本</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadAll" />上传所有文件</label>
+	                  </div>
+	                </div>
+	                <div class="settings-actions">
+	                  <button class="btn" id="btnWebdavTest">测试连接</button>
+	                  <span id="webdavTestStatus" class="muted"></span>
+	                </div>
+	              </div>
+	              <!-- Storage Tab -->
+	              <div class="settings-tab" id="settings-tab-storage">
+	                <div class="settings-section">
+	                  <h3>本地存储</h3>
+	                  <p class="muted">录制文件默认保存在本地 out/ 目录下。</p>
+	                </div>
+	                <div class="form-grid">
+	                  <div class="field">
+	                    <div class="field-label">本地存储路径</div>
+	                    <div class="input">
+	                      <input id="localStoragePath" value="out/" disabled />
+	                    </div>
+	                    <div class="field-help">目前不可修改，所有会话保存在项目根目录的 out/ 下。</div>
+	                  </div>
+	                </div>
+	              </div>
+	            </div>
 	          </div>
 	        </div>
 	      </div>
@@ -249,7 +380,7 @@
 			                      <div class="student-name">ASR（整节课转写）</div>
 			                      <span class="badge"><span class="dot unknown"></span><span>provider</span></span>
 			                    </div>
-			                    <div class="summary-right">用于"睡觉时间 × 讲课内容"对齐</div>
+			                    <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
 			                  </div>
 			                  <div class="model-section-body">
 			                    <div class="form-grid">
@@ -267,27 +398,12 @@
 			                        <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">可用模型（从 LLM 拉取）</div>
-			                        <div style="display:flex; gap:10px; align-items:center;">
-			                          <div class="select" style="flex:1; min-width:0;">
-			                            <span>Model</span>
-			                            <select id="asrModelSel">
-			                              <option value="">（先在 LLM 拉取模型）</option>
-			                            </select>
-			                          </div>
+			                        <div class="field-label">API 设置</div>
+			                        <div class="field-row">
+			                          <label class="toggle"><input type="checkbox" id="asrUseIndependentToggle" />使用独立 API 设置</label>
 			                        </div>
-			                        <div class="field-help">选择后自动填入下方模型名；也可手动输入。</div>
+			                        <div class="field-help">开启后可单独配置 ASR 的 URL/Key，否则复用 LLM 设置。</div>
 			                      </div>
-			                      <div class="field">
-			                        <div class="field-label">ASR 模型名（手动/被下拉框填入）</div>
-			                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
-			                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
-			                        </div>
-			                        <div class="field-help">建议：录制前先"检测"，避免报告生成时才发现不可用。</div>
-			                      </div>
-			                    </div>
-			                    <div class="field-row" style="margin-top:12px;">
-			                      <label class="toggle"><input type="checkbox" id="asrUseIndependentToggle" />使用独立 API 设置（不与 LLM 共用）</label>
 			                    </div>
 			                    <div id="asrIndependentSettings" class="form-grid" style="margin-top:10px; display:none;">
 			                      <div class="field">
@@ -303,6 +419,27 @@
 			                          <input id="asrApiKeyInput" type="password" placeholder="留空则使用 LLM 的 API Key" autocomplete="off" />
 			                        </div>
 			                        <div class="field-help">留空则使用 LLM 的 API Key 或环境变量。</div>
+			                      </div>
+			                    </div>
+			                    <div class="form-grid" style="margin-top:10px;">
+			                      <div class="field">
+			                        <div class="field-label">可用模型（从 API 拉取）</div>
+			                        <div style="display:flex; gap:10px; align-items:center;">
+			                          <div class="select" style="flex:1; min-width:0;">
+			                            <span>Model</span>
+			                            <select id="asrModelSel">
+			                              <option value="">（先在 LLM 拉取模型）</option>
+			                            </select>
+			                          </div>
+			                        </div>
+			                        <div class="field-help">选择后自动填入下方模型名；也可手动输入。</div>
+			                      </div>
+			                      <div class="field">
+			                        <div class="field-label">ASR 模型名（手动/被下拉框填入）</div>
+			                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
+			                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
+			                        </div>
+			                        <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
 			                      </div>
 			                    </div>
 			                  </div>
@@ -326,6 +463,9 @@
 		        </div>
 		      </div>
 	    </div>
+
+	    <!-- Toast notifications container -->
+	    <div class="toast-container" id="toastContainer"></div>
 
 	    <script src="./viz.js" defer></script>
 	  </body>

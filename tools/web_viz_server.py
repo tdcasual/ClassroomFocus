@@ -173,6 +173,89 @@ def _set_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return dict(_MODEL_CFG)
 
 
+# ===== WebDAV Configuration =====
+_WEBDAV_CFG: Dict[str, Any] = {}
+_WEBDAV_CONFIG_PATH = Path(__file__).resolve().parent.parent / "webdav_config.json"
+
+
+def _default_webdav_cfg() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "url": "",
+        "username": "",
+        "password": "",
+        "remote_path": "/classroom_focus",
+        "upload_video": True,
+        "upload_audio": True,
+        "upload_stats": True,
+        "upload_transcript": True,
+        "upload_all": False,
+        "auto_upload": False,  # Auto upload after recording stops
+    }
+
+
+def _get_webdav_cfg() -> Dict[str, Any]:
+    global _WEBDAV_CFG
+    if not _WEBDAV_CFG:
+        _WEBDAV_CFG = _load_webdav_cfg()
+    return dict(_WEBDAV_CFG)
+
+
+def _set_webdav_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    global _WEBDAV_CFG
+    base = _default_webdav_cfg()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    _WEBDAV_CFG = {
+        "enabled": bool(cfg.get("enabled", base["enabled"])),
+        "url": str(cfg.get("url", base["url"])).strip(),
+        "username": str(cfg.get("username", base["username"])).strip(),
+        "password": str(cfg.get("password", base["password"])),
+        "remote_path": str(cfg.get("remote_path", base["remote_path"])).strip() or "/classroom_focus",
+        "upload_video": bool(cfg.get("upload_video", base["upload_video"])),
+        "upload_audio": bool(cfg.get("upload_audio", base["upload_audio"])),
+        "upload_stats": bool(cfg.get("upload_stats", base["upload_stats"])),
+        "upload_transcript": bool(cfg.get("upload_transcript", base["upload_transcript"])),
+        "upload_all": bool(cfg.get("upload_all", base["upload_all"])),
+        "auto_upload": bool(cfg.get("auto_upload", base["auto_upload"])),
+    }
+    _save_webdav_cfg(_WEBDAV_CFG)
+    return dict(_WEBDAV_CFG)
+
+
+def _load_webdav_cfg() -> Dict[str, Any]:
+    try:
+        if _WEBDAV_CONFIG_PATH.exists():
+            with open(_WEBDAV_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    base = _default_webdav_cfg()
+                    for k in base:
+                        if k not in data:
+                            data[k] = base[k]
+                    return data
+    except Exception:
+        pass
+    return _default_webdav_cfg()
+
+
+def _save_webdav_cfg(cfg: Dict[str, Any]) -> bool:
+    try:
+        with open(_WEBDAV_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _redact_webdav_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact password for API response."""
+    out = dict(cfg)
+    if out.get("password"):
+        out["password"] = "***"
+    return out
+
+
 def _openai_client_from_cfg(llm_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
     api_key = str(llm_cfg.get("api_key") or "").strip() or (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
     if not api_key:
@@ -379,11 +462,19 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
         if asr_provider == "openai_compat":
             t0 = time.time()
             client = _openai_client_for_asr(cfg)
+            # Build effective config for hints (consider independent ASR settings)
+            asr_cfg_for_hints = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
+            llm_cfg_for_hints = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+            use_indep = bool(asr_cfg_for_hints.get("use_independent", False))
+            effective_hints_cfg = {
+                "base_url": (asr_cfg_for_hints.get("base_url") if use_indep else None) or llm_cfg_for_hints.get("base_url"),
+                "api_key": (asr_cfg_for_hints.get("api_key") if use_indep else None) or llm_cfg_for_hints.get("api_key"),
+            }
             if not client:
                 out["asr"] = {
                     "ok": False,
                     "error": "API key not set",
-                    "hints": _hints_for_openai_compat(cfg.get("llm") or {}, context="asr", err="API key not set"),
+                    "hints": _hints_for_openai_compat(effective_hints_cfg, context="asr", err="API key not set"),
                 }
             else:
                 try:
@@ -398,7 +489,7 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
                         "ok": False,
                         "latency_ms": int((time.time() - t0) * 1000),
                         "error": str(exc),
-                        "hints": _hints_for_openai_compat(cfg.get("llm") or {}, context="asr", err=str(exc)),
+                        "hints": _hints_for_openai_compat(effective_hints_cfg, context="asr", err=str(exc)),
                     }
         elif asr_provider == "dashscope":
             # Quick: validate key+deps, Deep: run a tiny file transcription.
@@ -559,6 +650,7 @@ async def root():
 
 @app.get("/api/sessions")
 async def list_sessions():
+    """List all sessions with display names. Returns fresh data without caching."""
     base = OUT_DIR
     sessions = []
     try:
@@ -570,8 +662,22 @@ async def list_sessions():
             stats_path = p / "stats.json"
             transcript_path = p / "transcript.txt"
             video_path = p / "session.mp4"
+            meta_path = p / "metadata.json"
+            
+            # Read display_name from metadata.json if exists
+            display_name = None
+            try:
+                if meta_path.exists():
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                        display_name = meta.get("display_name")
+                        logger.debug(f"Session {sid}: display_name = {display_name}")
+            except Exception as e:
+                logger.warning(f"Failed to read metadata for {sid}: {e}")
+            
             sessions.append({
                 "session_id": sid,
+                "display_name": display_name,
                 "mtime": float(getattr(st, "st_mtime", 0.0)),
                 "has_stats": stats_path.exists(),
                 "has_transcript": transcript_path.exists(),
@@ -580,7 +686,10 @@ async def list_sessions():
     except Exception:
         sessions = []
     sessions.sort(key=lambda x: x.get("mtime", 0.0), reverse=True)
-    return {"ok": True, "sessions": sessions}
+    return JSONResponse(
+        {"ok": True, "sessions": sessions},
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+    )
 
 
 @app.post("/api/session/start")
@@ -607,11 +716,37 @@ async def start_session(request: Request):
 
 
 @app.post("/api/session/stop")
-async def stop_session():
+async def stop_session(background_tasks: BackgroundTasks):
     try:
         path = session_mgr.stop()
         warn = getattr(session_mgr, "video_error", None) or None
-        return {"ok": True, "path": path, "warning": warn}
+        session_id = Path(path).name if path else None
+        
+        # Check if auto-upload is enabled
+        webdav_cfg = _get_webdav_cfg()
+        should_auto_upload = (
+            webdav_cfg.get("enabled")
+            and webdav_cfg.get("auto_upload")
+            and session_id
+        )
+        
+        if should_auto_upload:
+            # Schedule background upload
+            def _do_webdav_upload(sid: str):
+                try:
+                    from sync.webdav_client import WebDAVConfig, WebDAVClient
+                    config = WebDAVConfig.from_dict(webdav_cfg)
+                    if config.is_valid():
+                        session_dir = OUT_DIR / sid
+                        if session_dir.exists():
+                            client = WebDAVClient(config)
+                            client.upload_session(str(session_dir), sid)
+                except Exception as e:
+                    print(f"[WebDAV] Auto-upload failed: {e}")
+            
+            background_tasks.add_task(_do_webdav_upload, session_id)
+        
+        return {"ok": True, "path": path, "warning": warn, "auto_upload_scheduled": should_auto_upload}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -1304,6 +1439,206 @@ async def session_status():
         "session_id": session_mgr.session_id,
         "model_config": _get_model_cfg(),
     }
+
+
+@app.post("/api/session/rename")
+async def rename_session(request: Request):
+    """Rename a session by setting a display name (stored in metadata.json)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sid = body.get("session_id")
+    new_name = body.get("name", "").strip()
+    if not sid:
+        return JSONResponse({"ok": False, "error": "session_id required"}, status_code=400)
+    if not new_name:
+        return JSONResponse({"ok": False, "error": "name required"}, status_code=400)
+    
+    session_dir = OUT_DIR / sid
+    if not session_dir.exists():
+        return JSONResponse({"ok": False, "error": f"session not found: {sid}"}, status_code=404)
+    
+    # Store display name in metadata.json
+    meta_path = session_dir / "metadata.json"
+    meta = {}
+    try:
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+    except Exception:
+        meta = {}
+    
+    meta["display_name"] = new_name
+    meta["renamed_at"] = time.time()
+    
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        logger.info(f"Session {sid} renamed to '{new_name}', metadata saved to {meta_path}")
+    except Exception as e:
+        logger.error(f"Failed to save metadata for {sid}: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    
+    return {"ok": True, "session_id": sid, "name": new_name}
+
+
+# ===== WebDAV API Endpoints =====
+
+@app.get("/api/webdav/config")
+async def get_webdav_config():
+    """Get WebDAV configuration (password redacted)."""
+    cfg = _get_webdav_cfg()
+    return {"ok": True, "config": _redact_webdav_cfg(cfg)}
+
+
+@app.post("/api/webdav/config")
+async def set_webdav_config(request: Request):
+    """Set WebDAV configuration."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    cfg_data = body.get("config") or body
+    
+    # If password is "***" (redacted), keep the existing password
+    if cfg_data.get("password") == "***":
+        existing = _get_webdav_cfg()
+        cfg_data["password"] = existing.get("password", "")
+    
+    cfg = _set_webdav_cfg(cfg_data)
+    return {"ok": True, "config": _redact_webdav_cfg(cfg)}
+
+
+@app.post("/api/webdav/test")
+async def test_webdav_connection(request: Request):
+    """Test WebDAV connection with provided or saved config."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    # Use provided config or fall back to saved config
+    cfg_data = body.get("config") or body
+    if not cfg_data or not cfg_data.get("url"):
+        cfg_data = _get_webdav_cfg()
+    else:
+        # If password is redacted, use saved password
+        if cfg_data.get("password") == "***":
+            existing = _get_webdav_cfg()
+            cfg_data["password"] = existing.get("password", "")
+    
+    try:
+        from sync.webdav_client import WebDAVConfig, WebDAVClient
+        config = WebDAVConfig.from_dict(cfg_data)
+        if not config.is_valid():
+            return JSONResponse({"ok": False, "error": "Invalid configuration: URL and username required"}, status_code=400)
+        
+        client = WebDAVClient(config)
+        result = client.test_connection()
+        return result
+    except ImportError:
+        return JSONResponse({"ok": False, "error": "WebDAV client not available. Install webdavclient3."}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/webdav/upload")
+async def upload_to_webdav(request: Request, background_tasks: BackgroundTasks):
+    """Upload a session to WebDAV."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    session_id = body.get("session_id") or session_mgr.session_id
+    if not session_id:
+        return JSONResponse({"ok": False, "error": "session_id required"}, status_code=400)
+    
+    session_dir = OUT_DIR / session_id
+    if not session_dir.exists():
+        return JSONResponse({"ok": False, "error": f"Session not found: {session_id}"}, status_code=404)
+    
+    cfg = _get_webdav_cfg()
+    if not cfg.get("enabled"):
+        return JSONResponse({"ok": False, "error": "WebDAV is not enabled"}, status_code=400)
+    
+    try:
+        from sync.webdav_client import WebDAVConfig, WebDAVClient
+        config = WebDAVConfig.from_dict(cfg)
+        if not config.is_valid():
+            return JSONResponse({"ok": False, "error": "Invalid WebDAV configuration"}, status_code=400)
+        
+        client = WebDAVClient(config)
+        result = client.upload_session(str(session_dir), session_id)
+        return result
+    except ImportError:
+        return JSONResponse({"ok": False, "error": "WebDAV client not available. Install webdavclient3."}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/webdav/sessions")
+async def list_webdav_sessions():
+    """List sessions available on WebDAV."""
+    cfg = _get_webdav_cfg()
+    if not cfg.get("enabled"):
+        return JSONResponse({"ok": False, "error": "WebDAV is not enabled"}, status_code=400)
+    
+    try:
+        from sync.webdav_client import WebDAVConfig, WebDAVClient
+        config = WebDAVConfig.from_dict(cfg)
+        if not config.is_valid():
+            return JSONResponse({"ok": False, "error": "Invalid WebDAV configuration"}, status_code=400)
+        
+        client = WebDAVClient(config)
+        result = client.list_remote_sessions()
+        return result
+    except ImportError:
+        return JSONResponse({"ok": False, "error": "WebDAV client not available. Install webdavclient3."}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ===== Settings API (combined settings) =====
+
+@app.get("/api/settings")
+async def get_all_settings():
+    """Get all settings (model config + WebDAV config)."""
+    return {
+        "ok": True,
+        "model": _get_model_cfg(),
+        "webdav": _redact_webdav_cfg(_get_webdav_cfg()),
+        "env": _env_summary(),
+    }
+
+
+@app.post("/api/settings")
+async def set_all_settings(request: Request):
+    """Set all settings."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    result = {"ok": True}
+    
+    if "model" in body:
+        cfg = _sanitize_model_cfg(body["model"])
+        cfg = _set_model_cfg(cfg)
+        result["model"] = cfg
+    
+    if "webdav" in body:
+        webdav_data = body["webdav"]
+        if webdav_data.get("password") == "***":
+            existing = _get_webdav_cfg()
+            webdav_data["password"] = existing.get("password", "")
+        cfg = _set_webdav_cfg(webdav_data)
+        result["webdav"] = _redact_webdav_cfg(cfg)
+    
+    result["env"] = _env_summary()
+    return result
 
 
 @app.get("/api/models/config")

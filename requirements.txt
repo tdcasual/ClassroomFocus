@@ -7,4 +7,4 @@ sounddevice
 soundfile
 fastapi
 uvicorn[standard]
-
+webdavclient3>=3.14

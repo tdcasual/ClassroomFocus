@@ -15,7 +15,9 @@
 
   const recDot = document.getElementById("recDot");
   const recStatusText = document.getElementById("recStatusText");
+  const recTimer = document.getElementById("recTimer");
   const sessionIdText = document.getElementById("sessionIdText");
+  const toastContainer = document.getElementById("toastContainer");
 
   const btnModelCenter = document.getElementById("btnModelCenter");
   const modelDot = document.getElementById("modelDot");
@@ -48,7 +50,10 @@
   const modelEnvBox = document.getElementById("modelEnvBox");
   const modelContent = document.getElementById("modelContent");
   const modelNavButtons = Array.from(document.querySelectorAll(".model-nav-btn"));
+  const modelNav = document.querySelector(".model-nav");
   const modelSections = Array.from(document.querySelectorAll(".model-section"));
+  const llmSection = document.getElementById("model-section-llm");
+  const llmFormGrid = llmSection ? llmSection.querySelector(".form-grid") : null;
 
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
@@ -58,6 +63,9 @@
   const toggleBoxes = document.getElementById("toggleBoxes");
   const toggleLabels = document.getElementById("toggleLabels");
   const toggleAsr = document.getElementById("toggleAsr");
+  const toggleTimeline = document.getElementById("toggleTimeline");
+  const timelinePanel = document.getElementById("timelinePanel");
+  const mainPanel = document.querySelector(".main");
 
   const fpsDot = document.getElementById("fpsDot");
   const fpsText = document.getElementById("fpsText");
@@ -74,11 +82,49 @@
   const cursorAsrText = document.getElementById("cursorAsrText");
 
   const reportModal = document.getElementById("reportModal");
+  const reportDrawer = document.getElementById("reportDrawer");
+  const reportDragHandle = document.getElementById("reportDragHandle");
+  const btnMaximizeReport = document.getElementById("btnMaximizeReport");
+  const btnResetReportPos = document.getElementById("btnResetReportPos");
+  const maximizeIcon = document.getElementById("maximizeIcon");
   const btnCloseReport = document.getElementById("btnCloseReport");
   const btnReloadReport = document.getElementById("btnReloadReport");
   const reportKpis = document.getElementById("reportKpis");
   const reportLinks = document.getElementById("reportLinks");
   const reportBody = document.getElementById("reportBody");
+  const reportSessionId = document.getElementById("reportSessionId");
+  const reportSessionName = document.getElementById("reportSessionName");
+  const btnRenameSession = document.getElementById("btnRenameSession");
+
+  // Settings Center elements
+  const btnSettingsCenter = document.getElementById("btnSettingsCenter");
+  const settingsDot = document.getElementById("settingsDot");
+  const settingsModal = document.getElementById("settingsModal");
+  const settingsDrawer = document.getElementById("settingsDrawer");
+  const settingsDragHandle = document.getElementById("settingsDragHandle");
+  const btnSettingsSave = document.getElementById("btnSettingsSave");
+  const btnSettingsClose = document.getElementById("btnSettingsClose");
+  const settingsNavBtns = document.querySelectorAll(".settings-nav-btn");
+  const settingsTabs = document.querySelectorAll(".settings-tab");
+  
+  // WebDAV form elements
+  const webdavEnabled = document.getElementById("webdavEnabled");
+  const webdavUrl = document.getElementById("webdavUrl");
+  const webdavUsername = document.getElementById("webdavUsername");
+  const webdavPassword = document.getElementById("webdavPassword");
+  const webdavRemotePath = document.getElementById("webdavRemotePath");
+  const webdavAutoUpload = document.getElementById("webdavAutoUpload");
+  const webdavUploadVideo = document.getElementById("webdavUploadVideo");
+  const webdavUploadAudio = document.getElementById("webdavUploadAudio");
+  const webdavUploadStats = document.getElementById("webdavUploadStats");
+  const webdavUploadTranscript = document.getElementById("webdavUploadTranscript");
+  const webdavUploadAll = document.getElementById("webdavUploadAll");
+  const webdavFormGrid = document.getElementById("webdavFormGrid");
+  const btnWebdavTest = document.getElementById("btnWebdavTest");
+  const btnWebdavReset = document.getElementById("btnWebdavReset");
+  const btnToggleWebdavPassword = document.getElementById("btnToggleWebdavPassword");
+  const webdavTestStatus = document.getElementById("webdavTestStatus");
+  const btnUploadWebdav = document.getElementById("btnUploadWebdav");
 
   const COLORS = {
     awake: "#22c55e",
@@ -95,6 +141,15 @@
     wsConnected: false,
     isRecording: false,
     sessionId: null,
+    recordingStartTime: null,
+    recordingTimerId: null,
+    sessions: [],  // List of all sessions from /api/sessions
+
+    // WebDAV/Settings state
+    webdav: {
+      config: null,
+      dirty: false,
+    },
 
     windowSec: 60,
     nowSec: 0,
@@ -151,6 +206,89 @@
 
   function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
+  }
+
+  // ===== Toast Notification System =====
+  function showToast(message, type = "info", durationMs = 4000) {
+    if (!toastContainer) return;
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    
+    const textSpan = document.createElement("span");
+    textSpan.textContent = message;
+    toast.appendChild(textSpan);
+    
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "toast-close";
+    closeBtn.innerHTML = "\u00d7";
+    closeBtn.title = "关闭";
+    closeBtn.addEventListener("click", () => {
+      toast.classList.add("fade-out");
+      setTimeout(() => toast.remove(), 300);
+    });
+    toast.appendChild(closeBtn);
+    
+    toastContainer.appendChild(toast);
+    setTimeout(() => {
+      if (toast.parentElement) {
+        toast.classList.add("fade-out");
+        setTimeout(() => toast.remove(), 300);
+      }
+    }, durationMs);
+  }
+
+  // ===== Recording Timer =====
+  function formatRecordingTime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  }
+
+  function startRecordingTimer() {
+    state.recordingStartTime = Date.now();
+    if (recTimer) {
+      recTimer.style.display = "inline";
+      recTimer.textContent = "00:00";
+    }
+    state.recordingTimerId = setInterval(() => {
+      if (recTimer && state.recordingStartTime) {
+        recTimer.textContent = formatRecordingTime(Date.now() - state.recordingStartTime);
+      }
+    }, 1000);
+  }
+
+  function stopRecordingTimer() {
+    if (state.recordingTimerId) {
+      clearInterval(state.recordingTimerId);
+      state.recordingTimerId = null;
+    }
+    state.recordingStartTime = null;
+    if (recTimer) recTimer.style.display = "none";
+  }
+
+  // ===== Button Loading State =====
+  function setButtonLoading(btn, loading) {
+    if (!btn) return;
+    if (loading) {
+      btn.classList.add("loading");
+      btn.disabled = true;
+    } else {
+      btn.classList.remove("loading");
+    }
+  }
+
+  // ===== LLM Section Disabled State =====
+  function updateLlmSectionDisabledState() {
+    if (!llmSection || !llmFormGrid) return;
+    const enabled = llmEnabledToggle?.checked ?? true;
+    if (enabled) {
+      llmSection.classList.remove("disabled");
+      llmFormGrid.classList.remove("disabled");
+    } else {
+      llmSection.classList.add("disabled");
+      llmFormGrid.classList.add("disabled");
+    }
   }
 
   const MODEL_POS_KEY = "model_center_pos_v1";
@@ -267,6 +405,108 @@
     const rect = modelDrawer.getBoundingClientRect();
     writeModelDrawerPos(rect.left, rect.top);
     modelDragState = null;
+  }
+
+  // ===== Report Drawer Drag & Maximize =====
+  const REPORT_POS_KEY = "report_drawer_pos_v1";
+  let reportDragState = null;
+  let reportMaximized = false;
+
+  function readReportDrawerPos() {
+    try {
+      const raw = localStorage.getItem(REPORT_POS_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== "object") return null;
+      const left = Number(data.left);
+      const top = Number(data.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+      return { left, top };
+    } catch {
+      return null;
+    }
+  }
+
+  function writeReportDrawerPos(left, top) {
+    try {
+      localStorage.setItem(REPORT_POS_KEY, JSON.stringify({ left, top }));
+    } catch {}
+  }
+
+  function clampReportDrawerPos(left, top, width, height) {
+    const maxLeft = window.innerWidth - width;
+    const maxTop = window.innerHeight - height;
+    return {
+      left: clamp(left, 0, Math.max(0, maxLeft)),
+      top: clamp(top, 0, Math.max(0, maxTop)),
+    };
+  }
+
+  function setReportDrawerPos(left, top) {
+    if (!reportDrawer) return;
+    reportDrawer.style.left = `${left}px`;
+    reportDrawer.style.top = `${top}px`;
+  }
+
+  function initReportDrawerPos({ reset = false } = {}) {
+    if (!reportDrawer) return;
+    const saved = reset ? null : readReportDrawerPos();
+    if (saved) {
+      const rect = reportDrawer.getBoundingClientRect();
+      const clamped = clampReportDrawerPos(saved.left, saved.top, rect.width, rect.height);
+      setReportDrawerPos(clamped.left, clamped.top);
+    } else {
+      reportDrawer.style.left = "8vw";
+      reportDrawer.style.top = "8vh";
+    }
+  }
+
+  function resetReportDrawerPos() {
+    localStorage.removeItem(REPORT_POS_KEY);
+    initReportDrawerPos({ reset: true });
+  }
+
+  function startReportDrag(e) {
+    if (reportMaximized) return; // Don't drag when maximized
+    if (!reportDrawer) return;
+    const rect = reportDrawer.getBoundingClientRect();
+    reportDragState = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startLeft: rect.left,
+      startTop: rect.top,
+      pointerId: e.pointerId,
+    };
+    reportDrawer.classList.add("dragging");
+    reportDragHandle.setPointerCapture(e.pointerId);
+  }
+
+  function moveReportDrag(e) {
+    if (!reportDragState || e.pointerId !== reportDragState.pointerId) return;
+    const dx = e.clientX - reportDragState.startX;
+    const dy = e.clientY - reportDragState.startY;
+    const rect = reportDrawer.getBoundingClientRect();
+    const clamped = clampReportDrawerPos(reportDragState.startLeft + dx, reportDragState.startTop + dy, rect.width, rect.height);
+    setReportDrawerPos(clamped.left, clamped.top);
+  }
+
+  function endReportDrag(e) {
+    if (!reportDragState || e.pointerId !== reportDragState.pointerId) return;
+    reportDrawer.classList.remove("dragging");
+    reportDragHandle.releasePointerCapture(e.pointerId);
+    const rect = reportDrawer.getBoundingClientRect();
+    writeReportDrawerPos(rect.left, rect.top);
+    reportDragState = null;
+  }
+
+  function toggleReportMaximize() {
+    if (!reportDrawer) return;
+    reportMaximized = !reportMaximized;
+    reportDrawer.classList.toggle("maximized", reportMaximized);
+    if (maximizeIcon) {
+      maximizeIcon.textContent = reportMaximized ? "\u2922" : "\u2922"; // Use different icons
+      maximizeIcon.textContent = reportMaximized ? "\u2198" : "\u2922"; // Shrink vs Expand
+    }
   }
 
   function setActiveModelNav(targetId) {
@@ -403,6 +643,7 @@
   }
 
   function setRecording(isRec, sessionId = null) {
+    const wasRecording = state.isRecording;
     state.isRecording = Boolean(isRec);
     if (sessionId != null) state.sessionId = sessionId;
 
@@ -413,7 +654,14 @@
     btnModelCenter.disabled = state.isRecording;
 
     recStatusText.textContent = state.isRecording ? "recording" : "idle";
-    recDot.className = `dot ${state.isRecording ? "bad" : "unknown"}`;
+    recDot.className = `dot ${state.isRecording ? "bad pulse" : "unknown"}`;
+
+    // Handle recording timer
+    if (state.isRecording && !wasRecording) {
+      startRecordingTimer();
+    } else if (!state.isRecording && wasRecording) {
+      stopRecordingTimer();
+    }
 
     if (state.sessionId) {
       sessionIdText.textContent = state.sessionId;
@@ -1003,20 +1251,31 @@
     updateCursorInspector();
   }
 
-  async function fetchJson(url, options) {
-    const res = await fetch(url, options);
-    const text = await res.text();
-    let data = null;
+  async function fetchJson(url, options, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      data = text ? JSON.parse(text) : null;
-    } catch (_) {
-      data = null;
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeoutId);
+      const text = await res.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (_) {
+        data = null;
+      }
+      if (!res.ok) {
+        const err = (data && (data.error || data.detail)) || text || res.statusText;
+        throw new Error(err);
+      }
+      return data;
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e.name === "AbortError") {
+        throw new Error("Request timeout");
+      }
+      throw e;
     }
-    if (!res.ok) {
-      const err = (data && (data.error || data.detail)) || text || res.statusText;
-      throw new Error(err);
-    }
-    return data;
   }
 
   function isOkOrSkipped(obj) {
@@ -1090,6 +1349,9 @@
     const hasOpenaiKey = Boolean(String(cfg.llm?.api_key || "").trim()) || Boolean(env.has_openai_key);
     const asrProvider = String(cfg.asr?.provider || "none");
     const asrModel = String(cfg.asr?.model || "").trim();
+    const asrUseIndep = Boolean(cfg.asr?.use_independent);
+    const asrApiKey = String(cfg.asr?.api_key || "").trim();
+    const hasAsrKey = asrUseIndep ? (Boolean(asrApiKey) || hasOpenaiKey) : hasOpenaiKey;
 
     const r = state.models.lastCheck;
     if (!r) {
@@ -1112,8 +1374,10 @@
           if (!llmBaseUrl) hints.push(`LLM：Base URL 为空会回退为 ${envDefaultBaseUrl}`);
           if (!hasOpenaiKey) hints.push("LLM：缺少 API Key（填写或设置 OPENAI_API_KEY/OPENAI_KEY）");
         }
-        if (asrProvider === "openai_compat" && !hasOpenaiKey) {
-          hints.push("ASR：OpenAI-compatible 需要 OpenAI Key（OPENAI_API_KEY/OPENAI_KEY）");
+        if (asrProvider === "openai_compat" && !hasAsrKey) {
+          hints.push(asrUseIndep
+            ? "ASR：使用独立设置但缺少 API Key（填写 ASR API Key 或 LLM API Key）"
+            : "ASR：OpenAI-compatible 需要 API Key（填写 LLM API Key 或设置 OPENAI_API_KEY）");
         }
         if (asrProvider === "openai_compat" && !asrModel) {
           hints.push(`ASR：模型名为空会回退为 ${envDefaultAsrModel}`);
@@ -1214,7 +1478,9 @@
     llmApiKeyInput.value = String(cfg.llm?.api_key || "");
     llmModelInput.value = String(cfg.llm?.model || "");
     renderLlmModelsSelect();
+    renderAsrModelsSelect();  // Explicitly sync ASR model dropdown
     updateModelFormDisabledState();
+    updateLlmSectionDisabledState();
   }
 
   function updateModelFormDisabledState() {
@@ -1524,7 +1790,7 @@
   }
 
   async function startRecording() {
-    btnStart.disabled = true;
+    setButtonLoading(btnStart, true);
     try {
       await ensureModelsReadyBeforeRecording();
       const j = await fetchJson("/api/session/start", {
@@ -1538,6 +1804,7 @@
       state.report.lastStatsUrl = null;
       state.report.lastSessionId = j.session_id;
       btnOpenReport.style.display = "none";
+      showToast("录制已开始", "success");
       if (j.model_config) {
         state.models.config = j.model_config;
         state.models.dirty = false;
@@ -1545,39 +1812,354 @@
         updateModelPill();
       }
     } finally {
+      setButtonLoading(btnStart, false);
       btnStart.disabled = state.isRecording;
     }
   }
 
   async function stopRecording() {
-    btnStop.disabled = true;
+    setButtonLoading(btnStop, true);
     try {
       const j = await fetchJson("/api/session/stop", { method: "POST" });
       if (!j || !j.ok) throw new Error(j?.error || "stop failed");
       if (j.warning) {
-        alert(`录制已停止，但视频存在问题：${j.warning}`);
+        showToast(`录制已停止，但视频存在问题：${j.warning}`, "warning", 6000);
+      } else {
+        showToast("录制已停止", "success");
       }
       setRecording(false, state.sessionId);
       btnReport.disabled = !state.sessionId;
       await refreshSessions();
     } finally {
+      setButtonLoading(btnStop, false);
       btnStop.disabled = !state.isRecording;
     }
   }
 
   function openReportModal() {
     reportModal.classList.add("open");
-    reportModal.addEventListener(
-      "click",
-      (e) => {
-        if (e.target === reportModal) closeReportModal();
-      },
-      { once: true },
-    );
+    initReportDrawerPos();
   }
 
   function closeReportModal() {
     reportModal.classList.remove("open");
+    // Reset maximize state on close
+    if (reportMaximized) {
+      reportMaximized = false;
+      if (reportDrawer) reportDrawer.classList.remove("maximized");
+      if (maximizeIcon) maximizeIcon.textContent = "\u2922";
+    }
+  }
+
+  function updateReportSessionInfo(sessionId, displayName = null) {
+    if (reportSessionId) {
+      reportSessionId.textContent = sessionId ? `ID: ${sessionId}` : "";
+    }
+    if (reportSessionName) {
+      reportSessionName.value = displayName || "";
+      reportSessionName.placeholder = displayName ? "编辑会话名称" : "输入会话名称";
+    }
+  }
+
+  async function renameSession(sessionId, newName) {
+    if (!sessionId || !newName.trim()) return false;
+    try {
+      const resp = await fetchJson("/api/session/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, name: newName.trim() }),
+      });
+      if (resp?.ok) {
+        showToast("会话已重命名", "success");
+        // Refresh session list to show new name
+        await refreshSessions();
+        return true;
+      } else {
+        showToast(`重命名失败：${resp?.error || "unknown"}`, "error");
+        return false;
+      }
+    } catch (e) {
+      showToast(`重命名失败：${e}`, "error");
+      return false;
+    }
+  }
+
+  // ===== Settings Center Functions =====
+  const SETTINGS_POS_KEY = "settings_drawer_pos_v1";
+  let settingsDragState = null;
+
+  function openSettingsModal() {
+    settingsModal.classList.add("open");
+    initSettingsDrawerPos();
+  }
+
+  function closeSettingsModal() {
+    settingsModal.classList.remove("open");
+    // Reset drag state on close
+    settingsDragState = null;
+    if (settingsDrawer) settingsDrawer.classList.remove("dragging");
+  }
+
+  function initSettingsDrawerPos() {
+    if (!settingsDrawer) return;
+    try {
+      const raw = localStorage.getItem(SETTINGS_POS_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data?.left != null && data?.top != null) {
+          settingsDrawer.style.left = `${data.left}px`;
+          settingsDrawer.style.top = `${data.top}px`;
+          return;
+        }
+      }
+    } catch {}
+    settingsDrawer.style.left = "10vw";
+    settingsDrawer.style.top = "8vh";
+  }
+
+  function startSettingsDrag(e) {
+    if (!settingsDrawer) return;
+    const rect = settingsDrawer.getBoundingClientRect();
+    settingsDragState = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startLeft: rect.left,
+      startTop: rect.top,
+      pointerId: e.pointerId,
+    };
+    settingsDrawer.classList.add("dragging");
+    settingsDragHandle.setPointerCapture(e.pointerId);
+  }
+
+  function moveSettingsDrag(e) {
+    if (!settingsDragState || e.pointerId !== settingsDragState.pointerId) return;
+    const dx = e.clientX - settingsDragState.startX;
+    const dy = e.clientY - settingsDragState.startY;
+    const rect = settingsDrawer.getBoundingClientRect();
+    const maxLeft = window.innerWidth - rect.width;
+    const maxTop = window.innerHeight - rect.height;
+    const left = clamp(settingsDragState.startLeft + dx, 0, Math.max(0, maxLeft));
+    const top = clamp(settingsDragState.startTop + dy, 0, Math.max(0, maxTop));
+    settingsDrawer.style.left = `${left}px`;
+    settingsDrawer.style.top = `${top}px`;
+  }
+
+  function endSettingsDrag(e) {
+    if (!settingsDragState || e.pointerId !== settingsDragState.pointerId) return;
+    settingsDrawer.classList.remove("dragging");
+    settingsDragHandle.releasePointerCapture(e.pointerId);
+    const rect = settingsDrawer.getBoundingClientRect();
+    try {
+      localStorage.setItem(SETTINGS_POS_KEY, JSON.stringify({ left: rect.left, top: rect.top }));
+    } catch {}
+    settingsDragState = null;
+  }
+
+  function setActiveSettingsTab(tabId) {
+    for (const btn of settingsNavBtns) {
+      btn.classList.toggle("active", btn.dataset.tab === tabId);
+    }
+    for (const tab of settingsTabs) {
+      tab.classList.toggle("active", tab.id === `settings-tab-${tabId}`);
+    }
+  }
+
+  async function loadWebdavConfig() {
+    try {
+      // Use a shorter timeout (3s) since this is not critical
+      const resp = await fetchJson("/api/webdav/config", undefined, 3000);
+      if (resp?.ok) {
+        state.webdav.config = resp.config || {};
+        applyWebdavFormFromState();
+        updateSettingsDot();
+      }
+    } catch (e) {
+      console.warn("Failed to load WebDAV config:", e);
+    }
+  }
+
+  function applyWebdavFormFromState() {
+    const cfg = state.webdav.config || {};
+    if (webdavEnabled) webdavEnabled.checked = Boolean(cfg.enabled);
+    if (webdavUrl) webdavUrl.value = cfg.url || "";
+    if (webdavUsername) webdavUsername.value = cfg.username || "";
+    // Don't show redacted password placeholder - use empty or keep existing
+    if (webdavPassword) {
+      if (cfg.password && cfg.password !== "***") {
+        webdavPassword.value = cfg.password;
+      } else if (cfg.password === "***") {
+        // Password exists on server but is redacted; keep field empty with placeholder
+        webdavPassword.value = "";
+        webdavPassword.placeholder = "••••••••（已保存）";
+      } else {
+        webdavPassword.value = "";
+        webdavPassword.placeholder = "密码或应用专用密码";
+      }
+    }
+    if (webdavRemotePath) webdavRemotePath.value = cfg.remote_path || "/classroom_focus";
+    if (webdavAutoUpload) webdavAutoUpload.checked = Boolean(cfg.auto_upload);
+    if (webdavUploadVideo) webdavUploadVideo.checked = cfg.upload_video !== false;
+    if (webdavUploadAudio) webdavUploadAudio.checked = cfg.upload_audio !== false;
+    if (webdavUploadStats) webdavUploadStats.checked = cfg.upload_stats !== false;
+    if (webdavUploadTranscript) webdavUploadTranscript.checked = cfg.upload_transcript !== false;
+    if (webdavUploadAll) webdavUploadAll.checked = Boolean(cfg.upload_all);
+    updateWebdavFormDisabledState();
+  }
+
+  function syncWebdavStateFromForm() {
+    const existingPassword = state.webdav.config?.password;
+    const formPassword = webdavPassword?.value || "";
+    // If password field is empty but server has a password, preserve it
+    const passwordToSave = formPassword || (existingPassword === "***" ? "***" : existingPassword) || "";
+    
+    state.webdav.config = {
+      enabled: webdavEnabled?.checked ?? false,
+      url: webdavUrl?.value?.trim() || "",
+      username: webdavUsername?.value?.trim() || "",
+      password: passwordToSave,
+      remote_path: webdavRemotePath?.value?.trim() || "/classroom_focus",
+      auto_upload: webdavAutoUpload?.checked ?? false,
+      upload_video: webdavUploadVideo?.checked ?? true,
+      upload_audio: webdavUploadAudio?.checked ?? true,
+      upload_stats: webdavUploadStats?.checked ?? true,
+      upload_transcript: webdavUploadTranscript?.checked ?? true,
+      upload_all: webdavUploadAll?.checked ?? false,
+    };
+    state.webdav.dirty = true;
+  }
+
+  function updateWebdavFormDisabledState() {
+    const enabled = webdavEnabled?.checked ?? false;
+    if (webdavFormGrid) {
+      webdavFormGrid.classList.toggle("disabled", !enabled);
+    }
+  }
+
+  async function saveWebdavConfig() {
+    syncWebdavStateFromForm();
+    setButtonLoading(btnSettingsSave, true);
+    try {
+      const resp = await fetchJson("/api/webdav/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: state.webdav.config }),
+      });
+      if (resp?.ok) {
+        state.webdav.config = resp.config;
+        state.webdav.dirty = false;
+        showToast("设置已保存", "success");
+        updateSettingsDot();
+      } else {
+        showToast(`保存失败：${resp?.error || "unknown"}`, "error");
+      }
+    } catch (e) {
+      showToast(`保存失败：${e}`, "error");
+    } finally {
+      setButtonLoading(btnSettingsSave, false);
+    }
+  }
+
+  async function testWebdavConnection() {
+    syncWebdavStateFromForm();
+    setButtonLoading(btnWebdavTest, true);
+    if (webdavTestStatus) webdavTestStatus.textContent = "测试中…";
+    try {
+      const resp = await fetchJson("/api/webdav/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: state.webdav.config }),
+      });
+      if (resp?.ok) {
+        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="ok-text">✓ ${resp.message || "连接成功"}</span>`;
+        showToast("连接成功", "success");
+      } else {
+        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${resp.error || "连接失败"}</span>`;
+        showToast(`连接失败：${resp.error}`, "error");
+      }
+    } catch (e) {
+      if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${e}</span>`;
+      showToast(`连接失败：${e}`, "error");
+    } finally {
+      setButtonLoading(btnWebdavTest, false);
+    }
+  }
+
+  function updateSettingsDot() {
+    if (!settingsDot) return;
+    const cfg = state.webdav.config || {};
+    if (cfg.enabled && cfg.url && cfg.username) {
+      settingsDot.className = "dot good";
+    } else if (cfg.enabled) {
+      settingsDot.className = "dot warn";
+    } else {
+      settingsDot.className = "dot unknown";
+    }
+  }
+
+  function resetWebdavToDefaults() {
+    state.webdav.config = {
+      enabled: false,
+      url: "",
+      username: "",
+      password: "",
+      remote_path: "/classroom_focus",
+      auto_upload: false,
+      upload_video: true,
+      upload_audio: true,
+      upload_stats: true,
+      upload_transcript: true,
+      upload_all: false,
+    };
+    state.webdav.dirty = true;
+    applyWebdavFormFromState();
+    if (webdavTestStatus) webdavTestStatus.textContent = "";
+    showToast("已重置为默认值", "success");
+  }
+
+  function toggleWebdavPasswordVisibility() {
+    if (!webdavPassword || !btnToggleWebdavPassword) return;
+    const isPassword = webdavPassword.type === "password";
+    webdavPassword.type = isPassword ? "text" : "password";
+    btnToggleWebdavPassword.textContent = isPassword ? "●" : "◉";
+    btnToggleWebdavPassword.title = isPassword ? "隐藏密码" : "显示密码";
+  }
+
+  function validateWebdavUrl(url) {
+    if (!url) return { valid: true, message: "" };
+    const trimmed = url.trim();
+    if (trimmed && !trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+      return { valid: false, message: "URL 应以 http:// 或 https:// 开头" };
+    }
+    return { valid: true, message: "" };
+  }
+
+  async function uploadSessionToWebdav(sessionId) {
+    if (!sessionId) {
+      showToast("没有可上传的会话", "warning");
+      return;
+    }
+    const cfg = state.webdav.config || {};
+    if (!cfg.enabled) {
+      showToast("WebDAV 未启用，请先在设置中心启用", "warning");
+      return;
+    }
+    setButtonLoading(btnUploadWebdav, true);
+    try {
+      const resp = await fetchJson("/api/webdav/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (resp?.ok) {
+        showToast(`上传成功：${resp.uploaded || 0} 个文件`, "success");
+      } else {
+        showToast(`上传失败：${resp?.error || "unknown"}`, "error");
+      }
+    } catch (e) {
+      showToast(`上传失败：${e}`, "error");
+    } finally {
+      setButtonLoading(btnUploadWebdav, false);
+    }
   }
 
   function renderReportKpis(stats) {
@@ -1844,6 +2426,12 @@
 
     state.report.lastSessionId = sid;
     openReportModal();
+    
+    // Show session info and try to get display name
+    const sessions = state.sessions || [];
+    const sessionInfo = sessions.find(s => s.session_id === sid);
+    updateReportSessionInfo(sid, sessionInfo?.display_name || null);
+    
     reportLinks.innerHTML = "";
     reportKpis.innerHTML = "";
     setReportStatus("正在提交统计任务…");
@@ -1880,12 +2468,14 @@
         state.report.lastStatsUrl = job.result?.stats || null;
         btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
         setReportStatus("统计完成，正在加载结果…");
+        showToast("报告生成完成", "success");
         await loadReportFromResult(job.result);
         return;
       }
       if (status === "error") {
         state.report.polling = false;
         setReportStatus(`统计出错：${escapeHtml(String(job?.error || "unknown"))}`, "danger-text");
+        showToast("报告生成失败", "error");
         return;
       }
       setReportStatus(`处理中：${escapeHtml(status)}（${i + 1}s）`);
@@ -1914,6 +2504,11 @@
     openReportModal();
     reportLinks.innerHTML = "";
     reportKpis.innerHTML = "";
+
+    // Show session info and try to get display name
+    const sessions = state.sessions || [];
+    const sessionInfo = sessions.find(s => s.session_id === sid);
+    updateReportSessionInfo(sid, sessionInfo?.display_name || null);
 
     // try direct stats first
     const statsUrl = `/out/${encodeURIComponent(sid)}/stats.json`;
@@ -1944,8 +2539,13 @@
     sessionSelect.disabled = true;
     btnRefreshSessions.disabled = true;
     try {
-      const j = await fetchJson("/api/sessions");
+      const j = await fetchJson(`/api/sessions?_t=${Date.now()}`);
+      console.log("[refreshSessions] API response:", j);
       const items = Array.isArray(j?.sessions) ? j.sessions : [];
+      
+      // Store sessions in state for later lookup
+      state.sessions = items;
+      
       sessionSelect.innerHTML = "";
       const opt0 = document.createElement("option");
       opt0.value = "";
@@ -1956,9 +2556,13 @@
         const sid = String(it.session_id || it.id || "");
         if (!sid) continue;
         const hasStats = Boolean(it.has_stats);
+        const displayName = it.display_name || null;
+        console.log(`[refreshSessions] Session ${sid}: display_name = ${displayName}`);
         const opt = document.createElement("option");
         opt.value = sid;
-        opt.textContent = `${sid}${hasStats ? " · stats✅" : ""}`;
+        // Show display_name if available, otherwise just session_id
+        const label = displayName ? `${displayName} (${sid})` : sid;
+        opt.textContent = `${label}${hasStats ? " · stats✅" : ""}`;
         sessionSelect.appendChild(opt);
       }
       sessionSelect.disabled = false;
@@ -1980,6 +2584,106 @@
   }
 
   function bindUi() {
+    // Global keyboard shortcuts
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (settingsModal && settingsModal.classList.contains("open")) {
+          closeSettingsModal();
+          e.preventDefault();
+        } else if (modelModal.classList.contains("open")) {
+          closeModelModal();
+          e.preventDefault();
+        } else if (reportModal.classList.contains("open")) {
+          closeReportModal();
+          e.preventDefault();
+        }
+      }
+      // 'T' to toggle timeline (only when no modal is open and not in input)
+      if ((e.key === "t" || e.key === "T") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const isModalOpen = (settingsModal && settingsModal.classList.contains("open")) ||
+                            modelModal.classList.contains("open") ||
+                            reportModal.classList.contains("open");
+        const isInputFocused = document.activeElement?.tagName === "INPUT" ||
+                               document.activeElement?.tagName === "TEXTAREA";
+        if (!isModalOpen && !isInputFocused) {
+          toggleTimeline.checked = !toggleTimeline.checked;
+          toggleTimeline.dispatchEvent(new Event("change"));
+          e.preventDefault();
+        }
+      }
+    });
+
+    // Mobile: scroll indicator for model nav
+    if (modelNav) {
+      const checkScrollEnd = () => {
+        const isAtEnd = modelNav.scrollLeft + modelNav.clientWidth >= modelNav.scrollWidth - 5;
+        modelNav.classList.toggle("scroll-end", isAtEnd);
+      };
+      modelNav.addEventListener("scroll", checkScrollEnd);
+      window.addEventListener("resize", checkScrollEnd);
+      setTimeout(checkScrollEnd, 100);  // Initial check after render
+    }
+
+    // Settings Center event listeners
+    if (btnSettingsCenter) {
+      btnSettingsCenter.addEventListener("click", async () => {
+        // Open modal immediately for responsiveness
+        openSettingsModal();
+        // Load config in background
+        try {
+          await loadWebdavConfig();
+        } catch (e) {
+          console.warn("Failed to load WebDAV config:", e);
+          // Don't show error toast - the modal is already open and user can still use it
+        }
+      });
+    }
+    if (settingsModal) {
+      settingsModal.addEventListener("click", (e) => {
+        if (e.target === settingsModal) closeSettingsModal();
+      });
+    }
+    if (settingsDragHandle) {
+      settingsDragHandle.addEventListener("pointerdown", startSettingsDrag);
+      settingsDragHandle.addEventListener("pointermove", moveSettingsDrag);
+      settingsDragHandle.addEventListener("pointerup", endSettingsDrag);
+      settingsDragHandle.addEventListener("pointercancel", endSettingsDrag);
+    }
+    if (btnSettingsSave) {
+      btnSettingsSave.addEventListener("click", saveWebdavConfig);
+    }
+    if (btnSettingsClose) {
+      btnSettingsClose.addEventListener("click", closeSettingsModal);
+    }
+    if (btnWebdavTest) {
+      btnWebdavTest.addEventListener("click", testWebdavConnection);
+    }
+    if (btnWebdavReset) {
+      btnWebdavReset.addEventListener("click", resetWebdavToDefaults);
+    }
+    if (btnToggleWebdavPassword) {
+      btnToggleWebdavPassword.addEventListener("click", toggleWebdavPasswordVisibility);
+    }
+    if (webdavUrl) {
+      webdavUrl.addEventListener("blur", () => {
+        const validation = validateWebdavUrl(webdavUrl.value);
+        if (!validation.valid) {
+          showToast(validation.message, "warning");
+        }
+      });
+    }
+    if (webdavEnabled) {
+      webdavEnabled.addEventListener("change", () => {
+        syncWebdavStateFromForm();
+        updateWebdavFormDisabledState();
+      });
+    }
+    for (const btn of settingsNavBtns) {
+      btn.addEventListener("click", () => {
+        setActiveSettingsTab(btn.dataset.tab);
+      });
+    }
+
     btnModelCenter.addEventListener("click", async () => {
       try {
         if (!state.models.config) await loadModelsConfig();
@@ -1990,6 +2694,9 @@
     });
     modelModal.addEventListener("click", (e) => {
       if (e.target === modelModal) closeModelModal();
+    });
+    reportModal.addEventListener("click", (e) => {
+      if (e.target === reportModal) closeReportModal();
     });
     if (modelDragHandle) {
       modelDragHandle.addEventListener("pointerdown", startModelDrag);
@@ -2017,36 +2724,54 @@
       }
     });
     btnModelsCheck.addEventListener("click", async () => {
+      setButtonLoading(btnModelsCheck, true);
       try {
         syncModelStateFromForm();
         if (state.models.dirty) await saveModelsConfig();
         await checkModels({ deep: false });
+        showToast("模型检测完成", "success");
       } catch (e) {
         modelCheckBox.innerHTML = `<span class="danger-text">检测失败：${escapeHtml(String(e))}</span>`;
+        showToast(`检测失败：${e}`, "error");
+      } finally {
+        setButtonLoading(btnModelsCheck, false);
       }
     });
     btnModelsCheckDeep.addEventListener("click", async () => {
+      setButtonLoading(btnModelsCheckDeep, true);
       try {
         syncModelStateFromForm();
         if (state.models.dirty) await saveModelsConfig();
         await checkModels({ deep: true });
+        showToast("深度检测完成", "success");
       } catch (e) {
         modelCheckBox.innerHTML = `<span class="danger-text">深度检测失败：${escapeHtml(String(e))}</span>`;
+        showToast(`深度检测失败：${e}`, "error");
+      } finally {
+        setButtonLoading(btnModelsCheckDeep, false);
       }
     });
 
     btnLlmPullModels.addEventListener("click", async () => {
+      setButtonLoading(btnLlmPullModels, true);
       try {
         await pullLlmModels();
+        showToast("模型列表拉取成功", "success");
       } catch (e) {
         modelCheckBox.innerHTML = `<span class="danger-text">拉取模型失败：${escapeHtml(String(e))}</span>`;
+        showToast(`拉取模型失败：${e}`, "error");
+      } finally {
+        setButtonLoading(btnLlmPullModels, false);
       }
     });
 
     modelModeSel.addEventListener("change", syncModelStateFromForm);
     asrProviderSel.addEventListener("change", syncModelStateFromForm);
     asrModelInput.addEventListener("input", syncModelStateFromForm);
-    llmEnabledToggle.addEventListener("change", syncModelStateFromForm);
+    llmEnabledToggle.addEventListener("change", () => {
+      syncModelStateFromForm();
+      updateLlmSectionDisabledState();
+    });
     llmBaseUrlInput.addEventListener("input", () => {
       state.models.llmModels = [];
       state.models.llmModelsError = null;
@@ -2114,14 +2839,65 @@
     });
 
     btnReport.addEventListener("click", async () => {
+      setButtonLoading(btnReport, true);
       try {
         await startReportJob({ sessionId: state.sessionId });
       } catch (e) {
         setReportStatus(`生成报告失败：${escapeHtml(String(e))}`, "danger-text");
+        showToast(`生成报告失败：${e}`, "error");
+      } finally {
+        setButtonLoading(btnReport, false);
+        btnReport.disabled = state.isRecording || !state.sessionId;
       }
     });
     btnOpenReport.addEventListener("click", openReportModal);
     btnCloseReport.addEventListener("click", closeReportModal);
+    if (btnUploadWebdav) {
+      btnUploadWebdav.addEventListener("click", () => {
+        uploadSessionToWebdav(state.report.lastSessionId);
+      });
+    }
+
+    // Report drawer drag & maximize
+    if (reportDragHandle) {
+      reportDragHandle.addEventListener("pointerdown", startReportDrag);
+      reportDragHandle.addEventListener("pointermove", moveReportDrag);
+      reportDragHandle.addEventListener("pointerup", endReportDrag);
+      reportDragHandle.addEventListener("pointercancel", endReportDrag);
+    }
+    if (btnMaximizeReport) {
+      btnMaximizeReport.addEventListener("click", toggleReportMaximize);
+    }
+    if (btnResetReportPos) {
+      btnResetReportPos.addEventListener("click", resetReportDrawerPos);
+    }
+    if (btnRenameSession) {
+      btnRenameSession.addEventListener("click", async () => {
+        const sid = state.report.lastSessionId;
+        const newName = reportSessionName?.value?.trim();
+        if (!sid) {
+          showToast("没有当前会话", "warning");
+          return;
+        }
+        if (!newName) {
+          showToast("请输入会话名称", "warning");
+          return;
+        }
+        setButtonLoading(btnRenameSession, true);
+        await renameSession(sid, newName);
+        setButtonLoading(btnRenameSession, false);
+      });
+    }
+    // Allow pressing Enter to save rename
+    if (reportSessionName) {
+      reportSessionName.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          btnRenameSession?.click();
+        }
+      });
+    }
+
     btnReloadReport.addEventListener("click", async () => {
       try {
         if (state.report.lastStatsUrl) {
@@ -2150,6 +2926,16 @@
       state.showAsr = toggleAsr.checked;
       updateAsrNowLine();
       scheduleRender({ timeline: true });
+    });
+
+    toggleTimeline.addEventListener("change", () => {
+      const show = toggleTimeline.checked;
+      timelinePanel.classList.toggle("hidden", !show);
+      mainPanel.classList.toggle("timeline-hidden", !show);
+      localStorage.setItem("showTimeline", show ? "1" : "0");
+      if (show) {
+        scheduleRender({ timeline: true });
+      }
     });
 
     btnFollow.addEventListener("click", () => {
@@ -2206,18 +2992,25 @@
     state.showLabels = toggleLabels.checked;
     state.showAsr = toggleAsr.checked;
 
+    // Initialize timeline visibility (default: hidden)
+    const showTimeline = localStorage.getItem("showTimeline") === "1";
+    toggleTimeline.checked = showTimeline;
+    timelinePanel.classList.toggle("hidden", !showTimeline);
+    mainPanel.classList.toggle("timeline-hidden", !showTimeline);
+
     bindUi();
     connectWs();
     await loadInitialStatus();
     await refreshSessions();
 
-    try {
-      await loadModelsConfig();
-      await checkModels({ deep: false });
-    } catch (e) {
-      console.warn(e);
-      updateModelPill();
-    }
+    // Load configs in parallel for faster initialization
+    await Promise.allSettled([
+      loadWebdavConfig().catch(e => console.warn("Failed to load WebDAV config:", e)),
+      loadModelsConfig().then(() => checkModels({ deep: false })).catch(e => {
+        console.warn(e);
+        updateModelPill();
+      })
+    ]);
 
     scheduleRender({ preview: true, timeline: true });
   }

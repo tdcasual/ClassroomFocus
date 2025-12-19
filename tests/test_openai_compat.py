@@ -129,3 +129,15 @@ def test_transcribe_audio_error(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="bad key"):
         client.transcribe_audio(str(audio_path))
 
+
+def test_list_model_ids(monkeypatch):
+    client = OpenAICompat(OpenAICompatConfig(base_url="https://example.com", api_key="k", model="m"))
+
+    def fake_get(url, headers=None, timeout=None, **kwargs):
+        assert url.endswith("/v1/models")
+        assert headers["Authorization"] == "Bearer k"
+        return _Resp(200, {"data": [{"id": "gpt-4o-mini"}, {"id": "whisper-1"}]})
+
+    monkeypatch.setattr("tools.openai_compat.requests.get", fake_get)
+    ids = client.list_model_ids()
+    assert ids == ["gpt-4o-mini", "whisper-1"]

@@ -137,74 +137,144 @@
 	              <button class="btn small" id="btnModelsCheckDeep" title="深度检测（会触发真实 ASR 调用）">深度检测</button>
 	              <button class="btn small" id="btnModelsClose">关闭</button>
 	            </div>
-	          </div>
-	          <div class="drawer-body">
-	            <div class="form-card">
-	              <div class="form-grid">
-	                <div class="field">
-	                  <div class="field-label">模式</div>
-	                  <div class="select">
-	                    <span>Mode</span>
-	                    <select id="modelModeSel">
-	                      <option value="online">online（调用模型）</option>
-	                      <option value="offline">offline（不调用模型）</option>
-	                    </select>
-	                  </div>
-	                  <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但不会做 ASR/LLM 调用。</div>
-	                </div>
+		          </div>
+		          <div class="drawer-body">
+		            <details open class="accordion">
+		              <summary>
+		                <div class="summary-left">
+		                  <div class="student-name">检测结果</div>
+		                  <span class="badge"><span class="dot unknown"></span><span>建议录制前检测</span></span>
+		                </div>
+		                <div class="summary-right">将检测结果作为“是否需要 offline”的依据</div>
+		              </summary>
+		              <div class="accordion-body">
+		                <div id="modelCheckBox" class="muted">尚未检测。</div>
+		              </div>
+		            </details>
 
-	                <div class="field">
-	                  <div class="field-label">语音识别（ASR）</div>
-	                  <div class="select">
-	                    <span>Provider</span>
-	                    <select id="asrProviderSel">
-	                      <option value="openai_compat">OpenAI-compatible（Whisper）</option>
-	                      <option value="dashscope">阿里 DashScope（文件识别）</option>
-	                      <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
-	                      <option value="none">none（不转写）</option>
-	                    </select>
-	                  </div>
-	                  <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
-	                    <input id="asrModelInput" placeholder="ASR 模型（如 whisper-1 / fun-asr-realtime）" autocomplete="off" />
-	                  </div>
-	                  <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
-	                </div>
-	              </div>
-	            </div>
+		            <details open class="accordion">
+		              <summary>
+		                <div class="summary-left">
+		                  <div class="student-name">模式</div>
+		                  <span class="badge"><span class="dot unknown"></span><span>online / offline</span></span>
+		                </div>
+		                <div class="summary-right">offline 不会调用任何模型</div>
+		              </summary>
+		              <div class="accordion-body">
+		                <div class="field">
+		                  <div class="field-label">模式（Recording 不受影响）</div>
+		                  <div class="select">
+		                    <span>Mode</span>
+		                    <select id="modelModeSel">
+		                      <option value="online">online（调用模型）</option>
+		                      <option value="offline">offline（不调用模型）</option>
+		                    </select>
+		                  </div>
+		                  <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。</div>
+		                </div>
+		              </div>
+		            </details>
 
-	            <div class="form-card">
-	              <div class="field-row">
-	                <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用课程总结/知识点（LLM）</label>
-	              </div>
-	              <div class="form-grid">
-	                <div class="field">
-	                  <div class="field-label">OpenAI Base URL</div>
-	                  <div class="input">
-	                    <input id="llmBaseUrlInput" placeholder="https://api.openai.com" autocomplete="off" />
-	                  </div>
-	                </div>
-	                <div class="field">
-	                  <div class="field-label">模型名</div>
-	                  <div class="input">
-	                    <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / ..." autocomplete="off" />
-	                  </div>
-	                  <div class="field-help">兼容 GPT-5+ 与旧式 Chat Completions（由后端自动回退）。</div>
-	                </div>
-	              </div>
-	            </div>
+		            <details open class="accordion">
+		              <summary>
+		                <div class="summary-left">
+		                  <div class="student-name">LLM（课程总结 / 知识点）</div>
+		                  <span class="badge"><span class="dot unknown"></span><span>OpenAI-compatible</span></span>
+		                </div>
+		                <div class="summary-right">可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）</div>
+		              </summary>
+		              <div class="accordion-body">
+		                <div class="field-row">
+		                  <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用 LLM（总结+知识点）</label>
+		                </div>
+		                <div class="form-grid">
+		                  <div class="field">
+		                    <div class="field-label">Base URL</div>
+		                    <div class="input">
+		                      <input id="llmBaseUrlInput" placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" autocomplete="off" />
+		                    </div>
+		                    <div class="field-help">后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。</div>
+		                  </div>
+		                  <div class="field">
+		                    <div class="field-label">API Key</div>
+		                    <div class="input">
+		                      <input id="llmApiKeyInput" type="password" placeholder="sk-...（不会写入 out/ session 输出）" autocomplete="off" />
+		                    </div>
+		                    <div class="field-help">如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。</div>
+		                  </div>
+		                  <div class="field">
+		                    <div class="field-label">可用模型（从 URL 拉取）</div>
+		                    <div style="display:flex; gap:10px; align-items:center;">
+		                      <div class="select" style="flex:1; min-width:0;">
+		                        <span>Model</span>
+		                        <select id="llmModelSel">
+		                          <option value="">（点击“拉取模型”）</option>
+		                        </select>
+		                      </div>
+		                      <button class="btn small" id="btnLlmPullModels" title="从当前 Base URL 拉取 /v1/models">拉取模型</button>
+		                    </div>
+		                    <div id="llmModelsStatus" class="muted">（未拉取）</div>
+		                    <div class="field-help">如拉取失败，可直接在下方手动填写模型名。</div>
+		                  </div>
+		                  <div class="field">
+		                    <div class="field-label">模型名（手动/被下拉框填入）</div>
+		                    <div class="input">
+		                      <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." autocomplete="off" />
+		                    </div>
+		                  </div>
+		                </div>
+		              </div>
+		            </details>
 
-	            <div class="form-card">
-	              <div class="field-label">检测结果</div>
-	              <div id="modelCheckBox" class="muted">尚未检测。</div>
-	            </div>
+		            <details open class="accordion">
+		              <summary>
+		                <div class="summary-left">
+		                  <div class="student-name">ASR（整节课转写）</div>
+		                  <span class="badge"><span class="dot unknown"></span><span>provider</span></span>
+		                </div>
+		                <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
+		              </summary>
+		              <div class="accordion-body">
+		                <div class="form-grid">
+		                  <div class="field">
+		                    <div class="field-label">ASR Provider</div>
+		                    <div class="select">
+		                      <span>Provider</span>
+		                      <select id="asrProviderSel">
+		                        <option value="openai_compat">OpenAI-compatible（Whisper）</option>
+		                        <option value="dashscope">阿里 DashScope（文件识别）</option>
+		                        <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
+		                        <option value="none">none（不转写）</option>
+		                      </select>
+		                    </div>
+		                    <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
+		                  </div>
+		                  <div class="field">
+		                    <div class="field-label">ASR 模型</div>
+		                    <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
+		                      <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
+		                    </div>
+		                    <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
+		                  </div>
+		                </div>
+		              </div>
+		            </details>
 
-	            <div class="form-card">
-	              <div class="field-label">环境摘要（.env）</div>
-	              <div id="modelEnvBox" class="muted">（加载中…）</div>
-	            </div>
-	          </div>
-	        </div>
-	      </div>
+		            <details class="accordion">
+		              <summary>
+		                <div class="summary-left">
+		                  <div class="student-name">环境摘要（.env）</div>
+		                  <span class="badge"><span class="dot unknown"></span><span>keys present?</span></span>
+		                </div>
+		                <div class="summary-right">仅展示是否存在，不会回显 Key</div>
+		              </summary>
+		              <div class="accordion-body">
+		                <div id="modelEnvBox" class="muted">（加载中…）</div>
+		              </div>
+		            </details>
+		          </div>
+		        </div>
+		      </div>
 	    </div>
 
 	    <script src="./viz.js" defer></script>

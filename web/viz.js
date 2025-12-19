@@ -31,6 +31,10 @@
   const asrModelInput = document.getElementById("asrModelInput");
   const llmEnabledToggle = document.getElementById("llmEnabledToggle");
   const llmBaseUrlInput = document.getElementById("llmBaseUrlInput");
+  const llmApiKeyInput = document.getElementById("llmApiKeyInput");
+  const llmModelSel = document.getElementById("llmModelSel");
+  const btnLlmPullModels = document.getElementById("btnLlmPullModels");
+  const llmModelsStatus = document.getElementById("llmModelsStatus");
   const llmModelInput = document.getElementById("llmModelInput");
   const modelCheckBox = document.getElementById("modelCheckBox");
   const modelEnvBox = document.getElementById("modelEnvBox");
@@ -124,6 +128,9 @@
       suggestedMode: null,
       dirty: false,
       checking: false,
+      llmModels: [],
+      llmModelsLoading: false,
+      llmModelsError: null,
     },
   };
 
@@ -914,6 +921,8 @@
     const asr = r.asr || {};
     const llmOk = isOkOrSkipped(llm);
     const asrOk = isOkOrSkipped(asr);
+    const llmHints = Array.isArray(llm.hints) ? llm.hints : [];
+    const asrHints = Array.isArray(asr.hints) ? asr.hints : [];
 
     const lines = [];
     const llmLine = llm.skipped
@@ -935,6 +944,21 @@
         ? `<div class="warn-text" style="margin-top:8px;">建议切换为 offline（录制不受影响，但报告将跳过 ASR/LLM）。</div>`
         : "";
 
+    const hintItems = [];
+    if (!llmOk && llmHints.length) {
+      for (const h of llmHints.slice(0, 6)) hintItems.push(`LLM：${String(h)}`);
+    }
+    if (!asrOk && asrHints.length) {
+      for (const h of asrHints.slice(0, 6)) hintItems.push(`ASR：${String(h)}`);
+    }
+    const hintHtml =
+      hintItems.length > 0
+        ? `<div class="muted" style="margin-top:10px; line-height:1.55;">
+            <div><strong>可用提示：</strong></div>
+            <div>${hintItems.map((t) => `• ${escapeHtml(t)}`).join("<br/>")}</div>
+           </div>`
+        : "";
+
     modelCheckBox.innerHTML = `
       <div class="chips">
         <span class="chip">mode: ${escapeHtml(String(r.mode || ""))}</span>
@@ -942,6 +966,7 @@
         <span class="chip">${escapeHtml(asrOk ? "ASR ✅" : "ASR ❌")}</span>
       </div>
       <div class="codebox" style="margin-top:10px;">${escapeHtml(lines.join("\n"))}</div>
+      ${hintHtml}
       ${suggestHtml}
     `;
   }
@@ -954,27 +979,118 @@
     asrModelInput.value = String(cfg.asr?.model || "");
     llmEnabledToggle.checked = Boolean(cfg.llm?.enabled);
     llmBaseUrlInput.value = String(cfg.llm?.base_url || "");
+    llmApiKeyInput.value = String(cfg.llm?.api_key || "");
     llmModelInput.value = String(cfg.llm?.model || "");
+    renderLlmModelsSelect();
     updateModelFormDisabledState();
   }
 
   function updateModelFormDisabledState() {
     const cfg = state.models.config || {};
-    const mode = String(cfg.mode || "offline");
-    const offline = mode === "offline";
-    const llmEnabled = Boolean(cfg.llm?.enabled);
     const asrProvider = String(cfg.asr?.provider || "none");
+    const busy = Boolean(state.models.checking || state.models.llmModelsLoading);
 
-    llmEnabledToggle.disabled = offline;
-    llmBaseUrlInput.disabled = offline || !llmEnabled;
-    llmModelInput.disabled = offline || !llmEnabled;
+    modelModeSel.disabled = busy;
 
-    asrProviderSel.disabled = offline;
-    asrModelInput.disabled = offline || asrProvider === "none" || asrProvider === "xfyun_raasr";
+    llmEnabledToggle.disabled = busy;
+    llmBaseUrlInput.disabled = busy;
+    llmApiKeyInput.disabled = busy;
+    btnLlmPullModels.disabled = busy;
+    llmModelSel.disabled = busy || !(state.models.llmModels && state.models.llmModels.length);
+    llmModelInput.disabled = busy;
 
-    btnModelsSave.disabled = state.models.checking;
-    btnModelsCheck.disabled = state.models.checking;
-    btnModelsCheckDeep.disabled = state.models.checking;
+    asrProviderSel.disabled = busy;
+    asrModelInput.disabled = busy || asrProvider === "none" || asrProvider === "xfyun_raasr";
+
+    btnModelsSave.disabled = busy;
+    btnModelsCheck.disabled = busy;
+    btnModelsCheckDeep.disabled = busy;
+  }
+
+  function renderLlmModelsSelect() {
+    const cfg = state.models.config || {};
+    const cur = String(cfg.llm?.model || "").trim();
+    const models = Array.isArray(state.models.llmModels) ? state.models.llmModels : [];
+
+    llmModelSel.innerHTML = "";
+    const opt0 = document.createElement("option");
+    opt0.value = "";
+    opt0.textContent = models.length ? "选择模型…" : "（点击“拉取模型”）";
+    llmModelSel.appendChild(opt0);
+
+    for (const id of models) {
+      const mid = String(id || "").trim();
+      if (!mid) continue;
+      const opt = document.createElement("option");
+      opt.value = mid;
+      opt.textContent = mid;
+      llmModelSel.appendChild(opt);
+    }
+
+    if (cur && models.includes(cur)) llmModelSel.value = cur;
+    else llmModelSel.value = "";
+
+    if (!state.models.llmModelsLoading) {
+      if (state.models.llmModelsError) {
+        llmModelsStatus.innerHTML = `<span class="danger-text">${escapeHtml(String(state.models.llmModelsError))}</span>`;
+      } else if (models.length) {
+        llmModelsStatus.innerHTML = `<span class="ok-text">已拉取：${escapeHtml(String(models.length))} 个</span>`;
+      } else {
+        llmModelsStatus.textContent = "（未拉取）";
+      }
+    }
+  }
+
+  async function fetchJsonSoft(url, options) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (_) {
+      data = null;
+    }
+    return { ok: res.ok, status: res.status, data, text };
+  }
+
+  async function pullLlmModels() {
+    if (!state.models.config) await loadModelsConfig();
+    syncModelStateFromForm();
+
+    state.models.llmModelsLoading = true;
+    state.models.llmModelsError = null;
+    updateModelFormDisabledState();
+    llmModelsStatus.textContent = "正在拉取可用模型…";
+    try {
+      const res = await fetchJsonSoft("/api/models/list", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: state.models.config }),
+      });
+      const j = res.data;
+      if (!res.ok || !j || j.ok !== true) {
+        const err = (j && (j.error || j.detail)) || res.text || `HTTP ${res.status}`;
+        const hints = j && Array.isArray(j.hints) ? j.hints : [];
+        state.models.llmModelsError = String(err);
+        llmModelsStatus.innerHTML = `<span class="danger-text">拉取失败：${escapeHtml(String(err))}</span>${
+          hints.length
+            ? `<div class="muted" style="margin-top:6px; line-height:1.55;">${hints
+                .slice(0, 6)
+                .map((h) => `• ${escapeHtml(String(h))}`)
+                .join("<br/>")}</div>`
+            : ""
+        }`;
+        return;
+      }
+      const models = Array.isArray(j.models) ? j.models : [];
+      state.models.llmModels = models.map((m) => String(m || "").trim()).filter(Boolean);
+      renderLlmModelsSelect();
+      llmModelsStatus.innerHTML = `<span class="ok-text">已拉取：${escapeHtml(String(j.count ?? state.models.llmModels.length))} 个模型</span>`;
+    } finally {
+      state.models.llmModelsLoading = false;
+      updateModelFormDisabledState();
+      updateModelPill();
+    }
   }
 
   function syncModelStateFromForm() {
@@ -986,6 +1102,7 @@
         enabled: Boolean(llmEnabledToggle.checked),
         provider: "openai_compat",
         base_url: String(llmBaseUrlInput.value || "").trim(),
+        api_key: String(llmApiKeyInput.value || "").trim(),
         model: String(llmModelInput.value || "").trim(),
       },
       asr: {
@@ -1624,11 +1741,30 @@
       }
     });
 
+    btnLlmPullModels.addEventListener("click", async () => {
+      try {
+        await pullLlmModels();
+      } catch (e) {
+        modelCheckBox.innerHTML = `<span class="danger-text">拉取模型失败：${escapeHtml(String(e))}</span>`;
+      }
+    });
+
     modelModeSel.addEventListener("change", syncModelStateFromForm);
     asrProviderSel.addEventListener("change", syncModelStateFromForm);
     asrModelInput.addEventListener("input", syncModelStateFromForm);
     llmEnabledToggle.addEventListener("change", syncModelStateFromForm);
-    llmBaseUrlInput.addEventListener("input", syncModelStateFromForm);
+    llmBaseUrlInput.addEventListener("input", () => {
+      state.models.llmModels = [];
+      state.models.llmModelsError = null;
+      renderLlmModelsSelect();
+      syncModelStateFromForm();
+    });
+    llmApiKeyInput.addEventListener("input", syncModelStateFromForm);
+    llmModelSel.addEventListener("change", () => {
+      const v = String(llmModelSel.value || "").trim();
+      if (v) llmModelInput.value = v;
+      syncModelStateFromForm();
+    });
     llmModelInput.addEventListener("input", syncModelStateFromForm);
 
     windowSel.addEventListener("change", () => {

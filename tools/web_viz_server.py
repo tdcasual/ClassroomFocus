@@ -85,6 +85,8 @@ def _default_model_cfg() -> Dict[str, Any]:
             "provider": "openai_compat",
             "model": str(env.get("openai_model") or "gpt-4o-mini"),
             "base_url": str(env.get("openai_base_url") or "https://api.openai.com"),
+            # Optional override (kept in memory only; never persisted to session outputs).
+            "api_key": "",
         },
         "asr": {
             "provider": "openai_compat" if has_openai else "none",
@@ -117,6 +119,10 @@ def _sanitize_model_cfg(cfg: Any) -> Dict[str, Any]:
     base_url = str(llm.get("base_url", out["llm"]["base_url"]) or "").strip()
     if base_url:
         out["llm"]["base_url"] = base_url[:300]
+    api_key = str(llm.get("api_key", out["llm"].get("api_key", "")) or "").strip()
+    if api_key:
+        # Don't try to validate format; just keep it bounded.
+        out["llm"]["api_key"] = api_key[:500]
 
     asr = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
     asr_provider = str(asr.get("provider", out["asr"]["provider"]) or "").strip()
@@ -143,7 +149,7 @@ def _set_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _openai_client_from_cfg(llm_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
+    api_key = str(llm_cfg.get("api_key") or "").strip() or (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
     if not api_key:
         return None
     base_url = str(llm_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com")
@@ -157,12 +163,25 @@ def _openai_client_from_cfg(llm_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
     return OpenAICompat(OpenAICompatConfig(base_url=base_url, api_key=api_key, model=model, timeout_sec=timeout))
 
 
+def _redact_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove secrets before persisting to disk."""
+    if not isinstance(cfg, dict):
+        return {}
+    out = dict(cfg)
+    llm = out.get("llm") if isinstance(out.get("llm"), dict) else {}
+    llm2 = dict(llm)
+    if "api_key" in llm2:
+        llm2["api_key"] = ""
+    out["llm"] = llm2
+    return out
+
+
 def _write_session_config(session_dir: Path, cfg: Dict[str, Any]) -> None:
     try:
         with open(session_dir / "session_config.json", "w", encoding="utf-8") as fh:
             json.dump(
                 {
-                    "model_config": cfg,
+                    "model_config": _redact_model_cfg(cfg),
                     "env_summary": _env_summary(),
                     "ts": time.time(),
                 },
@@ -181,7 +200,16 @@ def _read_session_config(session_dir: Path) -> Dict[str, Any]:
             with open(p, "r", encoding="utf-8") as fh:
                 j = json.load(fh)
             cfg = j.get("model_config") if isinstance(j, dict) else None
-            return _sanitize_model_cfg(cfg)
+            # session_config is redacted, merge any in-memory secrets (e.g. api_key) back in.
+            loaded = _sanitize_model_cfg(cfg)
+            cur = _get_model_cfg()
+            try:
+                if isinstance(loaded.get("llm"), dict) and isinstance(cur.get("llm"), dict):
+                    if not str(loaded["llm"].get("api_key") or "").strip() and str(cur["llm"].get("api_key") or "").strip():
+                        loaded["llm"]["api_key"] = cur["llm"]["api_key"]
+            except Exception:
+                pass
+            return loaded
     except Exception:
         pass
     return _get_model_cfg()
@@ -199,6 +227,36 @@ def _make_silence_wav(path: Path, seconds: float = 0.6, sr: int = 16000) -> None
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(pcm)
+
+
+def _hints_for_openai_compat(llm_cfg: Dict[str, Any], *, context: str, err: str = "") -> List[str]:
+    hints: List[str] = []
+    base_url = str(llm_cfg.get("base_url") or "").strip()
+    api_key = str(llm_cfg.get("api_key") or "").strip() or (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
+    if not base_url:
+        hints.append("请设置 Base URL（示例：`https://api.openai.com` 或兼容服务的地址，如 `https://openrouter.ai/api/v1`）。")
+    if not api_key:
+        hints.append("请设置 API Key（在模型中心填写，或设置环境变量 `OPENAI_API_KEY` / `OPENAI_KEY`）。")
+
+    e = str(err or "").strip()
+    el = e.lower()
+    if e:
+        if "401" in el or "unauthorized" in el or "invalid_api_key" in el:
+            hints.append("鉴权失败（401）：API Key 不正确或无权限。")
+        if "403" in el or "forbidden" in el:
+            hints.append("权限不足（403）：检查 Key 权限/额度/是否需要开通对应模型。")
+        if "404" in el:
+            hints.append("接口不存在（404）：检查 Base URL 是否正确（有的服务需要带 `/v1`，有的不能重复带）。")
+        if "timed out" in el or "timeout" in el:
+            hints.append("请求超时：检查网络/代理/服务是否可达，或调大 `OPENAI_TIMEOUT_SEC`。")
+        if "name or service not known" in el or "failed to establish a new connection" in el or "connection" in el:
+            hints.append("连接失败：检查 Base URL 域名、网络、DNS、代理设置。")
+        if "certificate" in el or "ssl" in el:
+            hints.append("TLS/证书错误：检查系统证书、抓包代理、或使用可信 HTTPS 入口。")
+
+    if context == "asr":
+        hints.append("若该服务不支持 `/audio/transcriptions`，请在 ASR 里切换到 `dashscope` / `xfyun_raasr` 或 `none`。")
+    return hints
 
 
 def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
@@ -222,13 +280,26 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
         t0 = time.time()
         client = _openai_client_from_cfg(llm_cfg)
         if not client:
-            out["llm"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
+            out["llm"] = {
+                "ok": False,
+                "error": "API key not set",
+                "hints": _hints_for_openai_compat(llm_cfg, context="llm", err="API key not set"),
+            }
         else:
             try:
                 txt = client.generate_text(messages=[{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0)
-                out["llm"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "sample": (txt or "")[:60]}
+                out["llm"] = {
+                    "ok": True,
+                    "latency_ms": int((time.time() - t0) * 1000),
+                    "sample": (txt or "")[:60],
+                }
             except Exception as exc:
-                out["llm"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+                out["llm"] = {
+                    "ok": False,
+                    "latency_ms": int((time.time() - t0) * 1000),
+                    "error": str(exc),
+                    "hints": _hints_for_openai_compat(llm_cfg, context="llm", err=str(exc)),
+                }
 
     # ASR check
     asr_cfg = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
@@ -247,19 +318,35 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
             t0 = time.time()
             client = _openai_client_from_cfg(cfg.get("llm") or {})
             if not client:
-                out["asr"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
+                out["asr"] = {
+                    "ok": False,
+                    "error": "API key not set",
+                    "hints": _hints_for_openai_compat(cfg.get("llm") or {}, context="asr", err="API key not set"),
+                }
             else:
                 try:
                     resp = client.transcribe_audio(str(wav), model=asr_model or None, response_format="verbose_json")
                     ok = isinstance(resp, dict) and ("text" in resp or "segments" in resp)
-                    out["asr"] = {"ok": bool(ok), "latency_ms": int((time.time() - t0) * 1000)}
+                    out["asr"] = {
+                        "ok": bool(ok),
+                        "latency_ms": int((time.time() - t0) * 1000),
+                    }
                 except Exception as exc:
-                    out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+                    out["asr"] = {
+                        "ok": False,
+                        "latency_ms": int((time.time() - t0) * 1000),
+                        "error": str(exc),
+                        "hints": _hints_for_openai_compat(cfg.get("llm") or {}, context="asr", err=str(exc)),
+                    }
         elif asr_provider == "dashscope":
             # Quick: validate key+deps, Deep: run a tiny file transcription.
             key = os.getenv("DASH_SCOPE_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
             if not key:
-                out["asr"] = {"ok": False, "error": "DASH_SCOPE_API_KEY not set"}
+                out["asr"] = {
+                    "ok": False,
+                    "error": "DASH_SCOPE_API_KEY not set",
+                    "hints": ["请设置环境变量 `DASH_SCOPE_API_KEY`（或 `DASHSCOPE_API_KEY`）。"],
+                }
             else:
                 if not deep:
                     out["asr"] = {"ok": True, "skipped": True, "reason": "dashscope key present (deep check disabled)"}
@@ -269,12 +356,24 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
                         segs = dashscope_transcribe_wav_to_segments(str(wav), DashScopeOfflineConfig(api_key=key, model=asr_model or "fun-asr-realtime"))
                         out["asr"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "segments": len(segs)}
                     except Exception as exc:
-                        out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+                        hints = []
+                        if "dashscope is required" in str(exc).lower():
+                            hints.append("请安装可选依赖：`pip install -r requirements-optional.txt`（包含 dashscope）。")
+                        out["asr"] = {
+                            "ok": False,
+                            "latency_ms": int((time.time() - t0) * 1000),
+                            "error": str(exc),
+                            "hints": hints,
+                        }
         elif asr_provider == "xfyun_raasr":
             app_id = os.getenv("XFYUN_APP_ID") or ""
             secret = os.getenv("XFYUN_SECRET_KEY") or ""
             if not app_id or not secret:
-                out["asr"] = {"ok": False, "error": "XFYUN_APP_ID/XFYUN_SECRET_KEY not set"}
+                out["asr"] = {
+                    "ok": False,
+                    "error": "XFYUN_APP_ID/XFYUN_SECRET_KEY not set",
+                    "hints": ["请设置 `XFYUN_APP_ID` 和 `XFYUN_SECRET_KEY`（讯飞 RaaSR）。"],
+                }
             else:
                 if not deep:
                     out["asr"] = {"ok": True, "skipped": True, "reason": "xfyun keys present (deep check disabled)"}
@@ -287,7 +386,12 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
                         )
                         out["asr"] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000), "segments": len(segs), "task_id": meta.get("task_id")}
                     except Exception as exc:
-                        out["asr"] = {"ok": False, "latency_ms": int((time.time() - t0) * 1000), "error": str(exc)}
+                        out["asr"] = {
+                            "ok": False,
+                            "latency_ms": int((time.time() - t0) * 1000),
+                            "error": str(exc),
+                            "hints": ["请检查讯飞 Key 是否正确、账户余额、以及 `XFYUN_RAASR_HOST` 是否可达。"],
+                        }
         else:
             out["asr"] = {"ok": False, "error": f"unknown asr provider: {asr_provider}"}
     finally:
@@ -1098,7 +1202,7 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                     'video': str(video_path.name) if video_path else None,
                     'audio': 'temp_audio.wav' if (session_dir / 'temp_audio.wav').exists() else None,
                     'transcript': str(transcript_txt.name) if transcript_txt.exists() else None,
-                    'model_config': model_cfg,
+                    'model_config': _redact_model_cfg(model_cfg),
                     'warnings': warnings,
                     'lesson_summary': lesson_summary if lesson_summary else None,
                     'per_student': per_student,
@@ -1162,6 +1266,43 @@ async def set_models_config(request: Request):
     cfg = _sanitize_model_cfg((body or {}).get("config") or body)
     cfg = _set_model_cfg(cfg)
     return {"ok": True, "config": cfg, "env": _env_summary()}
+
+
+@app.post("/api/models/list")
+async def list_models(request: Request):
+    """List model ids from the configured OpenAI-compatible base URL."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cfg = _sanitize_model_cfg((body or {}).get("config") or _get_model_cfg())
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    provider = str(llm_cfg.get("provider") or "none")
+    if provider == "none":
+        return JSONResponse({"ok": False, "error": "llm provider is none"}, status_code=400)
+
+    client = _openai_client_from_cfg(llm_cfg)
+    if not client:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "API key not set",
+                "hints": _hints_for_openai_compat(llm_cfg, context="llm", err="API key not set"),
+            },
+            status_code=400,
+        )
+    try:
+        ids = client.list_model_ids()
+        return {"ok": True, "models": ids, "count": len(ids)}
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "hints": _hints_for_openai_compat(llm_cfg, context="llm", err=str(exc)),
+            },
+            status_code=400,
+        )
 
 
 @app.post("/api/models/check")

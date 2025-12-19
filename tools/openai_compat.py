@@ -289,3 +289,50 @@ class OpenAICompat:
                 msg = e.get("message")
             raise RuntimeError(msg or f"audio transcription failed (HTTP {r.status_code})")
         return j
+
+    def list_model_ids(self) -> List[str]:
+        """List available model ids via OpenAI-compatible `/v1/models`."""
+        url = f"{self.v1}/models"
+        headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        r = requests.get(url, headers=headers, timeout=self.cfg.timeout_sec)
+        try:
+            j = r.json()
+        except Exception:
+            j = {"error": {"message": r.text}}
+        if r.status_code < 200 or r.status_code >= 300:
+            msg = None
+            if isinstance(j, dict):
+                e = j.get("error")
+                if isinstance(e, dict) and isinstance(e.get("message"), str):
+                    msg = e.get("message")
+                elif isinstance(j.get("message"), str):
+                    msg = j.get("message")
+            raise RuntimeError(msg or f"list models failed (HTTP {r.status_code})")
+
+        out: List[str] = []
+        if isinstance(j, dict):
+            data = j.get("data")
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and isinstance(item.get("id"), str):
+                        out.append(item["id"])
+            models = j.get("models")
+            if isinstance(models, list):
+                for item in models:
+                    if isinstance(item, dict) and isinstance(item.get("id"), str):
+                        out.append(item["id"])
+        elif isinstance(j, list):
+            for item in j:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    out.append(item["id"])
+
+        # stable unique
+        seen = set()
+        uniq = []
+        for mid in out:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            uniq.append(mid)
+        uniq.sort()
+        return uniq

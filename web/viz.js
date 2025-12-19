@@ -22,9 +22,12 @@
   const modelStatusText = document.getElementById("modelStatusText");
 
   const modelModal = document.getElementById("modelModal");
+  const modelDrawer = document.getElementById("modelDrawer");
+  const modelDragHandle = document.getElementById("modelDragHandle");
   const btnModelsSave = document.getElementById("btnModelsSave");
   const btnModelsCheck = document.getElementById("btnModelsCheck");
   const btnModelsCheckDeep = document.getElementById("btnModelsCheckDeep");
+  const btnModelsResetPos = document.getElementById("btnModelsResetPos");
   const btnModelsClose = document.getElementById("btnModelsClose");
   const modelModeSel = document.getElementById("modelModeSel");
   const asrProviderSel = document.getElementById("asrProviderSel");
@@ -38,6 +41,9 @@
   const llmModelInput = document.getElementById("llmModelInput");
   const modelCheckBox = document.getElementById("modelCheckBox");
   const modelEnvBox = document.getElementById("modelEnvBox");
+  const modelContent = document.getElementById("modelContent");
+  const modelNavButtons = Array.from(document.querySelectorAll(".model-nav-btn"));
+  const modelSections = Array.from(document.querySelectorAll(".model-section"));
 
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
@@ -136,6 +142,148 @@
 
   function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
+  }
+
+  const MODEL_POS_KEY = "model_center_pos_v1";
+  let modelDragState = null;
+  let modelNavRaf = null;
+
+  function readModelDrawerPos() {
+    try {
+      const raw = localStorage.getItem(MODEL_POS_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== "object") return null;
+      const left = Number(data.left);
+      const top = Number(data.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+      return { left, top };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeModelDrawerPos(left, top) {
+    try {
+      localStorage.setItem(MODEL_POS_KEY, JSON.stringify({ left, top }));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function clampModelDrawerPos(left, top, width, height) {
+    const margin = 12;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    return {
+      left: clamp(left, margin, maxLeft),
+      top: clamp(top, margin, maxTop),
+    };
+  }
+
+  function setModelDrawerPos(left, top) {
+    if (!modelDrawer) return;
+    modelDrawer.style.left = `${Math.round(left)}px`;
+    modelDrawer.style.top = `${Math.round(top)}px`;
+    modelDrawer.style.right = "auto";
+    modelDrawer.style.bottom = "auto";
+    modelDrawer.style.transform = "none";
+  }
+
+  function initModelDrawerPos({ reset = false } = {}) {
+    if (!modelDrawer) return;
+    requestAnimationFrame(() => {
+      const rect = modelDrawer.getBoundingClientRect();
+      const stored = reset ? null : readModelDrawerPos();
+      let left = stored?.left;
+      let top = stored?.top;
+      if (!Number.isFinite(left) || !Number.isFinite(top)) {
+        left = Math.max(16, (window.innerWidth - rect.width) / 2);
+        top = Math.max(16, (window.innerHeight - rect.height) / 5);
+      }
+      const clamped = clampModelDrawerPos(left, top, rect.width, rect.height);
+      setModelDrawerPos(clamped.left, clamped.top);
+      writeModelDrawerPos(clamped.left, clamped.top);
+    });
+  }
+
+  function ensureModelDrawerInViewport() {
+    if (!modelDrawer || !modelModal.classList.contains("open")) return;
+    const rect = modelDrawer.getBoundingClientRect();
+    const clamped = clampModelDrawerPos(rect.left, rect.top, rect.width, rect.height);
+    setModelDrawerPos(clamped.left, clamped.top);
+    writeModelDrawerPos(clamped.left, clamped.top);
+  }
+
+  function resetModelDrawerPos() {
+    try {
+      localStorage.removeItem(MODEL_POS_KEY);
+    } catch (_) {
+      // ignore
+    }
+    initModelDrawerPos({ reset: true });
+  }
+
+  function startModelDrag(e) {
+    if (!modelDrawer || !modelDragHandle) return;
+    if (e.button !== 0) return;
+    const rect = modelDrawer.getBoundingClientRect();
+    modelDragState = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    modelDrawer.classList.add("dragging");
+    modelDragHandle.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+
+  function moveModelDrag(e) {
+    if (!modelDragState || e.pointerId !== modelDragState.pointerId) return;
+    const dx = e.clientX - modelDragState.startX;
+    const dy = e.clientY - modelDragState.startY;
+    const nextLeft = modelDragState.left + dx;
+    const nextTop = modelDragState.top + dy;
+    const clamped = clampModelDrawerPos(nextLeft, nextTop, modelDragState.width, modelDragState.height);
+    setModelDrawerPos(clamped.left, clamped.top);
+  }
+
+  function endModelDrag(e) {
+    if (!modelDragState || e.pointerId !== modelDragState.pointerId) return;
+    modelDrawer.classList.remove("dragging");
+    modelDragHandle.releasePointerCapture(e.pointerId);
+    const rect = modelDrawer.getBoundingClientRect();
+    writeModelDrawerPos(rect.left, rect.top);
+    modelDragState = null;
+  }
+
+  function setActiveModelNav(targetId) {
+    for (const btn of modelNavButtons) {
+      btn.classList.toggle("active", btn.dataset.target === targetId);
+    }
+  }
+
+  function updateModelNavActive() {
+    if (!modelContent || modelSections.length === 0) return;
+    const containerTop = modelContent.getBoundingClientRect().top + 8;
+    let activeId = modelSections[0].id;
+    for (const sec of modelSections) {
+      const rect = sec.getBoundingClientRect();
+      if (rect.top - containerTop <= 8) activeId = sec.id;
+    }
+    setActiveModelNav(activeId);
+  }
+
+  function scheduleModelNavUpdate() {
+    if (modelNavRaf != null) return;
+    modelNavRaf = requestAnimationFrame(() => {
+      modelNavRaf = null;
+      updateModelNavActive();
+    });
   }
 
   let rafId = null;
@@ -1174,6 +1322,8 @@
     applyModelFormFromState();
     renderModelEnvBox();
     renderModelCheckBox();
+    initModelDrawerPos();
+    scheduleModelNavUpdate();
     modelModal.addEventListener(
       "click",
       (e) => {
@@ -1711,6 +1861,28 @@
         alert(`模型中心不可用：${String(e)}`);
       }
     });
+    if (modelDragHandle) {
+      modelDragHandle.addEventListener("pointerdown", startModelDrag);
+      modelDragHandle.addEventListener("pointermove", moveModelDrag);
+      modelDragHandle.addEventListener("pointerup", endModelDrag);
+      modelDragHandle.addEventListener("pointercancel", endModelDrag);
+    }
+    if (btnModelsResetPos) {
+      btnModelsResetPos.addEventListener("click", resetModelDrawerPos);
+    }
+    for (const btn of modelNavButtons) {
+      btn.addEventListener("click", () => {
+        const target = btn.dataset.target;
+        const section = target ? document.getElementById(target) : null;
+        if (section && modelContent) {
+          modelContent.scrollTo({ top: Math.max(0, section.offsetTop - 8), behavior: "smooth" });
+          setActiveModelNav(target);
+        }
+      });
+    }
+    if (modelContent) {
+      modelContent.addEventListener("scroll", scheduleModelNavUpdate);
+    }
     btnModelsClose.addEventListener("click", closeModelModal);
     btnModelsSave.addEventListener("click", async () => {
       try {
@@ -1865,6 +2037,7 @@
 
     window.addEventListener("resize", () => {
       scheduleRender({ preview: true, timeline: true });
+      ensureModelDrawerInViewport();
     });
   }
 

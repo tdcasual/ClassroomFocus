@@ -509,6 +509,7 @@ a{color:inherit}
   border-radius:14px;
   overflow:hidden;
   scroll-margin-top: 12px;
+  flex-shrink: 0;
 }
 .model-section-head{
   padding:12px 14px;

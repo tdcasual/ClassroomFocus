@@ -137,6 +137,10 @@
       llmModels: [],
       llmModelsLoading: false,
       llmModelsError: null,
+      ui: {
+        view: "__all__",
+        allScrollTop: 0,
+      },
     },
   };
 
@@ -146,7 +150,6 @@
 
   const MODEL_POS_KEY = "model_center_pos_v1";
   let modelDragState = null;
-  let modelNavRaf = null;
 
   function readModelDrawerPos() {
     try {
@@ -267,36 +270,35 @@
     }
   }
 
-  function updateModelNavActive() {
-    if (!modelContent || modelSections.length === 0) return;
-    const containerTop = modelContent.getBoundingClientRect().top + 8;
-    let activeId = modelSections[0].id;
+  function setModelSettingsView(nextView, { preserveAllScroll = true } = {}) {
+    const ui = state.models?.ui && typeof state.models.ui === "object" ? state.models.ui : null;
+    const curView = ui && typeof ui.view === "string" ? ui.view : "__all__";
+    let view = String(nextView || "__all__").trim() || "__all__";
+    if (view !== "__all__" && !modelSections.some((s) => s && s.id === view)) {
+      view = "__all__";
+    }
+
+    if (ui) ui.view = view;
+
+    if (modelContent && ui && curView === "__all__" && view !== "__all__") {
+      ui.allScrollTop = modelContent.scrollTop;
+    }
+
     for (const sec of modelSections) {
-      const rect = sec.getBoundingClientRect();
-      if (rect.top - containerTop <= 8) activeId = sec.id;
+      if (!sec) continue;
+      sec.hidden = view !== "__all__" && sec.id !== view;
     }
-    setActiveModelNav(activeId);
-  }
 
-  function scheduleModelNavUpdate() {
-    if (modelNavRaf != null) return;
-    modelNavRaf = requestAnimationFrame(() => {
-      modelNavRaf = null;
-      updateModelNavActive();
-    });
-  }
-
-  function scrollModelContentToSection(section, { offset = 8, behavior = "smooth" } = {}) {
-    if (!modelContent || !section) return;
-    const containerRect = modelContent.getBoundingClientRect();
-    const sectionRect = section.getBoundingClientRect();
-    const delta = sectionRect.top - containerRect.top;
-    const top = Math.max(0, modelContent.scrollTop + delta - offset);
-    try {
-      modelContent.scrollTo({ top, behavior });
-    } catch (_) {
-      modelContent.scrollTop = top;
+    if (modelContent) {
+      const top = view === "__all__" && ui && preserveAllScroll ? Number(ui.allScrollTop) || 0 : 0;
+      try {
+        modelContent.scrollTo({ top, behavior: "auto" });
+      } catch (_) {
+        modelContent.scrollTop = top;
+      }
     }
+
+    setActiveModelNav(view);
   }
 
   let rafId = null;
@@ -1398,7 +1400,7 @@
     renderModelEnvBox();
     renderModelCheckBox();
     initModelDrawerPos();
-    scheduleModelNavUpdate();
+    setModelSettingsView("__all__", { preserveAllScroll: false });
     modelModal.addEventListener(
       "click",
       (e) => {
@@ -1933,7 +1935,7 @@
         if (!state.models.config) await loadModelsConfig();
         openModelModal();
       } catch (e) {
-        alert(`模型中心不可用：${String(e)}`);
+        alert(`模型设置不可用：${String(e)}`);
       }
     });
     if (modelDragHandle) {
@@ -1947,16 +1949,8 @@
     }
     for (const btn of modelNavButtons) {
       btn.addEventListener("click", () => {
-        const target = btn.dataset.target;
-        const section = target ? document.getElementById(target) : null;
-        if (section && modelContent) {
-          scrollModelContentToSection(section, { offset: 8, behavior: "smooth" });
-          setActiveModelNav(target);
-        }
+        setModelSettingsView(btn.dataset.target || "__all__");
       });
-    }
-    if (modelContent) {
-      modelContent.addEventListener("scroll", scheduleModelNavUpdate);
     }
     btnModelsClose.addEventListener("click", closeModelModal);
     btnModelsSave.addEventListener("click", async () => {

@@ -12,63 +12,72 @@
         <div class="brand">
           <div class="logo" aria-hidden="true"></div>
           <div class="brand-title">
-            <div class="title">Classroom Focus Analyzer</div>
-            <div class="subtitle">睡眠/低头检测 · 语音识别 · 知识点对齐</div>
+            <div class="title" data-i18n="Classroom Focus Analyzer">Classroom Focus Analyzer</div>
+            <div class="subtitle" data-i18n="睡眠/低头检测 · 语音识别 · 知识点对齐">睡眠/低头检测 · 语音识别 · 知识点对齐</div>
           </div>
         </div>
 
 	        <div class="topbar-right">
-	          <div class="pill" title="WebSocket 连接状态">
-	            <span class="dot unknown" id="wsDot"></span>
-	            <span id="wsStatus">disconnected</span>
+	          <button class="pill pill-btn sidebar-toggle" id="btnSidebarToggle" aria-controls="sidebar" aria-expanded="false" title="显示/隐藏侧边栏" data-i18n-title="显示/隐藏侧边栏">
+	            <span class="sidebar-icon" aria-hidden="true">☰</span>
+	            <span class="sidebar-toggle-text" data-i18n="学生列表">学生列表</span>
+	          </button>
+	          <div class="pill" title="WebSocket 连接状态" data-i18n-title="WebSocket 连接状态" role="status" aria-live="polite" aria-atomic="true">
+	            <span class="dot unknown" id="wsDot" aria-hidden="true"></span>
+	            <span id="wsStatus" data-i18n="disconnected">disconnected</span>
 	          </div>
-	          <div class="pill" title="当前会话">
-	            <span class="dot unknown" id="recDot"></span>
-	            <span id="recStatusText">idle</span>
-	            <span class="rec-timer" id="recTimer" style="display:none;">00:00</span>
-	            <span class="mono" id="sessionIdText" style="display:none;"></span>
+	          <div class="pill" title="当前会话" data-i18n-title="当前会话" role="status" aria-live="polite" aria-atomic="true">
+	            <span class="dot unknown" id="recDot" aria-hidden="true"></span>
+	            <span id="recStatusText" data-i18n="idle">idle</span>
+	            <span class="rec-timer is-hidden" id="recTimer">00:00</span>
+	            <span class="mono is-hidden" id="sessionIdText"></span>
 	          </div>
 	          <div class="btn-group-sep"></div>
-	          <button class="pill pill-btn" id="btnModelCenter" title="模型设置：录制前检测/切换在线/离线/ASR">
-	            <span class="dot unknown" id="modelDot"></span>
-	            <span id="modelStatusText">模型设置</span>
+	          <button class="pill pill-btn" id="btnModelCenter" title="模型设置：录制前检测/切换在线/离线/ASR" data-i18n-title="模型设置：录制前检测/切换在线/离线/ASR">
+	            <span class="dot unknown" id="modelDot" aria-hidden="true"></span>
+	            <span id="modelStatusText" aria-live="polite" aria-atomic="true" data-i18n="模型设置">模型设置</span>
 	          </button>
-	          <button class="pill pill-btn" id="btnSettingsCenter" title="设置中心：WebDAV/同步">
-	            <span class="dot unknown" id="settingsDot"></span>
-	            <span>设置</span>
+	          <button class="pill pill-btn" id="btnSettingsCenter" title="设置中心：WebDAV/同步" data-i18n-title="设置中心：WebDAV/同步">
+	            <span class="dot unknown" id="settingsDot" aria-hidden="true"></span>
+	            <span data-i18n="设置">设置</span>
+	          </button>
+	          <button class="pill pill-btn" id="btnThemeToggle" title="切换主题" data-i18n-title="切换主题" aria-pressed="false">
+	            <span class="theme-icon" id="themeIcon" aria-hidden="true">☾</span>
+	            <span id="themeText" data-i18n="夜间">夜间</span>
 	          </button>
 	          <div class="shortcuts-help" id="shortcutsHelp">
-	            <button class="shortcuts-trigger" id="btnShortcutsHelp" title="键盘快捷键">?</button>
+	            <button class="shortcuts-trigger" id="btnShortcutsHelp" title="键盘快捷键" data-i18n-title="键盘快捷键">?</button>
 	            <div class="shortcuts-tooltip" id="shortcutsTooltip">
-	              <div class="shortcuts-title">键盘快捷键</div>
+	              <div class="shortcuts-title" data-i18n="键盘快捷键">键盘快捷键</div>
 	              <div class="shortcuts-list">
-	                <div class="shortcut-item"><kbd>Esc</kbd> <span>关闭弹窗</span></div>
-	                <div class="shortcut-item"><kbd>R</kbd> <span>刷新会话列表</span></div>
-	                <div class="shortcut-item"><kbd>T</kbd> <span>切换时间轴</span></div>
+	                <div class="shortcut-item"><kbd>Esc</kbd> <span data-i18n="关闭弹窗">关闭弹窗</span></div>
+	                <div class="shortcut-item"><kbd>R</kbd> <span data-i18n="刷新会话列表">刷新会话列表</span></div>
+	                <div class="shortcut-item"><kbd>T</kbd> <span data-i18n="切换时间轴">切换时间轴</span></div>
 	              </div>
 	            </div>
 	          </div>
 	          <div class="btn-group-sep"></div>
 	          <div class="btn-group">
-	            <button class="btn primary" id="btnStart">开始录制</button>
-	            <button class="btn danger" id="btnStop" disabled>停止</button>
+	            <button class="btn primary" id="btnStart" data-i18n="开始录制">开始录制</button>
+	            <button class="btn danger" id="btnStop" disabled data-i18n="停止">停止</button>
 	          </div>
 	          <div class="btn-group">
-	            <button class="btn" id="btnReport" disabled>生成报告</button>
-	            <button class="btn ghost" id="btnOpenReport" style="display:none;">查看报告</button>
+	            <button class="btn" id="btnReport" disabled data-i18n="生成报告">生成报告</button>
+	            <button class="btn ghost is-hidden" id="btnOpenReport" data-i18n="查看报告">查看报告</button>
 	          </div>
         </div>
       </header>
 
       <div class="content">
-        <aside class="sidebar">
+        <div class="sidebar-backdrop" id="sidebarBackdrop" aria-hidden="true"></div>
+        <aside class="sidebar" id="sidebar">
           <div class="sidebar-head">
             <div class="sidebar-head-row">
-              <div class="input" title="按学生 ID 过滤">
-                <input id="studentFilter" placeholder="搜索学生 ID（track_id）…" autocomplete="off" />
+              <div class="input" title="按学生 ID 过滤" data-i18n-title="按学生 ID 过滤">
+                <input id="studentFilter" placeholder="搜索学生 ID（track_id）…" data-i18n-placeholder="搜索学生 ID（track_id）…" autocomplete="off" />
               </div>
-              <div class="select" title="时间窗">
-                <span>窗口</span>
+              <div class="select" title="时间窗" data-i18n-title="时间窗">
+                <span data-i18n="窗口">窗口</span>
                 <select id="windowSel">
                   <option value="30">30s</option>
                   <option value="60" selected>60s</option>
@@ -78,55 +87,55 @@
               </div>
             </div>
             <div class="sidebar-head-row">
-              <div class="select" title="历史会话（out/session_*/stats.json）">
-                <span>历史</span>
+              <div class="select" title="历史会话（out/session_*/stats.json）" data-i18n-title="历史会话（out/session_*/stats.json）">
+                <span data-i18n="历史">历史</span>
                 <select id="sessionSelect">
-                  <option value="">（加载中…）</option>
+                  <option value="" data-i18n="（加载中…）">（加载中…）</option>
                 </select>
               </div>
-              <button class="btn small" id="btnRefreshSessions" title="刷新会话列表">刷新</button>
+              <button class="btn small" id="btnRefreshSessions" title="刷新会话列表" data-i18n-title="刷新会话列表" data-i18n="刷新">刷新</button>
             </div>
           </div>
-          <div class="student-list" id="studentList">
-            <div class="muted" style="padding:8px 4px;">等待人脸轨迹数据…</div>
+          <div class="student-list" id="studentList" role="list">
+            <div class="student-list-placeholder" id="studentListPlaceholder" data-i18n="等待人脸轨迹数据…">等待人脸轨迹数据…</div>
           </div>
         </aside>
 
         <main class="main">
           <section class="panel" id="previewPanel">
             <div class="panel-head">
-              <div class="panel-title">实时画面</div>
+              <div class="panel-title" data-i18n="实时画面">实时画面</div>
               <div class="panel-actions">
-                <label class="toggle"><input type="checkbox" id="toggleTimeline" />时间轴</label>
-                <label class="toggle"><input type="checkbox" id="toggleBoxes" checked />框选</label>
-                <label class="toggle"><input type="checkbox" id="toggleLabels" checked />状态</label>
-                <label class="toggle"><input type="checkbox" id="toggleAsr" checked />ASR</label>
-                <span class="pill" title="渲染帧率"><span class="dot unknown" id="fpsDot"></span><span id="fpsText">0 fps</span></span>
+                <label class="toggle"><input type="checkbox" id="toggleTimeline" /><span data-i18n="时间轴">时间轴</span></label>
+                <label class="toggle"><input type="checkbox" id="toggleBoxes" checked /><span data-i18n="框选">框选</span></label>
+                <label class="toggle"><input type="checkbox" id="toggleLabels" checked /><span data-i18n="状态">状态</span></label>
+                <label class="toggle"><input type="checkbox" id="toggleAsr" checked /><span data-i18n="ASR">ASR</span></label>
+                <span class="pill" title="渲染帧率" data-i18n-title="渲染帧率"><span class="dot unknown" id="fpsDot" aria-hidden="true"></span><span id="fpsText">0 fps</span></span>
               </div>
             </div>
             <div class="preview-wrap">
               <canvas id="preview"></canvas>
             </div>
             <div class="inspector" id="liveInspector">
-              <span><strong>选中学生：</strong><span id="selectedStudentText">—</span></span>
-              <span><strong>时间：</strong><span class="mono" id="nowText">0.00s</span></span>
-              <span><strong>讲解：</strong><span id="asrNowText" class="muted">（暂无 ASR 段）</span></span>
+              <span><strong data-i18n="选中学生：">选中学生：</strong><span id="selectedStudentText">—</span></span>
+              <span><strong data-i18n="时间：">时间：</strong><span class="mono" id="nowText">0.00s</span></span>
+              <span><strong data-i18n="讲解：">讲解：</strong><span id="asrNowText" class="muted" data-i18n="（暂无 ASR 段）">（暂无 ASR 段）</span></span>
             </div>
           </section>
 
           <section class="panel timeline-panel" id="timelinePanel">
             <div class="panel-head">
-              <div class="panel-title">时间轴（点击取点对齐内容）</div>
+              <div class="panel-title" data-i18n="时间轴（点击取点对齐内容）">时间轴（点击取点对齐内容）</div>
               <div class="panel-actions">
-                <button class="btn small" id="btnFollow">跟随实时</button>
-                <button class="btn small" id="btnClearCursor" disabled>清除游标</button>
+                <button class="btn small" id="btnFollow" data-i18n="跟随实时">跟随实时</button>
+                <button class="btn small" id="btnClearCursor" disabled data-i18n="清除游标">清除游标</button>
               </div>
             </div>
             <canvas id="timeline" class="timeline-canvas"></canvas>
-            <div class="inspector" id="cursorInspector" style="display:none;">
-              <span><strong>游标：</strong><span class="mono" id="cursorTimeText">—</span></span>
-              <span><strong>状态：</strong><span id="cursorStateText">—</span></span>
-              <span><strong>讲解：</strong><span id="cursorAsrText" class="muted">—</span></span>
+            <div class="inspector is-hidden" id="cursorInspector">
+              <span><strong data-i18n="游标：">游标：</strong><span class="mono" id="cursorTimeText">—</span></span>
+              <span><strong data-i18n="状态：">状态：</strong><span id="cursorStateText">—</span></span>
+              <span><strong data-i18n="讲解：">讲解：</strong><span id="cursorAsrText" class="muted">—</span></span>
             </div>
           </section>
         </main>
@@ -136,28 +145,28 @@
 	        <div class="drawer report-drawer" id="reportDrawer">
 	          <div class="drawer-head report-head">
 	            <div class="report-head-left">
-	              <div class="drag-handle" id="reportDragHandle" title="拖动窗口"></div>
-	              <div class="drawer-title" id="reportTitle">学习情况报告</div>
+	              <div class="drag-handle" id="reportDragHandle" title="拖动窗口" data-i18n-title="拖动窗口"></div>
+	              <div class="drawer-title" id="reportTitle" data-i18n="学习情况报告">学习情况报告</div>
 	            </div>
 	            <div class="report-session-info">
 	              <span class="muted" id="reportSessionId"></span>
 	              <div class="rename-group">
-	                <input type="text" id="reportSessionName" class="session-name-input" placeholder="会话名称（点击编辑）" />
-	                <button class="btn small" id="btnRenameSession" title="保存名称">保存</button>
+	                <input type="text" id="reportSessionName" class="session-name-input" placeholder="会话名称（点击编辑）" data-i18n-placeholder="会话名称（点击编辑）" />
+	                <button class="btn small" id="btnRenameSession" title="保存名称" data-i18n-title="保存名称" data-i18n="保存">保存</button>
 	              </div>
 	            </div>
 	            <div class="report-head-actions">
-	              <button class="btn small" id="btnUploadWebdav" title="上传到 WebDAV">上传 WebDAV</button>
-	              <button class="btn small" id="btnReloadReport" title="重新拉取统计结果">重载</button>
-	              <button class="btn small" id="btnMaximizeReport" title="最大化/还原"><span id="maximizeIcon">⤢</span></button>
-	              <button class="btn small" id="btnResetReportPos" title="重置窗口位置">重置位置</button>
-	              <button class="btn small" id="btnCloseReport">关闭</button>
+	              <button class="btn small" id="btnUploadWebdav" title="上传到 WebDAV" data-i18n-title="上传到 WebDAV" data-i18n="上传 WebDAV">上传 WebDAV</button>
+	              <button class="btn small" id="btnReloadReport" title="重新拉取统计结果" data-i18n-title="重新拉取统计结果" data-i18n="重载">重载</button>
+	              <button class="btn small" id="btnMaximizeReport" title="最大化/还原" data-i18n-title="最大化/还原"><span id="maximizeIcon">⤢</span></button>
+	              <button class="btn small" id="btnResetReportPos" title="重置窗口位置" data-i18n-title="重置窗口位置" data-i18n="重置位置">重置位置</button>
+	              <button class="btn small" id="btnCloseReport" data-i18n="关闭">关闭</button>
 	            </div>
 	          </div>
 	          <div class="drawer-body">
 	            <div class="kpi-row" id="reportKpis"></div>
 	            <div class="links" id="reportLinks"></div>
-	            <div id="reportBody" class="muted">尚未生成报告。停止录制后点击“生成报告”。</div>
+	            <div id="reportBody" class="muted" data-i18n="尚未生成报告。停止录制后点击“生成报告”。">尚未生成报告。停止录制后点击“生成报告”。</div>
 	          </div>
 	        </div>
 	      </div>
@@ -167,158 +176,174 @@
 	        <div class="drawer settings-drawer" id="settingsDrawer">
 	          <div class="drawer-head settings-head">
 	            <div class="settings-head-left">
-	              <div class="drag-handle" id="settingsDragHandle" title="拖动窗口"></div>
-	              <div class="drawer-title" id="settingsTitle">设置中心</div>
+	              <div class="drag-handle" id="settingsDragHandle" title="拖动窗口" data-i18n-title="拖动窗口"></div>
+	              <div class="drawer-title" id="settingsTitle" data-i18n="设置中心">设置中心</div>
 	            </div>
 	            <div class="settings-head-actions">
-	              <button class="btn small" id="btnWebdavReset" title="重置为默认值">重置</button>
-	              <button class="btn small primary" id="btnSettingsSave">保存</button>
-	              <button class="btn small" id="btnSettingsClose">关闭</button>
+	              <button class="btn small" id="btnWebdavReset" title="重置为默认值" data-i18n-title="重置为默认值" data-i18n="重置">重置</button>
+	              <button class="btn small primary" id="btnSettingsSave" data-i18n="保存">保存</button>
+	              <button class="btn small" id="btnSettingsClose" data-i18n="关闭">关闭</button>
 	            </div>
 	          </div>
 	          <div class="drawer-body settings-body">
 	            <div class="settings-nav">
-	              <button class="settings-nav-btn active" data-tab="webdav">WebDAV 同步</button>
-	              <button class="settings-nav-btn" data-tab="storage">存储设置</button>
+	              <button class="settings-nav-btn active" data-tab="webdav" data-i18n="WebDAV 同步">WebDAV 同步</button>
+	              <button class="settings-nav-btn" data-tab="storage" data-i18n="存储设置">存储设置</button>
 	            </div>
 	            <div class="settings-content">
 	              <!-- WebDAV Tab -->
 	              <div class="settings-tab active" id="settings-tab-webdav">
 	                <div class="settings-section">
 	                  <div class="settings-section-head">
-	                    <h3>WebDAV 远程同步</h3>
-	                    <label class="toggle"><input type="checkbox" id="webdavEnabled" />启用 WebDAV</label>
+	                    <h3 data-i18n="WebDAV 远程同步">WebDAV 远程同步</h3>
+	                    <label class="toggle"><input type="checkbox" id="webdavEnabled" /><span data-i18n="启用 WebDAV">启用 WebDAV</span></label>
 	                  </div>
-	                  <p class="muted">启用后，录制文件可以自动或手动上传到 WebDAV 服务器。</p>
+	                  <p class="muted" data-i18n="启用后，录制文件可以自动或手动上传到 WebDAV 服务器。">启用后，录制文件可以自动或手动上传到 WebDAV 服务器。</p>
 	                </div>
 	                <div class="form-grid" id="webdavFormGrid">
 	                  <div class="field">
-	                    <div class="field-label">WebDAV URL</div>
+	                    <div class="field-label" data-i18n="WebDAV URL">WebDAV URL</div>
 	                    <div class="input">
-	                      <input id="webdavUrl" placeholder="https://your-server.com/webdav" autocomplete="off" />
+	                      <input id="webdavUrl" placeholder="https://your-server.com/webdav" data-i18n-placeholder="https://your-server.com/webdav" autocomplete="off" aria-describedby="webdavUrlHelp" />
 	                    </div>
-	                    <div class="field-help">例如：https://dav.jianguoyun.com/dav/</div>
+	                    <div class="field-help" id="webdavUrlHelp" data-i18n="例如：https://dav.jianguoyun.com/dav/">例如：https://dav.jianguoyun.com/dav/</div>
 	                  </div>
 	                  <div class="field">
-	                    <div class="field-label">用户名</div>
+	                    <div class="field-label" data-i18n="用户名">用户名</div>
 	                    <div class="input">
-	                      <input id="webdavUsername" placeholder="用户名/邮箱" autocomplete="off" />
+	                      <input id="webdavUsername" placeholder="用户名/邮箱" data-i18n-placeholder="用户名/邮箱" autocomplete="off" />
 	                    </div>
 	                  </div>
 	                  <div class="field">
-	                    <div class="field-label">密码/应用密码</div>
+	                    <div class="field-label" data-i18n="密码/应用密码">密码/应用密码</div>
 	                    <div class="input password-input-wrap">
-	                      <input id="webdavPassword" type="password" placeholder="密码或应用专用密码" autocomplete="off" />
-	                      <button type="button" class="btn-toggle-password" id="btnToggleWebdavPassword" title="显示/隐藏密码">◉</button>
+	                      <input id="webdavPassword" type="password" placeholder="密码或应用专用密码" data-i18n-placeholder="密码或应用专用密码" autocomplete="off" aria-describedby="webdavPasswordHelp" />
+	                      <button type="button" class="btn-toggle-password" id="btnToggleWebdavPassword" title="显示/隐藏密码" data-i18n-title="显示/隐藏密码">◉</button>
 	                    </div>
-	                    <div class="field-help">建议使用应用专用密码，而非主账户密码。</div>
+	                    <div class="field-help" id="webdavPasswordHelp" data-i18n="建议使用应用专用密码，而非主账户密码。">建议使用应用专用密码，而非主账户密码。</div>
 	                  </div>
 	                  <div class="field">
-	                    <div class="field-label">远程路径</div>
+	                    <div class="field-label" data-i18n="远程路径">远程路径</div>
 	                    <div class="input">
-	                      <input id="webdavRemotePath" placeholder="/classroom_focus" autocomplete="off" />
+	                      <input id="webdavRemotePath" placeholder="/classroom_focus" data-i18n-placeholder="/classroom_focus" autocomplete="off" aria-describedby="webdavRemotePathHelp" />
 	                    </div>
-	                    <div class="field-help">文件会保存到此路径下，每个会话一个子文件夹。</div>
+	                    <div class="field-help" id="webdavRemotePathHelp" data-i18n="文件会保存到此路径下，每个会话一个子文件夹。">文件会保存到此路径下，每个会话一个子文件夹。</div>
 	                  </div>
 	                </div>
-	                <div class="settings-section" style="margin-top: 16px;">
-	                  <h4>上传选项</h4>
+	                <div class="settings-section mt-16">
+	                  <h4 data-i18n="上传选项">上传选项</h4>
 	                  <div class="checkbox-group">
-	                    <label class="toggle"><input type="checkbox" id="webdavAutoUpload" />录制结束后自动上传</label>
-	                    <label class="toggle"><input type="checkbox" id="webdavUploadVideo" checked />上传视频</label>
-	                    <label class="toggle"><input type="checkbox" id="webdavUploadAudio" checked />上传音频</label>
-	                    <label class="toggle"><input type="checkbox" id="webdavUploadStats" checked />上传统计/报告</label>
-	                    <label class="toggle"><input type="checkbox" id="webdavUploadTranscript" checked />上传转写文本</label>
-	                    <label class="toggle"><input type="checkbox" id="webdavUploadAll" />上传所有文件</label>
+	                    <label class="toggle"><input type="checkbox" id="webdavAutoUpload" /><span data-i18n="录制结束后自动上传">录制结束后自动上传</span></label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadVideo" checked /><span data-i18n="上传视频">上传视频</span></label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadAudio" checked /><span data-i18n="上传音频">上传音频</span></label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadStats" checked /><span data-i18n="上传统计/报告">上传统计/报告</span></label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadTranscript" checked /><span data-i18n="上传转写文本">上传转写文本</span></label>
+	                    <label class="toggle"><input type="checkbox" id="webdavUploadAll" /><span data-i18n="上传所有文件">上传所有文件</span></label>
 	                  </div>
 	                </div>
 	                <div class="settings-actions">
-	                  <button class="btn" id="btnWebdavTest">测试连接</button>
+	                  <button class="btn" id="btnWebdavTest" data-i18n="测试连接">测试连接</button>
 	                  <span id="webdavTestStatus" class="muted"></span>
 	                </div>
 	              </div>
 	              <!-- Storage Tab -->
-	              <div class="settings-tab" id="settings-tab-storage">
-	                <div class="settings-section">
-	                  <h3>本地存储</h3>
-	                  <p class="muted">录制文件默认保存在本地 out/ 目录下。</p>
-	                </div>
-	                <div class="form-grid">
-	                  <div class="field">
-	                    <div class="field-label">本地存储路径</div>
-	                    <div class="input">
-	                      <input id="localStoragePath" value="out/" disabled />
-	                    </div>
-	                    <div class="field-help">目前不可修改，所有会话保存在项目根目录的 out/ 下。</div>
-	                  </div>
-	                </div>
-	              </div>
-	            </div>
-	          </div>
-	        </div>
+              <div class="settings-tab" id="settings-tab-storage">
+                <div class="settings-section">
+                  <h3 data-i18n="本地存储">本地存储</h3>
+                  <p class="muted" data-i18n="录制文件默认保存在本地 out/ 目录下。">录制文件默认保存在本地 out/ 目录下。</p>
+                </div>
+                <div class="form-grid">
+                  <div class="field">
+                    <div class="field-label" data-i18n="本地存储路径">本地存储路径</div>
+                    <div class="input">
+                      <input id="localStoragePath" value="out/" disabled aria-describedby="localStorageHelp" />
+                    </div>
+                    <div class="field-help" id="localStorageHelp" data-i18n="目前不可修改，所有会话保存在项目根目录的 out/ 下。">目前不可修改，所有会话保存在项目根目录的 out/ 下。</div>
+                  </div>
+                </div>
+                <div class="settings-section mt-16">
+                  <h3 data-i18n="语言">语言</h3>
+                  <div class="form-grid">
+                    <div class="field">
+                      <div class="field-label" data-i18n="界面语言">界面语言</div>
+                      <div class="select">
+                        <span data-i18n="Language">Language</span>
+                        <select id="langSelect" aria-describedby="langHelp">
+                          <option value="zh" data-i18n="中文">中文</option>
+                          <option value="en" data-i18n="English">English</option>
+                        </select>
+                      </div>
+                      <div class="field-help" id="langHelp" data-i18n="切换界面语言后立即生效。">切换界面语言后立即生效。</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
 	      </div>
 
 	      <div class="modal model-modal" id="modelModal" role="dialog" aria-modal="true" aria-labelledby="modelTitle">
 	        <div class="drawer model-drawer" id="modelDrawer" role="document">
 	          <div class="drawer-head model-head">
 	            <div class="model-head-left">
-	              <div class="drag-handle" id="modelDragHandle" title="拖动窗口"></div>
+	              <div class="drag-handle" id="modelDragHandle" title="拖动窗口" data-i18n-title="拖动窗口"></div>
 	            <div class="model-head-title">
-	                <div class="drawer-title" id="modelTitle">模型设置（录制前检测）</div>
-	                <div class="model-subtitle">拖动窗口，可在不遮挡实时画面的情况下调整设置。</div>
+	                <div class="drawer-title" id="modelTitle" data-i18n="模型设置（录制前检测）">模型设置（录制前检测）</div>
+	                <div class="model-subtitle" data-i18n="拖动窗口，可在不遮挡实时画面的情况下调整设置。">拖动窗口，可在不遮挡实时画面的情况下调整设置。</div>
 	              </div>
 	            </div>
 	            <div class="model-head-actions">
-	              <button class="btn small" id="btnModelsSave" title="保存并应用到下一次录制">保存/应用</button>
-	              <button class="btn small" id="btnModelsCheck" title="快速检测（推荐）">检测</button>
-	              <button class="btn small" id="btnModelsCheckDeep" title="深度检测（会触发真实 ASR 调用）">深度检测</button>
-	              <button class="btn small" id="btnModelsResetPos" title="重置窗口位置">重置位置</button>
-	              <button class="btn small" id="btnModelsClose">关闭</button>
+	              <button class="btn small" id="btnModelsSave" title="保存并应用到下一次录制" data-i18n-title="保存并应用到下一次录制" data-i18n="保存/应用">保存/应用</button>
+	              <button class="btn small" id="btnModelsCheck" title="快速检测（推荐）" data-i18n-title="快速检测（推荐）" data-i18n="检测">检测</button>
+	              <button class="btn small" id="btnModelsCheckDeep" title="深度检测（会触发真实 ASR 调用）" data-i18n-title="深度检测（会触发真实 ASR 调用）" data-i18n="深度检测">深度检测</button>
+	              <button class="btn small" id="btnModelsResetPos" title="重置窗口位置" data-i18n-title="重置窗口位置" data-i18n="重置位置">重置位置</button>
+	              <button class="btn small" id="btnModelsClose" data-i18n="关闭">关闭</button>
 	            </div>
 		          </div>
 		          <div class="drawer-body model-body">
 			            <div class="model-layout">
-			              <aside class="model-nav" aria-label="模型设置导航">
-			                <button class="model-nav-btn active" type="button" data-target="__all__">全部</button>
-			                <button class="model-nav-btn" type="button" data-target="model-section-check">检测结果</button>
-			                <button class="model-nav-btn" type="button" data-target="model-section-mode">模式</button>
+			              <aside class="model-nav" aria-label="模型设置导航" data-i18n-aria-label="模型设置导航">
+			                <button class="model-nav-btn active" type="button" data-target="__all__" data-i18n="全部">全部</button>
+			                <button class="model-nav-btn" type="button" data-target="model-section-check" data-i18n="检测结果">检测结果</button>
+			                <button class="model-nav-btn" type="button" data-target="model-section-mode" data-i18n="模式">模式</button>
 			                <button class="model-nav-btn" type="button" data-target="model-section-llm">LLM</button>
-			                <button class="model-nav-btn" type="button" data-target="model-section-asr">ASR</button>
-			                <button class="model-nav-btn" type="button" data-target="model-section-env">环境摘要</button>
+			                <button class="model-nav-btn" type="button" data-target="model-section-asr" data-i18n="ASR">ASR</button>
+			                <button class="model-nav-btn" type="button" data-target="model-section-env" data-i18n="环境摘要">环境摘要</button>
 			              </aside>
 			              <div class="model-content" id="modelContent">
 			                <section class="model-section" id="model-section-check">
 			                  <div class="model-section-head">
 			                    <div class="summary-left">
-			                      <div class="student-name">检测结果</div>
-			                      <span class="badge"><span class="dot unknown"></span><span>建议录制前检测</span></span>
+			                      <div class="student-name" data-i18n="检测结果">检测结果</div>
+			                      <span class="badge"><span class="dot unknown"></span><span data-i18n="建议录制前检测">建议录制前检测</span></span>
 			                    </div>
-			                    <div class="summary-right">将检测结果作为“是否需要 offline”的依据</div>
+			                    <div class="summary-right" data-i18n="将检测结果作为“是否需要 offline”的依据">将检测结果作为“是否需要 offline”的依据</div>
 			                  </div>
 			                  <div class="model-section-body">
-			                    <div id="modelCheckBox" class="muted">尚未检测。</div>
+			                    <div id="modelCheckBox" class="muted" data-i18n="尚未检测。">尚未检测。</div>
 			                  </div>
 			                </section>
 
 			                <section class="model-section" id="model-section-mode">
 			                  <div class="model-section-head">
 			                    <div class="summary-left">
-			                      <div class="student-name">模式</div>
-			                      <span class="badge"><span class="dot unknown"></span><span>online / offline</span></span>
+			                      <div class="student-name" data-i18n="模式">模式</div>
+			                      <span class="badge"><span class="dot unknown"></span><span data-i18n="online / offline">online / offline</span></span>
 			                    </div>
-			                    <div class="summary-right">offline 不会调用任何模型</div>
+			                    <div class="summary-right" data-i18n="offline 不会调用任何模型">offline 不会调用任何模型</div>
 			                  </div>
 			                  <div class="model-section-body">
 			                    <div class="field">
-			                      <div class="field-label">模式（Recording 不受影响）</div>
+			                      <div class="field-label" data-i18n="模式（Recording 不受影响）">模式（Recording 不受影响）</div>
 			                      <div class="select">
-			                        <span>Mode</span>
-			                        <select id="modelModeSel">
-			                          <option value="online">online（调用模型）</option>
-			                          <option value="offline">offline（不调用模型）</option>
+			                        <span data-i18n="Mode">Mode</span>
+			                        <select id="modelModeSel" aria-describedby="modelModeHelp">
+			                          <option value="online" data-i18n="online（调用模型）">online（调用模型）</option>
+			                          <option value="offline" data-i18n="offline（不调用模型）">offline（不调用模型）</option>
 			                        </select>
 			                      </div>
-			                      <div class="field-help">离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。</div>
+			                      <div class="field-help" id="modelModeHelp" data-i18n="离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。">离线模式仍会录制音视频并生成 CV 统计，但报告将跳过 ASR/LLM。</div>
 			                    </div>
 			                  </div>
 			                </section>
@@ -326,48 +351,48 @@
 			                <section class="model-section" id="model-section-llm">
 			                  <div class="model-section-head">
 			                    <div class="summary-left">
-			                      <div class="student-name">LLM（课程总结 / 知识点）</div>
-			                      <span class="badge"><span class="dot unknown"></span><span>OpenAI-compatible</span></span>
+			                      <div class="student-name" data-i18n="LLM（课程总结 / 知识点）">LLM（课程总结 / 知识点）</div>
+			                      <span class="badge"><span class="dot unknown"></span><span data-i18n="OpenAI-compatible">OpenAI-compatible</span></span>
 			                    </div>
-			                    <div class="summary-right">可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）</div>
+			                    <div class="summary-right" data-i18n="可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）">可接 OpenAI / OpenRouter 等兼容服务（含 Claude 等）</div>
 			                  </div>
 			                  <div class="model-section-body">
 			                    <div class="field-row">
-			                      <label class="toggle"><input type="checkbox" id="llmEnabledToggle" />启用 LLM（总结+知识点）</label>
+			                      <label class="toggle"><input type="checkbox" id="llmEnabledToggle" /><span data-i18n="启用 LLM（总结+知识点）">启用 LLM（总结+知识点）</span></label>
 			                    </div>
 			                    <div class="form-grid">
 			                      <div class="field">
-			                        <div class="field-label">Base URL</div>
+			                        <div class="field-label" data-i18n="Base URL">Base URL</div>
 			                        <div class="input">
-			                          <input id="llmBaseUrlInput" placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" autocomplete="off" />
+			                          <input id="llmBaseUrlInput" placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" data-i18n-placeholder="https://api.openai.com 或 https://openrouter.ai/api/v1" autocomplete="off" aria-describedby="llmBaseUrlHelp" />
 			                        </div>
-			                        <div class="field-help">后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。</div>
+			                        <div class="field-help" id="llmBaseUrlHelp" data-i18n="后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。">后端会自动补齐/规范化 `/v1` 路径，并兼容 GPT-5+ 与旧式 Chat Completions。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">API Key</div>
+			                        <div class="field-label" data-i18n="API Key">API Key</div>
 			                        <div class="input">
-			                          <input id="llmApiKeyInput" type="password" placeholder="sk-...（不会写入 out/ session 输出）" autocomplete="off" />
+			                          <input id="llmApiKeyInput" type="password" placeholder="sk-...（不会写入 out/ session 输出）" data-i18n-placeholder="sk-...（不会写入 out/ session 输出）" autocomplete="off" aria-describedby="llmApiKeyHelp" />
 			                        </div>
-			                        <div class="field-help">如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。</div>
+			                        <div class="field-help" id="llmApiKeyHelp" data-i18n="如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。">如不填写则回退使用环境变量：`OPENAI_API_KEY` / `OPENAI_KEY`。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">可用模型（从 URL 拉取）</div>
-			                        <div style="display:flex; gap:10px; align-items:center;">
-			                          <div class="select" style="flex:1; min-width:0;">
-			                            <span>Model</span>
-			                            <select id="llmModelSel">
-			                              <option value="">（点击“拉取模型”）</option>
+			                        <div class="field-label" data-i18n="可用模型（从 URL 拉取）">可用模型（从 URL 拉取）</div>
+			                        <div class="inline-row">
+			                          <div class="select flex-1 min-w-0">
+			                            <span data-i18n="Model">Model</span>
+			                            <select id="llmModelSel" aria-describedby="llmModelSelectHelp">
+			                              <option value="" data-i18n="（点击“拉取模型”）">（点击“拉取模型”）</option>
 			                            </select>
 			                          </div>
-			                          <button class="btn small" id="btnLlmPullModels" title="从当前 Base URL 拉取 /v1/models">拉取模型</button>
+			                          <button class="btn small" id="btnLlmPullModels" title="从当前 Base URL 拉取 /v1/models" data-i18n-title="从当前 Base URL 拉取 /v1/models" data-i18n="拉取模型">拉取模型</button>
 			                        </div>
-			                        <div id="llmModelsStatus" class="muted">（未拉取）</div>
-			                        <div class="field-help">如拉取失败，可直接在下方手动填写模型名。</div>
+			                        <div id="llmModelsStatus" class="muted" data-i18n="（未拉取）">（未拉取）</div>
+			                        <div class="field-help" id="llmModelSelectHelp" data-i18n="如拉取失败，可直接在下方手动填写模型名。">如拉取失败，可直接在下方手动填写模型名。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">模型名（手动/被下拉框填入）</div>
+			                        <div class="field-label" data-i18n="模型名（手动/被下拉框填入）">模型名（手动/被下拉框填入）</div>
 			                        <div class="input">
-			                          <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." autocomplete="off" />
+			                          <input id="llmModelInput" placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." data-i18n-placeholder="gpt-4o-mini / gpt-5 / anthropic/claude-... / ..." autocomplete="off" aria-describedby="llmModelSelectHelp" />
 			                        </div>
 			                      </div>
 			                    </div>
@@ -377,69 +402,69 @@
 			                <section class="model-section" id="model-section-asr">
 			                  <div class="model-section-head">
 			                    <div class="summary-left">
-			                      <div class="student-name">ASR（整节课转写）</div>
-			                      <span class="badge"><span class="dot unknown"></span><span>provider</span></span>
+			                      <div class="student-name" data-i18n="ASR（整节课转写）">ASR（整节课转写）</div>
+			                      <span class="badge"><span class="dot unknown"></span><span data-i18n="provider">provider</span></span>
 			                    </div>
-			                    <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
+			                    <div class="summary-right" data-i18n="用于“睡觉时间 × 讲课内容”对齐">用于“睡觉时间 × 讲课内容”对齐</div>
 			                  </div>
 			                  <div class="model-section-body">
 			                    <div class="form-grid">
 			                      <div class="field">
-			                        <div class="field-label">ASR Provider</div>
+			                        <div class="field-label" data-i18n="ASR Provider">ASR Provider</div>
 			                        <div class="select">
-			                          <span>Provider</span>
-			                          <select id="asrProviderSel">
-			                            <option value="openai_compat">OpenAI-compatible（Whisper）</option>
-			                            <option value="dashscope">阿里 DashScope（文件识别）</option>
-			                            <option value="xfyun_raasr">讯飞 RaaSR（录音文件识别）</option>
-			                            <option value="none">none（不转写）</option>
+			                          <span data-i18n="Provider">Provider</span>
+			                          <select id="asrProviderSel" aria-describedby="asrProviderHelp">
+			                            <option value="openai_compat" data-i18n="OpenAI-compatible（Whisper）">OpenAI-compatible（Whisper）</option>
+			                            <option value="dashscope" data-i18n="阿里 DashScope（文件识别）">阿里 DashScope（文件识别）</option>
+			                            <option value="xfyun_raasr" data-i18n="讯飞 RaaSR（录音文件识别）">讯飞 RaaSR（录音文件识别）</option>
+			                            <option value="none" data-i18n="none（不转写）">none（不转写）</option>
 			                          </select>
 			                        </div>
-			                        <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
+			                        <div class="field-help" id="asrProviderHelp" data-i18n="DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">API 设置</div>
+			                        <div class="field-label" data-i18n="API 设置">API 设置</div>
 			                        <div class="field-row">
-			                          <label class="toggle"><input type="checkbox" id="asrUseIndependentToggle" />使用独立 API 设置</label>
+			                          <label class="toggle"><input type="checkbox" id="asrUseIndependentToggle" aria-describedby="asrIndependentHelp" /><span data-i18n="使用独立 API 设置">使用独立 API 设置</span></label>
 			                        </div>
-			                        <div class="field-help">开启后可单独配置 ASR 的 URL/Key，否则复用 LLM 设置。</div>
+			                        <div class="field-help" id="asrIndependentHelp" data-i18n="开启后可单独配置 ASR 的 URL/Key，否则复用 LLM 设置。">开启后可单独配置 ASR 的 URL/Key，否则复用 LLM 设置。</div>
 			                      </div>
 			                    </div>
-			                    <div id="asrIndependentSettings" class="form-grid" style="margin-top:10px; display:none;">
+			                    <div id="asrIndependentSettings" class="form-grid mt-10 is-hidden">
 			                      <div class="field">
-			                        <div class="field-label">ASR Base URL</div>
+			                        <div class="field-label" data-i18n="ASR Base URL">ASR Base URL</div>
 			                        <div class="input">
-			                          <input id="asrBaseUrlInput" placeholder="https://api.openai.com 或其他兼容服务" autocomplete="off" />
+			                          <input id="asrBaseUrlInput" placeholder="https://api.openai.com 或其他兼容服务" data-i18n-placeholder="https://api.openai.com 或其他兼容服务" autocomplete="off" aria-describedby="asrBaseUrlHelp" />
 			                        </div>
-			                        <div class="field-help">留空则使用 LLM 的 Base URL。</div>
+			                        <div class="field-help" id="asrBaseUrlHelp" data-i18n="留空则使用 LLM 的 Base URL。">留空则使用 LLM 的 Base URL。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">ASR API Key</div>
+			                        <div class="field-label" data-i18n="ASR API Key">ASR API Key</div>
 			                        <div class="input">
-			                          <input id="asrApiKeyInput" type="password" placeholder="留空则使用 LLM 的 API Key" autocomplete="off" />
+			                          <input id="asrApiKeyInput" type="password" placeholder="留空则使用 LLM 的 API Key" data-i18n-placeholder="留空则使用 LLM 的 API Key" autocomplete="off" aria-describedby="asrApiKeyHelp" />
 			                        </div>
-			                        <div class="field-help">留空则使用 LLM 的 API Key 或环境变量。</div>
+			                        <div class="field-help" id="asrApiKeyHelp" data-i18n="留空则使用 LLM 的 API Key 或环境变量。">留空则使用 LLM 的 API Key 或环境变量。</div>
 			                      </div>
 			                    </div>
-			                    <div class="form-grid" style="margin-top:10px;">
+			                    <div class="form-grid mt-10">
 			                      <div class="field">
-			                        <div class="field-label">可用模型（从 API 拉取）</div>
-			                        <div style="display:flex; gap:10px; align-items:center;">
-			                          <div class="select" style="flex:1; min-width:0;">
-			                            <span>Model</span>
-			                            <select id="asrModelSel">
-			                              <option value="">（先在 LLM 拉取模型）</option>
+			                        <div class="field-label" data-i18n="可用模型（从 API 拉取）">可用模型（从 API 拉取）</div>
+			                        <div class="inline-row">
+			                          <div class="select flex-1 min-w-0">
+			                            <span data-i18n="Model">Model</span>
+			                            <select id="asrModelSel" aria-describedby="asrModelSelectHelp">
+			                              <option value="" data-i18n="（先在 LLM 拉取模型）">（先在 LLM 拉取模型）</option>
 			                            </select>
 			                          </div>
 			                        </div>
-			                        <div class="field-help">选择后自动填入下方模型名；也可手动输入。</div>
+			                        <div class="field-help" id="asrModelSelectHelp" data-i18n="选择后自动填入下方模型名；也可手动输入。">选择后自动填入下方模型名；也可手动输入。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">ASR 模型名（手动/被下拉框填入）</div>
-			                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
-			                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
+			                        <div class="field-label" data-i18n="ASR 模型名（手动/被下拉框填入）">ASR 模型名（手动/被下拉框填入）</div>
+			                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）" data-i18n-title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
+			                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." data-i18n-placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" aria-describedby="asrModelInputHelp" />
 			                        </div>
-			                        <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
+			                        <div class="field-help" id="asrModelInputHelp" data-i18n="建议：录制前先“检测”，避免报告生成时才发现不可用。">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
 			                      </div>
 			                    </div>
 			                  </div>
@@ -448,13 +473,13 @@
 			                <section class="model-section" id="model-section-env">
 			                  <div class="model-section-head">
 			                    <div class="summary-left">
-			                      <div class="student-name">环境摘要（.env）</div>
-			                      <span class="badge"><span class="dot unknown"></span><span>keys present?</span></span>
+			                      <div class="student-name" data-i18n="环境摘要（.env）">环境摘要（.env）</div>
+			                      <span class="badge"><span class="dot unknown"></span><span data-i18n="keys present?">keys present?</span></span>
 			                    </div>
-			                    <div class="summary-right">仅展示是否存在，不会回显 Key</div>
+			                    <div class="summary-right" data-i18n="仅展示是否存在，不会回显 Key">仅展示是否存在，不会回显 Key</div>
 			                  </div>
 			                  <div class="model-section-body">
-			                    <div id="modelEnvBox" class="muted">（加载中…）</div>
+			                    <div id="modelEnvBox" class="muted" data-i18n="（加载中…）">（加载中…）</div>
 			                  </div>
 			                </section>
 			              </div>

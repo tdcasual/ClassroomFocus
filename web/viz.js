@@ -9,6 +9,10 @@
   const windowSel = document.getElementById("windowSel");
   const sessionSelect = document.getElementById("sessionSelect");
   const btnRefreshSessions = document.getElementById("btnRefreshSessions");
+  const btnSidebarToggle = document.getElementById("btnSidebarToggle");
+  const sidebar = document.getElementById("sidebar");
+  const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+  const content = document.querySelector(".content");
 
   const wsDot = document.getElementById("wsDot");
   const wsStatus = document.getElementById("wsStatus");
@@ -99,6 +103,9 @@
   // Settings Center elements
   const btnSettingsCenter = document.getElementById("btnSettingsCenter");
   const settingsDot = document.getElementById("settingsDot");
+  const btnThemeToggle = document.getElementById("btnThemeToggle");
+  const themeIcon = document.getElementById("themeIcon");
+  const themeText = document.getElementById("themeText");
   const settingsModal = document.getElementById("settingsModal");
   const settingsDrawer = document.getElementById("settingsDrawer");
   const settingsDragHandle = document.getElementById("settingsDragHandle");
@@ -106,6 +113,7 @@
   const btnSettingsClose = document.getElementById("btnSettingsClose");
   const settingsNavBtns = document.querySelectorAll(".settings-nav-btn");
   const settingsTabs = document.querySelectorAll(".settings-tab");
+  const langSelect = document.getElementById("langSelect");
   
   // WebDAV form elements
   const webdavEnabled = document.getElementById("webdavEnabled");
@@ -156,6 +164,7 @@
 
     students: new Map(), // id -> Student
     selectedStudentId: null,
+    studentListView: null,
 
     followLive: true,
     cursorTime: null,
@@ -182,6 +191,7 @@
       jobId: null,
       lastResult: null,
       lastStatsUrl: null,
+      lastStats: null,
       lastSessionId: null,
       polling: false,
     },
@@ -204,6 +214,166 @@
     },
   };
 
+  const I18N_LANG_KEY = "ui_lang";
+  const THEME_KEY = "ui_theme";
+  const SIDEBAR_OPEN_KEY = "sidebar_open";
+  const SIDEBAR_BREAKPOINT = 980;
+  const SUPPORTED_LANGS = ["zh", "en"];
+  const DEFAULT_LANG = "zh";
+  let i18n = { lang: DEFAULT_LANG, dict: {} };
+
+  function detectLanguage() {
+    const stored = localStorage.getItem(I18N_LANG_KEY);
+    if (SUPPORTED_LANGS.includes(stored)) return stored;
+    const nav = String(navigator.language || "").toLowerCase();
+    if (nav.startsWith("en")) return "en";
+    return DEFAULT_LANG;
+  }
+
+  async function loadI18n(lang) {
+    const safeLang = SUPPORTED_LANGS.includes(lang) ? lang : DEFAULT_LANG;
+    try {
+      const res = await fetch(`./i18n/${safeLang}.json?_t=${Date.now()}`);
+      if (!res.ok) throw new Error(`i18n load failed: ${res.status}`);
+      const data = await res.json();
+      i18n = { lang: safeLang, dict: data || {} };
+    } catch (_) {
+      i18n = { lang: safeLang, dict: {} };
+    }
+    document.documentElement.lang = safeLang === "en" ? "en" : "zh-CN";
+  }
+
+  function t(key, params = null) {
+    let str = (i18n.dict && Object.prototype.hasOwnProperty.call(i18n.dict, key)) ? i18n.dict[key] : key;
+    if (params && typeof params === "object") {
+      str = String(str).replace(/\{(\w+)\}/g, (m, k) => {
+        if (params[k] == null) return m;
+        return String(params[k]);
+      });
+    }
+    return String(str);
+  }
+
+  function applyI18n(root = document) {
+    const textNodes = root.querySelectorAll("[data-i18n]");
+    for (const el of textNodes) {
+      el.textContent = t(el.dataset.i18n || "");
+    }
+    const placeholders = root.querySelectorAll("[data-i18n-placeholder]");
+    for (const el of placeholders) {
+      el.placeholder = t(el.dataset.i18nPlaceholder || "");
+    }
+    const titles = root.querySelectorAll("[data-i18n-title]");
+    for (const el of titles) {
+      el.title = t(el.dataset.i18nTitle || "");
+    }
+    const ariaLabels = root.querySelectorAll("[data-i18n-aria-label]");
+    for (const el of ariaLabels) {
+      el.setAttribute("aria-label", t(el.dataset.i18nAriaLabel || ""));
+    }
+  }
+
+  async function setLanguage(lang) {
+    const safeLang = SUPPORTED_LANGS.includes(lang) ? lang : DEFAULT_LANG;
+    localStorage.setItem(I18N_LANG_KEY, safeLang);
+    await loadI18n(safeLang);
+    applyI18n();
+    refreshUiTexts();
+  }
+
+  function getSystemTheme() {
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+      return "light";
+    }
+    return "dark";
+  }
+
+  function getStoredTheme() {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === "light" || v === "dark") return v;
+    return null;
+  }
+
+  function updateThemeToggle() {
+    if (!btnThemeToggle || !themeText || !themeIcon) return;
+    const resolved = getStoredTheme() || getSystemTheme();
+    const isDark = resolved === "dark";
+    themeIcon.textContent = isDark ? "☾" : "☀";
+    themeText.textContent = isDark ? t("夜间") : t("白天");
+    btnThemeToggle.setAttribute("aria-pressed", isDark ? "true" : "false");
+  }
+
+  function applyTheme(theme) {
+    if (theme === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+    } else if (theme === "dark") {
+      document.documentElement.setAttribute("data-theme", "dark");
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    updateThemeToggle();
+    resetCachedStyles();
+  }
+
+  function toggleTheme() {
+    const current = getStoredTheme() || getSystemTheme();
+    const next = current === "dark" ? "light" : "dark";
+    localStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+  }
+
+  function isSidebarOverlay() {
+    if (window.matchMedia) {
+      return window.matchMedia(`(max-width: ${SIDEBAR_BREAKPOINT}px)`).matches;
+    }
+    return window.innerWidth <= SIDEBAR_BREAKPOINT;
+  }
+
+  function setSidebarOpen(open, { persist = true } = {}) {
+    if (!content || !sidebar) return;
+    if (!isSidebarOverlay()) {
+      content.classList.remove("sidebar-open");
+      sidebar.setAttribute("aria-hidden", "false");
+      if (btnSidebarToggle) btnSidebarToggle.setAttribute("aria-expanded", "true");
+      return;
+    }
+    content.classList.toggle("sidebar-open", open);
+    sidebar.setAttribute("aria-hidden", open ? "false" : "true");
+    if (btnSidebarToggle) btnSidebarToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    if (persist) localStorage.setItem(SIDEBAR_OPEN_KEY, open ? "1" : "0");
+  }
+
+  function syncSidebarLayout({ preserveOpen = true } = {}) {
+    if (!content || !sidebar) return;
+    if (!isSidebarOverlay()) {
+      content.classList.remove("sidebar-open");
+      sidebar.setAttribute("aria-hidden", "false");
+      if (btnSidebarToggle) btnSidebarToggle.setAttribute("aria-expanded", "true");
+      return;
+    }
+    const open = preserveOpen ? content.classList.contains("sidebar-open") : localStorage.getItem(SIDEBAR_OPEN_KEY) === "1";
+    setSidebarOpen(open, { persist: false });
+  }
+
+  function refreshUiTexts() {
+    setWsStatus(state.wsConnected);
+    setRecording(state.isRecording, state.sessionId);
+    updateModelPill();
+    updateThemeToggle();
+    updateAsrNowLine();
+    updateCursorInspector();
+    renderModelEnvBox();
+    renderModelCheckBox();
+    renderLlmModelsSelect();
+    renderAsrModelsSelect();
+    if (state.report.lastStats) {
+      renderReportKpis(state.report.lastStats);
+      renderReportBody(state.report.lastStats);
+    }
+    scheduleStudentListRender();
+    scheduleRender({ preview: true, timeline: true });
+  }
+
   // Performance: Cache font family to avoid getComputedStyle in render loop
   let _cachedFontFamily = null;
   function getCachedFontFamily() {
@@ -211,6 +381,42 @@
       _cachedFontFamily = getComputedStyle(document.body).fontFamily;
     }
     return _cachedFontFamily;
+  }
+
+  let _cachedTimelinePalette = null;
+  function resetCachedStyles() {
+    _cachedTimelinePalette = null;
+    _cachedFontFamily = null;
+  }
+  function getTimelinePalette() {
+    if (!_cachedTimelinePalette) {
+      const style = getComputedStyle(document.documentElement);
+      const pick = (name, fallback) => {
+        const v = style.getPropertyValue(name);
+        return v ? v.trim() : fallback;
+      };
+      _cachedTimelinePalette = {
+        bg: pick("--panel", "rgba(255,255,255,0.03)"),
+        rowBg: pick("--bg-elev", "rgba(255,255,255,0.10)"),
+        grid: pick("--border", "rgba(255,255,255,0.10)"),
+        text: pick("--text", "#fff"),
+        muted: pick("--muted", "rgba(255,255,255,0.65)"),
+      };
+    }
+    return _cachedTimelinePalette;
+  }
+
+  const _colorSchemeQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  if (_colorSchemeQuery) {
+    const resetPalette = () => {
+      resetCachedStyles();
+      if (!getStoredTheme()) updateThemeToggle();
+    };
+    if (typeof _colorSchemeQuery.addEventListener === "function") {
+      _colorSchemeQuery.addEventListener("change", resetPalette);
+    } else if (typeof _colorSchemeQuery.addListener === "function") {
+      _colorSchemeQuery.addListener(resetPalette);
+    }
   }
 
   // Performance: Binary search for finding first visible ASR segment
@@ -242,7 +448,7 @@
     const closeBtn = document.createElement("button");
     closeBtn.className = "toast-close";
     closeBtn.textContent = "\u00d7";
-    closeBtn.title = "关闭";
+    closeBtn.title = t("关闭");
     closeBtn.addEventListener("click", () => {
       toast.classList.add("fade-out");
       setTimeout(() => toast.remove(), 300);
@@ -269,7 +475,7 @@
   function startRecordingTimer() {
     state.recordingStartTime = Date.now();
     if (recTimer) {
-      recTimer.style.display = "inline";
+      recTimer.classList.remove("is-hidden");
       recTimer.textContent = "00:00";
     }
     state.recordingTimerId = setInterval(() => {
@@ -285,18 +491,82 @@
       state.recordingTimerId = null;
     }
     state.recordingStartTime = null;
-    if (recTimer) recTimer.style.display = "none";
+    if (recTimer) recTimer.classList.add("is-hidden");
   }
 
   // ===== Button Loading State =====
   function setButtonLoading(btn, loading) {
     if (!btn) return;
     if (loading) {
+      if (btn.dataset.loadingPrevDisabled == null) {
+        btn.dataset.loadingPrevDisabled = btn.disabled ? "1" : "0";
+      }
       btn.classList.add("loading");
       btn.disabled = true;
     } else {
       btn.classList.remove("loading");
+      if (btn.dataset.loadingPrevDisabled != null) {
+        btn.disabled = btn.dataset.loadingPrevDisabled === "1";
+        delete btn.dataset.loadingPrevDisabled;
+      }
     }
+  }
+
+  const FOCUSABLE_SELECTOR = "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])";
+  const modalFocusState = new WeakMap();
+
+  function getFocusableElements(container) {
+    if (!container) return [];
+    return Array.from(container.querySelectorAll(FOCUSABLE_SELECTOR)).filter((el) => {
+      if (el.disabled) return false;
+      if (el.getAttribute("aria-hidden") === "true") return false;
+      return el.getClientRects().length > 0;
+    });
+  }
+
+  function trapModalFocus(modal, initialFocusEl) {
+    if (!modal) return;
+    const focusable = getFocusableElements(modal);
+    const first = (initialFocusEl && focusable.includes(initialFocusEl)) ? initialFocusEl : focusable[0];
+    const last = focusable[focusable.length - 1];
+    const prevActive = document.activeElement;
+    if (first) {
+      try {
+        first.focus({ preventScroll: true });
+      } catch (_) {
+        first.focus();
+      }
+    }
+    const handler = (e) => {
+      if (e.key !== "Tab") return;
+      if (!focusable.length) return;
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !modal.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    modal.addEventListener("keydown", handler);
+    modalFocusState.set(modal, { handler, prevActive });
+  }
+
+  function releaseModalFocus(modal) {
+    const st = modalFocusState.get(modal);
+    if (!st) return;
+    modal.removeEventListener("keydown", st.handler);
+    if (st.prevActive && document.contains(st.prevActive)) {
+      try {
+        st.prevActive.focus({ preventScroll: true });
+      } catch (_) {
+        st.prevActive.focus();
+      }
+    }
+    modalFocusState.delete(modal);
   }
 
   // ===== LLM Section Disabled State =====
@@ -570,17 +840,27 @@
   let rafId = null;
   let needsPreview = false;
   let needsTimeline = false;
+  let lastRenderMs = 0;
+  const MIN_RENDER_INTERVAL = 1000 / 30;
+
+  function renderLoop(now) {
+    rafId = null;
+    if (now - lastRenderMs < MIN_RENDER_INTERVAL) {
+      rafId = requestAnimationFrame(renderLoop);
+      return;
+    }
+    lastRenderMs = now;
+    if (needsPreview) drawPreview();
+    if (needsTimeline) renderTimeline();
+    needsPreview = false;
+    needsTimeline = false;
+  }
+
   function scheduleRender({ preview = false, timeline = false } = {}) {
     needsPreview = needsPreview || preview;
     needsTimeline = needsTimeline || timeline;
     if (rafId != null) return;
-    rafId = requestAnimationFrame(() => {
-      rafId = null;
-      if (needsPreview) drawPreview();
-      if (needsTimeline) renderTimeline();
-      needsPreview = false;
-      needsTimeline = false;
-    });
+    rafId = requestAnimationFrame(renderLoop);
   }
 
   function toNum(v, fallback = 0) {
@@ -590,15 +870,15 @@
 
   function formatSec(sec) {
     const v = Math.max(0, Number(sec) || 0);
-    return `${v.toFixed(2)}s`;
+    return t("{sec}s", { sec: v.toFixed(2) });
   }
 
   function formatDuration(sec) {
     const v = Math.max(0, Number(sec) || 0);
-    if (v < 60) return `${v.toFixed(1)}s`;
+    if (v < 60) return t("{sec}s", { sec: v.toFixed(1) });
     const m = Math.floor(v / 60);
     const s = v - m * 60;
-    return `${m}m ${s.toFixed(0)}s`;
+    return t("{min}m {sec}s", { min: m, sec: s.toFixed(0) });
   }
 
   function escapeHtml(str) {
@@ -621,24 +901,24 @@
   function stateLabel(s) {
     switch (s) {
       case "awake":
-        return "清醒";
+        return t("清醒");
       case "drowsy":
-        return "瞌睡";
+        return t("瞌睡");
       case "down":
-        return "低头";
+        return t("低头");
       case "drowsy+down":
-        return "瞌睡+低头";
+        return t("瞌睡+低头");
       default:
-        return "未知";
+        return t("未知");
     }
   }
 
   function intervalTypeLabel(t) {
     const v = String(t || "").toUpperCase();
-    if (v === "INATTENTIVE") return "走神/疑似睡觉";
-    if (v === "DROWSY") return "睡觉（闭眼）";
-    if (v === "LOOKING_DOWN") return "低头";
-    if (v === "NOT_VISIBLE") return "眼睛不可见（趴下/遮挡）";
+    if (v === "INATTENTIVE") return t("走神/疑似睡觉");
+    if (v === "DROWSY") return t("睡觉（闭眼）");
+    if (v === "LOOKING_DOWN") return t("低头");
+    if (v === "NOT_VISIBLE") return t("眼睛不可见（趴下/遮挡）");
     return v || "UNKNOWN";
   }
 
@@ -657,9 +937,23 @@
     }
   }
 
+  function textClassForState(s) {
+    switch (normalizeState(s)) {
+      case "awake":
+        return "ok-text";
+      case "drowsy":
+        return "warn-text";
+      case "down":
+      case "drowsy+down":
+        return "danger-text";
+      default:
+        return "muted";
+    }
+  }
+
   function setWsStatus(connected) {
     state.wsConnected = connected;
-    wsStatus.textContent = connected ? "connected" : "disconnected";
+    wsStatus.textContent = connected ? t("connected") : t("disconnected");
     wsDot.className = `dot ${connected ? "good" : "unknown"}`;
   }
 
@@ -671,10 +965,10 @@
     btnStart.disabled = state.isRecording;
     btnStop.disabled = !state.isRecording;
     btnReport.disabled = state.isRecording || !state.sessionId;
-    btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
+    btnOpenReport.classList.toggle("is-hidden", !state.report.lastStatsUrl);
     btnModelCenter.disabled = state.isRecording;
 
-    recStatusText.textContent = state.isRecording ? "recording" : "idle";
+    recStatusText.textContent = state.isRecording ? t("recording") : t("idle");
     recDot.className = `dot ${state.isRecording ? "bad pulse" : "unknown"}`;
 
     // Handle recording timer
@@ -686,19 +980,18 @@
 
     if (state.sessionId) {
       sessionIdText.textContent = state.sessionId;
-      sessionIdText.style.display = "inline";
-      sessionIdText.className = "mono";
+      sessionIdText.classList.remove("is-hidden");
     } else {
-      sessionIdText.style.display = "none";
+      sessionIdText.classList.add("is-hidden");
     }
   }
 
   // Performance: Cache canvas sizes and only recheck on resize
   const _canvasSizeCache = new WeakMap();
-  let _canvasSizeDirty = true;
+  let _canvasSizeEpoch = 0;
   
   function markCanvasSizeDirty() {
-    _canvasSizeDirty = true;
+    _canvasSizeEpoch += 1;
   }
   
   // Listen for resize events to invalidate cache
@@ -709,7 +1002,7 @@
     const cached = _canvasSizeCache.get(canvas);
     
     // Only call getBoundingClientRect if dirty or no cache
-    if (!_canvasSizeDirty && cached && canvas.width === cached.w && canvas.height === cached.h) {
+    if (cached && cached.epoch === _canvasSizeEpoch && canvas.width === cached.w && canvas.height === cached.h) {
       return false;
     }
     
@@ -717,15 +1010,13 @@
     const w = Math.max(1, Math.round(rect.width * dpr));
     const h = Math.max(1, Math.round(rect.height * dpr));
     
-    _canvasSizeCache.set(canvas, { w, h });
+    _canvasSizeCache.set(canvas, { w, h, epoch: _canvasSizeEpoch });
     
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
-      _canvasSizeDirty = false;
       return true;
     }
-    _canvasSizeDirty = false;
     return false;
   }
 
@@ -785,15 +1076,124 @@
     }
   }
 
-  function ensureStudent(id) {
-    const sid = String(id);
-    const existing = state.students.get(sid);
-    if (existing) return existing;
+  const STUDENT_LIST_OVERSCAN = 6;
+  const DEFAULT_STUDENT_ROW_HEIGHT = 78;
+  let studentListRenderId = null;
 
+  function compareStudentId(a, b) {
+    const na = Number(a);
+    const nb = Number(b);
+    const fa = Number.isFinite(na);
+    const fb = Number.isFinite(nb);
+    if (fa && fb) return na - nb;
+    if (fa && !fb) return -1;
+    if (!fa && fb) return 1;
+    return String(a).localeCompare(String(b), "zh-Hans-CN", { numeric: true });
+  }
+
+  function initStudentListView() {
+    if (!studentList || state.studentListView) return;
+    const placeholder = document.getElementById("studentListPlaceholder");
+    const spacer = document.createElement("div");
+    spacer.className = "student-list-spacer";
+    const items = document.createElement("div");
+    items.className = "student-list-items";
+    studentList.appendChild(spacer);
+    studentList.appendChild(items);
+    const gapStr = getComputedStyle(studentList).getPropertyValue("--student-gap");
+    const gap = Number.parseFloat(gapStr) || 10;
+    state.studentListView = {
+      ids: [],
+      filteredIds: [],
+      filterQuery: "",
+      rowHeight: null,
+      gap,
+      overscan: STUDENT_LIST_OVERSCAN,
+      spacer,
+      items,
+      placeholder,
+    };
+    studentList.addEventListener("scroll", () => {
+      scheduleStudentListRender();
+    });
+  }
+
+  function updateFilteredStudentIds() {
+    const view = state.studentListView;
+    if (!view) return [];
+    const q = String(view.filterQuery || "").trim().toLowerCase();
+    if (!q) {
+      view.filteredIds = view.ids.slice();
+    } else {
+      view.filteredIds = view.ids.filter((sid) => String(sid).toLowerCase().includes(q));
+    }
+    return view.filteredIds;
+  }
+
+  function scheduleStudentListRender() {
+    if (!studentList || !state.studentListView) return;
+    if (studentListRenderId != null) return;
+    studentListRenderId = requestAnimationFrame(() => {
+      studentListRenderId = null;
+      renderStudentListWindow();
+    });
+  }
+
+  function renderStudentListWindow() {
+    const view = state.studentListView;
+    if (!view || !studentList) return;
+    const ids = Array.isArray(view.filteredIds) ? view.filteredIds : view.ids;
+    const total = ids.length;
+    if (view.placeholder) {
+      view.placeholder.classList.toggle("is-hidden", total > 0);
+      if (!view.placeholder.classList.contains("is-hidden")) {
+        view.placeholder.textContent = view.filterQuery ? t("没有匹配的学生。") : t("等待人脸轨迹数据…");
+      }
+    }
+    if (total === 0) {
+      view.spacer.style.height = "0px";
+      view.items.textContent = "";
+      return;
+    }
+
+    const scrollTop = studentList.scrollTop;
+    const viewportHeight = studentList.clientHeight || 0;
+    const rowHeight = view.rowHeight || DEFAULT_STUDENT_ROW_HEIGHT;
+    const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - view.overscan);
+    const endIndex = Math.min(total, Math.ceil((scrollTop + viewportHeight) / rowHeight) + view.overscan);
+    view.spacer.style.height = `${total * rowHeight}px`;
+    view.items.style.transform = `translateY(${startIndex * rowHeight}px)`;
+
+    view.items.textContent = "";
+    let didMeasure = false;
+    for (let i = startIndex; i < endIndex; i++) {
+      const sid = ids[i];
+      const s = state.students.get(sid);
+      if (!s) continue;
+      if (!s.dom) {
+        s.dom = createStudentDom(s);
+      }
+      s.dom.card.classList.toggle("selected", s.id === state.selectedStudentId);
+      updateStudentDom(s, { force: true });
+      view.items.appendChild(s.dom.card);
+      if (!view.rowHeight) {
+        const rect = s.dom.card.getBoundingClientRect();
+        if (rect.height > 0) {
+          view.rowHeight = rect.height + view.gap;
+          didMeasure = true;
+        }
+      }
+    }
+    if (didMeasure) scheduleStudentListRender();
+  }
+
+  function createStudentDom(s) {
+    const sid = s.id;
     const card = document.createElement("button");
     card.type = "button";
     card.className = "student-card";
     card.dataset.sid = sid;
+    card.setAttribute("role", "listitem");
 
     const avatar = document.createElement("canvas");
     avatar.className = "avatar";
@@ -808,15 +1208,16 @@
 
     const name = document.createElement("div");
     name.className = "student-name";
-    name.textContent = `学生 ${sid}`;
+    name.textContent = t("学生 {sid}", { sid });
 
     const badge = document.createElement("span");
     badge.className = "badge";
     // Performance: Create elements separately to avoid innerHTML updates later
     const badgeDot = document.createElement("span");
     badgeDot.className = "dot unknown";
+    badgeDot.setAttribute("aria-hidden", "true");
     const badgeLabel = document.createElement("span");
-    badgeLabel.textContent = "未知";
+    badgeLabel.textContent = t("未知");
     badge.appendChild(badgeDot);
     badge.appendChild(badgeLabel);
 
@@ -828,19 +1229,22 @@
 
     // Performance: Create code elements separately to update textContent instead of innerHTML
     const metaSeen = document.createElement("span");
-    metaSeen.appendChild(document.createTextNode("last "));
+    const metaSeenLabel = document.createTextNode(`${t("last")} `);
+    metaSeen.appendChild(metaSeenLabel);
     const metaSeenCode = document.createElement("code");
     metaSeenCode.textContent = "—";
     metaSeen.appendChild(metaSeenCode);
 
     const metaEar = document.createElement("span");
-    metaEar.appendChild(document.createTextNode("EAR "));
+    const metaEarLabel = document.createTextNode(`${t("EAR")} `);
+    metaEar.appendChild(metaEarLabel);
     const metaEarCode = document.createElement("code");
     metaEarCode.textContent = "—";
     metaEar.appendChild(metaEarCode);
 
     const metaPitch = document.createElement("span");
-    metaPitch.appendChild(document.createTextNode("pitch "));
+    const metaPitchLabel = document.createTextNode(`${t("pitch")} `);
+    metaPitch.appendChild(metaPitchLabel);
     const metaPitchCode = document.createElement("code");
     metaPitchCode.textContent = "—";
     metaPitch.appendChild(metaPitchCode);
@@ -859,6 +1263,51 @@
       selectStudent(sid);
     });
 
+    return { card, avatar, name, badge, badgeDot, badgeLabel, metaSeenLabel, metaEarLabel, metaPitchLabel, metaSeenCode, metaEarCode, metaPitchCode };
+  }
+
+  function insertStudentIdSorted(sid) {
+    const view = state.studentListView;
+    if (!view) return;
+    if (view.ids.includes(sid)) return;
+    let lo = 0;
+    let hi = view.ids.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (compareStudentId(sid, view.ids[mid]) < 0) hi = mid;
+      else lo = mid + 1;
+    }
+    view.ids.splice(lo, 0, sid);
+    updateFilteredStudentIds();
+  }
+
+  function removeStudentById(sid) {
+    const s = state.students.get(sid);
+    if (s?.dom?.card) {
+      s.dom.card.remove();
+    }
+    state.students.delete(sid);
+    const view = state.studentListView;
+    if (view) {
+      const idx = view.ids.indexOf(sid);
+      if (idx >= 0) view.ids.splice(idx, 1);
+      if (view.filteredIds) {
+        const fidx = view.filteredIds.indexOf(sid);
+        if (fidx >= 0) view.filteredIds.splice(fidx, 1);
+      }
+    }
+    if (state.selectedStudentId === sid) {
+      state.selectedStudentId = null;
+      selectedStudentText.textContent = "—";
+    }
+    scheduleStudentListRender();
+  }
+
+  function ensureStudent(id) {
+    const sid = String(id);
+    const existing = state.students.get(sid);
+    if (existing) return existing;
+
     const student = {
       id: sid,
       state: "unknown",
@@ -868,44 +1317,33 @@
       pitch: null,
       blinkCount: 0,
       history: [],
-      dom: { card, avatar, name, badge, badgeDot, badgeLabel, metaSeenCode, metaEarCode, metaPitchCode },
+      dom: null,
       lastAvatarTs: -1e9,
     };
 
     state.students.set(sid, student);
-    if (!studentList.querySelector(".student-card")) {
-      studentList.innerHTML = "";
-    }
-    insertStudentCardSorted(card);
+    insertStudentIdSorted(sid);
     if (!state.selectedStudentId) selectStudent(sid);
+    scheduleStudentListRender();
     return student;
-  }
-
-  function insertStudentCardSorted(card) {
-    const sid = card.dataset.sid || "";
-    const sidNum = Number(sid);
-    const children = Array.from(studentList.querySelectorAll(".student-card"));
-    const idx = children.findIndex((el) => {
-      const other = el.dataset.sid || "";
-      const otherNum = Number(other);
-      if (Number.isFinite(sidNum) && Number.isFinite(otherNum)) return sidNum < otherNum;
-      return sid.localeCompare(other) < 0;
-    });
-    if (idx === -1) studentList.appendChild(card);
-    else studentList.insertBefore(card, children[idx]);
   }
 
   function selectStudent(sid) {
     state.selectedStudentId = sid;
-    selectedStudentText.textContent = sid ? `学生 ${sid}` : "—";
-
-    for (const s of state.students.values()) {
-      s.dom.card.classList.toggle("selected", s.id === sid);
-    }
+    selectedStudentText.textContent = sid ? t("学生 {sid}", { sid }) : "—";
+    scheduleStudentListRender();
     scheduleRender({ timeline: true });
   }
 
-  function updateStudentDom(s) {
+  function updateStudentDom(s, { force = false } = {}) {
+    if (!s?.dom?.card) return;
+    if (!force && !s.dom.card.isConnected) return;
+    if (s.dom.name) {
+      s.dom.name.textContent = t("学生 {sid}", { sid: s.id });
+    }
+    if (s.dom.metaSeenLabel) s.dom.metaSeenLabel.textContent = `${t("last")} `;
+    if (s.dom.metaEarLabel) s.dom.metaEarLabel.textContent = `${t("EAR")} `;
+    if (s.dom.metaPitchLabel) s.dom.metaPitchLabel.textContent = `${t("pitch")} `;
     const st = normalizeState(s.state);
     const dotCls = dotClassForState(st);
     const badgeText = stateLabel(st);
@@ -920,6 +1358,7 @@
   }
 
   function maybeUpdateAvatar(s, img) {
+    if (!s?.dom?.avatar || !s.dom.avatar.isConnected) return;
     if (!img || !s.bbox || !Array.isArray(s.bbox) || s.bbox.length < 4) return;
     const now = state.nowSec;
     if (now - s.lastAvatarTs < 0.8) return;
@@ -1002,14 +1441,10 @@
       const staleThreshold = state.nowSec - 60;
       for (const [sid, s] of state.students.entries()) {
         if ((s.lastSeen || 0) < staleThreshold) {
-          s.dom.card.remove();
-          state.students.delete(sid);
-          if (state.selectedStudentId === sid) {
-            state.selectedStudentId = null;
-            selectedStudentText.textContent = "—";
-          }
+          removeStudentById(sid);
         }
       }
+      scheduleStudentListRender();
     }
 
     // Update live ASR line if available
@@ -1155,15 +1590,15 @@
 
   function updateAsrNowLine() {
     if (!state.showAsr) {
-      asrNowText.textContent = "（ASR 已关闭）";
+      asrNowText.textContent = t("（ASR 已关闭）");
       return;
     }
     const seg = findAsrAt(state.nowSec);
     if (!seg || !seg.text) {
-      asrNowText.textContent = "（暂无 ASR 段）";
+      asrNowText.textContent = t("（暂无 ASR 段）");
       return;
     }
-    const prefix = seg.label === "teacher" ? "老师：" : "学生：";
+    const prefix = seg.label === "teacher" ? t("老师：") : t("学生：");
     asrNowText.textContent = `${prefix}${seg.text}`;
   }
 
@@ -1183,16 +1618,17 @@
     const W = timelineCanvas.width;
     const H = timelineCanvas.height;
     timelineCtx.clearRect(0, 0, W, H);
+    const palette = getTimelinePalette();
 
     const endT = state.followLive ? state.nowSec : state.cursorTime ?? state.nowSec;
     const startT = endT - state.windowSec;
 
     // background
-    timelineCtx.fillStyle = "rgba(255,255,255,0.03)";
+    timelineCtx.fillStyle = palette.bg;
     timelineCtx.fillRect(0, 0, W, H);
 
     // grid / axis
-    timelineCtx.strokeStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.strokeStyle = palette.grid;
     timelineCtx.lineWidth = 1;
     timelineCtx.beginPath();
     const step = state.windowSec >= 300 ? 30 : state.windowSec >= 120 ? 10 : 5;
@@ -1205,7 +1641,7 @@
 
     const dpr = window.devicePixelRatio || 1;
     timelineCtx.font = `${Math.max(11, Math.round(12 * dpr))}px ${getCachedFontFamily()}`;
-    timelineCtx.fillStyle = "rgba(255,255,255,0.65)";
+    timelineCtx.fillStyle = palette.muted;
     timelineCtx.textBaseline = "top";
     for (let t = Math.ceil(startT / step) * step; t <= endT; t += step) {
       const x = ((t - startT) / state.windowSec) * W;
@@ -1222,7 +1658,7 @@
     // selected student state segments
     const sid = state.selectedStudentId;
     const s = sid ? state.students.get(sid) : null;
-    timelineCtx.fillStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.fillStyle = palette.rowBg;
     timelineCtx.fillRect(0, rowStateY, W, rowStateH);
 
     if (s && Array.isArray(s.history) && s.history.length > 0) {
@@ -1245,14 +1681,14 @@
       timelineCtx.fillStyle = "rgba(0,0,0,0.45)";
       timelineCtx.fillRect(10 * dpr, rowStateY + 10 * dpr, 150 * dpr, 22 * dpr);
       timelineCtx.fillStyle = "#fff";
-      timelineCtx.fillText(`学生 ${sid} 状态`, 16 * dpr, rowStateY + 14 * dpr);
+      timelineCtx.fillText(t("学生 {sid} 状态", { sid }), 16 * dpr, rowStateY + 14 * dpr);
     } else {
-      timelineCtx.fillStyle = "rgba(255,255,255,0.55)";
-      timelineCtx.fillText("未选择学生或暂无状态数据", 14 * dpr, rowStateY + 14 * dpr);
+      timelineCtx.fillStyle = palette.muted;
+      timelineCtx.fillText(t("未选择学生或暂无状态数据"), 14 * dpr, rowStateY + 14 * dpr);
     }
 
     // ASR row
-    timelineCtx.fillStyle = "rgba(255,255,255,0.10)";
+    timelineCtx.fillStyle = palette.rowBg;
     timelineCtx.fillRect(0, rowAsrY, W, rowAsrH);
 
     if (state.showAsr && state.asrSegments.length > 0) {
@@ -1275,16 +1711,16 @@
       timelineCtx.fillStyle = "rgba(0,0,0,0.45)";
       timelineCtx.fillRect(10 * dpr, rowAsrY + 8 * dpr, 150 * dpr, 22 * dpr);
       timelineCtx.fillStyle = "#fff";
-      timelineCtx.fillText("ASR 讲解", 16 * dpr, rowAsrY + 12 * dpr);
+      timelineCtx.fillText(t("ASR 讲解"), 16 * dpr, rowAsrY + 12 * dpr);
 
       if (segNow && segNow.text) {
-        timelineCtx.fillStyle = "rgba(255,255,255,0.70)";
+        timelineCtx.fillStyle = palette.text;
         const snippet = segNow.text.length > 28 ? `${segNow.text.slice(0, 28)}…` : segNow.text;
         timelineCtx.fillText(snippet, 170 * dpr, rowAsrY + 12 * dpr);
       }
     } else {
-      timelineCtx.fillStyle = "rgba(255,255,255,0.55)";
-      timelineCtx.fillText(state.showAsr ? "暂无 ASR 段（可通过 /push 注入 asr_segment）" : "ASR 显示已关闭", 14 * dpr, rowAsrY + 12 * dpr);
+      timelineCtx.fillStyle = palette.muted;
+      timelineCtx.fillText(state.showAsr ? t("暂无 ASR 段（可通过 /push 注入 asr_segment）") : t("ASR 显示已关闭"), 14 * dpr, rowAsrY + 12 * dpr);
     }
 
     // cursor marker
@@ -1304,15 +1740,15 @@
 
   function updateCursorInspector() {
     if (state.cursorTime == null) {
-      cursorInspector.style.display = "none";
+      cursorInspector.classList.add("is-hidden");
       btnClearCursor.disabled = true;
-      btnFollow.textContent = "跟随实时";
+      btnFollow.textContent = t("跟随实时");
       return;
     }
 
     btnClearCursor.disabled = false;
-    btnFollow.textContent = "回到实时";
-    cursorInspector.style.display = "flex";
+    btnFollow.textContent = t("回到实时");
+    cursorInspector.classList.remove("is-hidden");
 
     const t = state.cursorTime;
     cursorTimeText.textContent = formatSec(t);
@@ -1321,7 +1757,7 @@
     const s = sid ? state.students.get(sid) : null;
     const st = getStudentStateAt(s, t);
     cursorStateText.textContent = stateLabel(st);
-    cursorStateText.className = dotClassForState(st) === "good" ? "ok-text" : dotClassForState(st) === "warn" ? "warn-text" : "danger-text";
+    cursorStateText.className = textClassForState(st);
 
     const seg = state.showAsr ? findAsrAt(t) : null;
     cursorAsrText.textContent = seg && seg.text ? seg.text : "—";
@@ -1332,10 +1768,20 @@
     state.selectedStudentId = null;
     state.asrSegments = [];
     state.lastFrame = { image: null, ts: 0, faces: [], b64: null };
-    studentList.innerHTML = `<div class="muted" style="padding:8px 4px;">等待人脸轨迹数据…</div>`;
+    if (state.studentListView) {
+      state.studentListView.ids = [];
+      state.studentListView.filteredIds = [];
+      state.studentListView.rowHeight = null;
+      state.studentListView.items.textContent = "";
+      state.studentListView.spacer.style.height = "0px";
+      if (state.studentListView.placeholder) {
+        state.studentListView.placeholder.classList.remove("is-hidden");
+        state.studentListView.placeholder.textContent = t("等待人脸轨迹数据…");
+      }
+    }
     selectedStudentText.textContent = "—";
     nowText.textContent = "0.00s";
-    asrNowText.textContent = "（暂无 ASR 段）";
+    asrNowText.textContent = t("（暂无 ASR 段）");
     state.cursorTime = null;
     state.followLive = true;
     updateCursorInspector();
@@ -1377,40 +1823,42 @@
     const cfg = state.models.config;
     if (!cfg) {
       modelDot.className = "dot unknown";
-      modelStatusText.textContent = "模型设置";
+      modelStatusText.textContent = t("模型设置");
       return;
     }
 
     const mode = String(cfg.mode || "offline");
     if (mode === "offline") {
       modelDot.className = "dot warn";
-      modelStatusText.textContent = state.models.dirty ? "模型设置*" : "模型设置";
+      modelStatusText.textContent = `${t("模型设置")}${state.models.dirty ? "*" : ""}`;
       return;
     }
 
     const check = state.models.lastCheck;
     if (!check) {
       modelDot.className = "dot unknown";
-      modelStatusText.textContent = state.models.dirty ? "模型设置*" : "模型设置";
+      modelStatusText.textContent = `${t("模型设置")}${state.models.dirty ? "*" : ""}`;
       return;
     }
 
     const llmOk = isOkOrSkipped(check.llm);
     const asrOk = isOkOrSkipped(check.asr);
     modelDot.className = `dot ${llmOk && asrOk ? "good" : "bad"}`;
-    modelStatusText.textContent = `模型设置${state.models.dirty ? "*" : ""}`;
+    modelStatusText.textContent = `${t("模型设置")}${state.models.dirty ? "*" : ""}`;
   }
 
   function renderModelEnvBox() {
     const env = state.models.env;
     if (!env) {
-      modelEnvBox.textContent = "（未加载 env 信息）";
+      modelEnvBox.textContent = t("（未加载 env 信息）");
       return;
     }
+    const yesText = t("yes");
+    const noText = t("no");
     const chips = [
-      `OpenAI key: ${env.has_openai_key ? "yes" : "no"}`,
-      `DashScope key: ${env.has_dashscope_key ? "yes" : "no"}`,
-      `Xfyun: ${env.has_xfyun ? "yes" : "no"}`,
+      t("OpenAI key: {value}", { value: env.has_openai_key ? yesText : noText }),
+      t("DashScope key: {value}", { value: env.has_dashscope_key ? yesText : noText }),
+      t("Xfyun: {value}", { value: env.has_xfyun ? yesText : noText }),
     ]
       .map((t) => `<span class="chip">${escapeHtml(t)}</span>`)
       .join("");
@@ -1426,7 +1874,7 @@
 
   function renderModelCheckBox() {
     if (state.models.checking) {
-      modelCheckBox.textContent = "检测中…";
+      modelCheckBox.textContent = t("检测中…");
       return;
     }
     const cfg = state.models.config || {};
@@ -1446,12 +1894,13 @@
     const r = state.models.lastCheck;
     if (!r) {
       const chips = [];
-      chips.push(`mode: ${mode}`);
-      chips.push(llmEnabled ? `llm: on${llmModel ? ` (${llmModel})` : ""}` : "llm: off");
+      chips.push(t("mode: {mode}", { mode }));
+      chips.push(llmEnabled ? `${t("llm: on")}${llmModel ? ` (${llmModel})` : ""}` : t("llm: off"));
       if (asrProvider && asrProvider !== "none") {
-        chips.push(`asr: ${asrProvider}${asrProvider !== "xfyun_raasr" && asrModel ? ` (${asrModel})` : ""}`);
+        const base = t("asr: {provider}", { provider: asrProvider });
+        chips.push(asrProvider !== "xfyun_raasr" && asrModel ? `${base} (${asrModel})` : base);
       } else {
-        chips.push("asr: none");
+        chips.push(t("asr: none"));
       }
 
       const hints = [];
@@ -1460,35 +1909,35 @@
       const envDefaultAsrModel = String(env.openai_asr_model || "whisper-1");
       if (mode === "online") {
         if (llmEnabled) {
-          if (!llmModel) hints.push(`LLM：模型名为空会回退为 ${envDefaultModel}`);
-          if (!llmBaseUrl) hints.push(`LLM：Base URL 为空会回退为 ${envDefaultBaseUrl}`);
-          if (!hasOpenaiKey) hints.push("LLM：缺少 API Key（填写或设置 OPENAI_API_KEY/OPENAI_KEY）");
+          if (!llmModel) hints.push(t("LLM：模型名为空会回退为 {model}", { model: envDefaultModel }));
+          if (!llmBaseUrl) hints.push(t("LLM：Base URL 为空会回退为 {url}", { url: envDefaultBaseUrl }));
+          if (!hasOpenaiKey) hints.push(t("LLM：缺少 API Key（填写或设置 OPENAI_API_KEY/OPENAI_KEY）"));
         }
         if (asrProvider === "openai_compat" && !hasAsrKey) {
           hints.push(asrUseIndep
-            ? "ASR：使用独立设置但缺少 API Key（填写 ASR API Key 或 LLM API Key）"
-            : "ASR：OpenAI-compatible 需要 API Key（填写 LLM API Key 或设置 OPENAI_API_KEY）");
+            ? t("ASR：使用独立设置但缺少 API Key（填写 ASR API Key 或 LLM API Key）")
+            : t("ASR：OpenAI-compatible 需要 API Key（填写 LLM API Key 或设置 OPENAI_API_KEY）"));
         }
         if (asrProvider === "openai_compat" && !asrModel) {
-          hints.push(`ASR：模型名为空会回退为 ${envDefaultAsrModel}`);
+          hints.push(t("ASR：模型名为空会回退为 {model}", { model: envDefaultAsrModel }));
         }
         if (asrProvider === "dashscope" && !env.has_dashscope_key) {
-          hints.push("ASR：DashScope 需要 DASH_SCOPE_API_KEY");
+          hints.push(t("ASR：DashScope 需要 DASH_SCOPE_API_KEY"));
         }
         if (asrProvider === "xfyun_raasr" && !env.has_xfyun) {
-          hints.push("ASR：讯飞需要 XFYUN_APP_ID/XFYUN_SECRET_KEY");
+          hints.push(t("ASR：讯飞需要 XFYUN_APP_ID/XFYUN_SECRET_KEY"));
         }
       }
 
       modelCheckBox.innerHTML = `
         <div class="chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div>
         <div class="muted" style="margin-top:10px; line-height:1.55;">
-          尚未检测。点击“检测”可验证当前配置是否可用。
+          ${escapeHtml(t("尚未检测。点击“检测”可验证当前配置是否可用。"))}
         </div>
         ${
           hints.length
             ? `<div class="muted" style="margin-top:10px; line-height:1.55;">
-                <div><strong>配置提示：</strong></div>
+                <div><strong>${escapeHtml(t("配置提示："))}</strong></div>
                 <div>${hints.slice(0, 8).map((t) => `• ${escapeHtml(t)}`).join("<br/>")}</div>
                </div>`
             : ""
@@ -1505,47 +1954,47 @@
 
     const lines = [];
     const llmLine = llm.skipped
-      ? `LLM: skipped (${llm.reason || "disabled"})`
+      ? t("LLM: skipped ({reason})", { reason: llm.reason || t("disabled") })
       : llmOk
-        ? `LLM: ok${llm.latency_ms != null ? ` (${llm.latency_ms}ms)` : ""}`
-        : `LLM: failed (${llm.error || "unknown"})`;
+        ? t("LLM: ok{latency}", { latency: llm.latency_ms != null ? ` (${llm.latency_ms}ms)` : "" })
+        : t("LLM: failed ({error})", { error: llm.error || t("unknown") });
     const asrLine = asr.skipped
-      ? `ASR: skipped (${asr.reason || "disabled"})`
+      ? t("ASR: skipped ({reason})", { reason: asr.reason || t("disabled") })
       : asrOk
-        ? `ASR: ok${asr.latency_ms != null ? ` (${asr.latency_ms}ms)` : ""}`
-        : `ASR: failed (${asr.error || "unknown"})`;
+        ? t("ASR: ok{latency}", { latency: asr.latency_ms != null ? ` (${asr.latency_ms}ms)` : "" })
+        : t("ASR: failed ({error})", { error: asr.error || t("unknown") });
     lines.push(llmLine);
     lines.push(asrLine);
 
     const suggested = state.models.suggestedMode;
     const dirtyHtml = state.models.dirty
-      ? `<div class="warn-text" style="margin-top:8px;">配置已修改，检测结果可能已过期；建议重新“检测”。</div>`
+      ? `<div class="warn-text" style="margin-top:8px;">${escapeHtml(t("配置已修改，检测结果可能已过期；建议重新“检测”。"))}</div>`
       : "";
     const suggestHtml =
       suggested === "offline"
-        ? `<div class="warn-text" style="margin-top:8px;">建议切换为 offline（录制不受影响，但报告将跳过 ASR/LLM）。</div>`
+        ? `<div class="warn-text" style="margin-top:8px;">${escapeHtml(t("建议切换为 offline（录制不受影响，但报告将跳过 ASR/LLM）。"))}</div>`
         : "";
 
     const hintItems = [];
     if (!llmOk && llmHints.length) {
-      for (const h of llmHints.slice(0, 6)) hintItems.push(`LLM：${String(h)}`);
+      for (const h of llmHints.slice(0, 6)) hintItems.push(t("LLM：{hint}", { hint: String(h) }));
     }
     if (!asrOk && asrHints.length) {
-      for (const h of asrHints.slice(0, 6)) hintItems.push(`ASR：${String(h)}`);
+      for (const h of asrHints.slice(0, 6)) hintItems.push(t("ASR：{hint}", { hint: String(h) }));
     }
     const hintHtml =
       hintItems.length > 0
         ? `<div class="muted" style="margin-top:10px; line-height:1.55;">
-            <div><strong>可用提示：</strong></div>
+            <div><strong>${escapeHtml(t("可用提示："))}</strong></div>
             <div>${hintItems.map((t) => `• ${escapeHtml(t)}`).join("<br/>")}</div>
            </div>`
         : "";
 
     modelCheckBox.innerHTML = `
       <div class="chips">
-        <span class="chip">mode: ${escapeHtml(String(r.mode || ""))}</span>
-        <span class="chip">${escapeHtml(llmOk ? "LLM ✅" : "LLM ❌")}</span>
-        <span class="chip">${escapeHtml(asrOk ? "ASR ✅" : "ASR ❌")}</span>
+        <span class="chip">${escapeHtml(t("mode: {mode}", { mode: String(r.mode || "") }))}</span>
+        <span class="chip">${escapeHtml(llmOk ? t("LLM ✅") : t("LLM ❌"))}</span>
+        <span class="chip">${escapeHtml(asrOk ? t("ASR ✅") : t("ASR ❌"))}</span>
       </div>
       <div class="codebox" style="margin-top:10px;">${escapeHtml(lines.join("\n"))}</div>
       ${hintHtml}
@@ -1596,7 +2045,7 @@
     if (asrBaseUrlInput) asrBaseUrlInput.disabled = busy || !asrUseIndependent;
     if (asrApiKeyInput) asrApiKeyInput.disabled = busy || !asrUseIndependent;
     if (asrIndependentSettings) {
-      asrIndependentSettings.style.display = asrUseIndependent && asrProvider === "openai_compat" ? "" : "none";
+      asrIndependentSettings.classList.toggle("is-hidden", !(asrUseIndependent && asrProvider === "openai_compat"));
     }
 
     btnModelsSave.disabled = busy;
@@ -1612,7 +2061,7 @@
     llmModelSel.innerHTML = "";
     const opt0 = document.createElement("option");
     opt0.value = "";
-    opt0.textContent = models.length ? "选择模型…" : "（点击“拉取模型”）";
+    opt0.textContent = models.length ? t("选择模型…") : t("（点击“拉取模型”）");
     llmModelSel.appendChild(opt0);
 
     for (const id of models) {
@@ -1634,9 +2083,9 @@
       if (state.models.llmModelsError) {
         llmModelsStatus.innerHTML = `<span class="danger-text">${escapeHtml(String(state.models.llmModelsError))}</span>`;
       } else if (models.length) {
-        llmModelsStatus.innerHTML = `<span class="ok-text">已拉取：${escapeHtml(String(models.length))} 个</span>`;
+        llmModelsStatus.innerHTML = `<span class="ok-text">${escapeHtml(t("已拉取：{count} 个", { count: String(models.length) }))}</span>`;
       } else {
-        llmModelsStatus.textContent = "（未拉取）";
+        llmModelsStatus.textContent = t("（未拉取）");
       }
     }
 
@@ -1653,7 +2102,7 @@
     asrModelSel.innerHTML = "";
     const opt0 = document.createElement("option");
     opt0.value = "";
-    opt0.textContent = models.length ? "选择模型…" : "（先在 LLM 拉取模型）";
+    opt0.textContent = models.length ? t("选择模型…") : t("（先在 LLM 拉取模型）");
     asrModelSel.appendChild(opt0);
 
     for (const id of models) {
@@ -1691,7 +2140,7 @@
     state.models.llmModelsLoading = true;
     state.models.llmModelsError = null;
     updateModelFormDisabledState();
-    llmModelsStatus.textContent = "正在拉取可用模型…";
+    llmModelsStatus.innerHTML = `<span class="loading-spinner" aria-hidden="true"></span><span class="sr-only">${escapeHtml(t("正在拉取可用模型…"))}</span>`;
     try {
       const res = await fetchJsonSoft("/api/models/list", {
         method: "POST",
@@ -1703,7 +2152,7 @@
         const err = (j && (j.error || j.detail)) || res.text || `HTTP ${res.status}`;
         const hints = j && Array.isArray(j.hints) ? j.hints : [];
         state.models.llmModelsError = String(err);
-        llmModelsStatus.innerHTML = `<span class="danger-text">拉取失败：${escapeHtml(String(err))}</span>${
+        llmModelsStatus.innerHTML = `<span class="danger-text">${escapeHtml(t("拉取失败：{error}", { error: String(err) }))}</span>${
           hints.length
             ? `<div class="muted" style="margin-top:6px; line-height:1.55;">${hints
                 .slice(0, 6)
@@ -1716,7 +2165,7 @@
       const models = Array.isArray(j.models) ? j.models : [];
       state.models.llmModels = models.map((m) => String(m || "").trim()).filter(Boolean);
       renderLlmModelsSelect();
-      llmModelsStatus.innerHTML = `<span class="ok-text">已拉取：${escapeHtml(String(j.count ?? state.models.llmModels.length))} 个模型</span>`;
+      llmModelsStatus.innerHTML = `<span class="ok-text">${escapeHtml(t("已拉取：{count} 个模型", { count: String(j.count ?? state.models.llmModels.length) }))}</span>`;
     } finally {
       state.models.llmModelsLoading = false;
       updateModelFormDisabledState();
@@ -1814,10 +2263,12 @@
     renderModelCheckBox();
     initModelDrawerPos();
     setModelSettingsView("__all__", { preserveAllScroll: false });
+    trapModalFocus(modelModal, btnModelsClose);
   }
 
   function closeModelModal() {
     modelModal.classList.remove("open");
+    releaseModalFocus(modelModal);
   }
 
   async function ensureModelsReadyBeforeRecording() {
@@ -1846,8 +2297,8 @@
       state.models.suggestedMode = "offline";
       renderModelCheckBox();
       updateModelPill();
-      const ok = confirm(`模型检测请求失败：${String(e)}\n\n是否切换 offline 继续录制？`);
-      if (!ok) throw new Error(`模型检测失败，已取消开始录制：${String(e)}`);
+      const ok = confirm(t("模型检测请求失败：{error}\n\n是否切换 offline 继续录制？", { error: String(e) }));
+      if (!ok) throw new Error(t("模型检测失败，已取消开始录制：{error}", { error: String(e) }));
 
       const cur = state.models.config || {};
       state.models.config = {
@@ -1863,8 +2314,8 @@
     }
 
     if (String(chk?.suggested_mode || "") === "offline") {
-      const ok = confirm("模型检测未通过，建议切换 offline 继续录制（仍会录制音视频并生成 CV 统计）。\n\n确定切换为 offline 吗？");
-      if (!ok) throw new Error("模型不可用，已取消开始录制。");
+      const ok = confirm(t("模型检测未通过，建议切换 offline 继续录制（仍会录制音视频并生成 CV 统计）。\n\n确定切换为 offline 吗？"));
+      if (!ok) throw new Error(t("模型不可用，已取消开始录制。"));
 
       state.models.config = {
         ...cfg,
@@ -1892,9 +2343,10 @@
       clearAllLiveState();
       setRecording(true, j.session_id);
       state.report.lastStatsUrl = null;
+      state.report.lastStats = null;
       state.report.lastSessionId = j.session_id;
-      btnOpenReport.style.display = "none";
-      showToast("录制已开始", "success");
+      btnOpenReport.classList.add("is-hidden");
+      showToast(t("录制已开始"), "success");
       if (j.model_config) {
         state.models.config = j.model_config;
         state.models.dirty = false;
@@ -1913,9 +2365,9 @@
       const j = await fetchJson("/api/session/stop", { method: "POST" });
       if (!j || !j.ok) throw new Error(j?.error || "stop failed");
       if (j.warning) {
-        showToast(`录制已停止，但视频存在问题：${j.warning}`, "warning", 6000);
+        showToast(t("录制已停止，但视频存在问题：{warning}", { warning: j.warning }), "warning", 6000);
       } else {
-        showToast("录制已停止", "success");
+        showToast(t("录制已停止"), "success");
       }
       setRecording(false, state.sessionId);
       btnReport.disabled = !state.sessionId;
@@ -1929,10 +2381,12 @@
   function openReportModal() {
     reportModal.classList.add("open");
     initReportDrawerPos();
+    trapModalFocus(reportModal, btnCloseReport);
   }
 
   function closeReportModal() {
     reportModal.classList.remove("open");
+    releaseModalFocus(reportModal);
     // Reset maximize state on close
     if (reportMaximized) {
       reportMaximized = false;
@@ -1947,7 +2401,7 @@
     }
     if (reportSessionName) {
       reportSessionName.value = displayName || "";
-      reportSessionName.placeholder = displayName ? "编辑会话名称" : "输入会话名称";
+      reportSessionName.placeholder = displayName ? t("编辑会话名称") : t("输入会话名称");
     }
   }
 
@@ -1960,16 +2414,16 @@
         body: JSON.stringify({ session_id: sessionId, name: newName.trim() }),
       });
       if (resp?.ok) {
-        showToast("会话已重命名", "success");
+        showToast(t("会话已重命名"), "success");
         // Refresh session list to show new name
         await refreshSessions();
         return true;
       } else {
-        showToast(`重命名失败：${resp?.error || "unknown"}`, "error");
+        showToast(t("重命名失败：{error}", { error: resp?.error || t("unknown") }), "error");
         return false;
       }
     } catch (e) {
-      showToast(`重命名失败：${e}`, "error");
+      showToast(t("重命名失败：{error}", { error: e }), "error");
       return false;
     }
   }
@@ -1978,33 +2432,87 @@
   const SETTINGS_POS_KEY = "settings_drawer_pos_v1";
   let settingsDragState = null;
 
+  function readSettingsDrawerPos() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_POS_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== "object") return null;
+      const left = Number(data.left);
+      const top = Number(data.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+      return { left, top };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeSettingsDrawerPos(left, top) {
+    try {
+      localStorage.setItem(SETTINGS_POS_KEY, JSON.stringify({ left, top }));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function clampSettingsDrawerPos(left, top, width, height) {
+    const margin = 12;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    return {
+      left: clamp(left, margin, maxLeft),
+      top: clamp(top, margin, maxTop),
+    };
+  }
+
+  function setSettingsDrawerPos(left, top) {
+    if (!settingsDrawer) return;
+    settingsDrawer.style.left = `${Math.round(left)}px`;
+    settingsDrawer.style.top = `${Math.round(top)}px`;
+    settingsDrawer.style.right = "auto";
+    settingsDrawer.style.bottom = "auto";
+    settingsDrawer.style.transform = "none";
+  }
+
   function openSettingsModal() {
     settingsModal.classList.add("open");
     initSettingsDrawerPos();
+    trapModalFocus(settingsModal, btnSettingsClose);
   }
 
   function closeSettingsModal() {
     settingsModal.classList.remove("open");
+    releaseModalFocus(settingsModal);
     // Reset drag state on close
     settingsDragState = null;
     if (settingsDrawer) settingsDrawer.classList.remove("dragging");
   }
 
-  function initSettingsDrawerPos() {
+  function initSettingsDrawerPos({ reset = false } = {}) {
     if (!settingsDrawer) return;
-    try {
-      const raw = localStorage.getItem(SETTINGS_POS_KEY);
-      if (raw) {
-        const data = JSON.parse(raw);
-        if (data?.left != null && data?.top != null) {
-          settingsDrawer.style.left = `${data.left}px`;
-          settingsDrawer.style.top = `${data.top}px`;
-          return;
-        }
+    requestAnimationFrame(() => {
+      const rect = settingsDrawer.getBoundingClientRect();
+      const stored = reset ? null : readSettingsDrawerPos();
+      let left = stored?.left;
+      let top = stored?.top;
+      if (!Number.isFinite(left) || !Number.isFinite(top)) {
+        left = Math.max(16, (window.innerWidth - rect.width) / 2);
+        top = Math.max(16, (window.innerHeight - rect.height) / 5);
       }
-    } catch {}
-    settingsDrawer.style.left = "10vw";
-    settingsDrawer.style.top = "8vh";
+      const clamped = clampSettingsDrawerPos(left, top, rect.width, rect.height);
+      setSettingsDrawerPos(clamped.left, clamped.top);
+      writeSettingsDrawerPos(clamped.left, clamped.top);
+    });
+  }
+
+  function ensureSettingsDrawerInViewport() {
+    if (!settingsDrawer || !settingsModal.classList.contains("open")) return;
+    const rect = settingsDrawer.getBoundingClientRect();
+    const clamped = clampSettingsDrawerPos(rect.left, rect.top, rect.width, rect.height);
+    if (clamped.left !== rect.left || clamped.top !== rect.top) {
+      setSettingsDrawerPos(clamped.left, clamped.top);
+      writeSettingsDrawerPos(clamped.left, clamped.top);
+    }
   }
 
   function startSettingsDrag(e) {
@@ -2026,12 +2534,8 @@
     const dx = e.clientX - settingsDragState.startX;
     const dy = e.clientY - settingsDragState.startY;
     const rect = settingsDrawer.getBoundingClientRect();
-    const maxLeft = window.innerWidth - rect.width;
-    const maxTop = window.innerHeight - rect.height;
-    const left = clamp(settingsDragState.startLeft + dx, 0, Math.max(0, maxLeft));
-    const top = clamp(settingsDragState.startTop + dy, 0, Math.max(0, maxTop));
-    settingsDrawer.style.left = `${left}px`;
-    settingsDrawer.style.top = `${top}px`;
+    const clamped = clampSettingsDrawerPos(settingsDragState.startLeft + dx, settingsDragState.startTop + dy, rect.width, rect.height);
+    setSettingsDrawerPos(clamped.left, clamped.top);
   }
 
   function endSettingsDrag(e) {
@@ -2039,9 +2543,9 @@
     settingsDrawer.classList.remove("dragging");
     settingsDragHandle.releasePointerCapture(e.pointerId);
     const rect = settingsDrawer.getBoundingClientRect();
-    try {
-      localStorage.setItem(SETTINGS_POS_KEY, JSON.stringify({ left: rect.left, top: rect.top }));
-    } catch {}
+    const clamped = clampSettingsDrawerPos(rect.left, rect.top, rect.width, rect.height);
+    setSettingsDrawerPos(clamped.left, clamped.top);
+    writeSettingsDrawerPos(clamped.left, clamped.top);
     settingsDragState = null;
   }
 
@@ -2080,10 +2584,10 @@
       } else if (cfg.password === "***") {
         // Password exists on server but is redacted; keep field empty with placeholder
         webdavPassword.value = "";
-        webdavPassword.placeholder = "••••••••（已保存）";
+        webdavPassword.placeholder = t("••••••••（已保存）");
       } else {
         webdavPassword.value = "";
-        webdavPassword.placeholder = "密码或应用专用密码";
+        webdavPassword.placeholder = t("密码或应用专用密码");
       }
     }
     if (webdavRemotePath) webdavRemotePath.value = cfg.remote_path || "/classroom_focus";
@@ -2137,13 +2641,13 @@
       if (resp?.ok) {
         state.webdav.config = resp.config;
         state.webdav.dirty = false;
-        showToast("设置已保存", "success");
+        showToast(t("设置已保存"), "success");
         updateSettingsDot();
       } else {
-        showToast(`保存失败：${resp?.error || "unknown"}`, "error");
+        showToast(t("保存失败：{error}", { error: resp?.error || t("unknown") }), "error");
       }
     } catch (e) {
-      showToast(`保存失败：${e}`, "error");
+      showToast(t("保存失败：{error}", { error: e }), "error");
     } finally {
       setButtonLoading(btnSettingsSave, false);
     }
@@ -2152,7 +2656,7 @@
   async function testWebdavConnection() {
     syncWebdavStateFromForm();
     setButtonLoading(btnWebdavTest, true);
-    if (webdavTestStatus) webdavTestStatus.textContent = "测试中…";
+    if (webdavTestStatus) webdavTestStatus.textContent = t("测试中…");
     try {
       const resp = await fetchJson("/api/webdav/test", {
         method: "POST",
@@ -2160,15 +2664,15 @@
         body: JSON.stringify({ config: state.webdav.config }),
       });
       if (resp?.ok) {
-        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="ok-text">✓ ${resp.message || "连接成功"}</span>`;
-        showToast("连接成功", "success");
+        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="ok-text">✓ ${escapeHtml(resp.message || t("连接成功"))}</span>`;
+        showToast(t("连接成功"), "success");
       } else {
-        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${resp.error || "连接失败"}</span>`;
-        showToast(`连接失败：${resp.error}`, "error");
+        if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${escapeHtml(resp.error || t("连接失败"))}</span>`;
+        showToast(t("连接失败：{error}", { error: resp.error || t("连接失败") }), "error");
       }
     } catch (e) {
-      if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${e}</span>`;
-      showToast(`连接失败：${e}`, "error");
+      if (webdavTestStatus) webdavTestStatus.innerHTML = `<span class="danger-text">✗ ${escapeHtml(String(e))}</span>`;
+      showToast(t("连接失败：{error}", { error: e }), "error");
     } finally {
       setButtonLoading(btnWebdavTest, false);
     }
@@ -2203,7 +2707,7 @@
     state.webdav.dirty = true;
     applyWebdavFormFromState();
     if (webdavTestStatus) webdavTestStatus.textContent = "";
-    showToast("已重置为默认值", "success");
+    showToast(t("已重置为默认值"), "success");
   }
 
   function toggleWebdavPasswordVisibility() {
@@ -2211,26 +2715,26 @@
     const isPassword = webdavPassword.type === "password";
     webdavPassword.type = isPassword ? "text" : "password";
     btnToggleWebdavPassword.textContent = isPassword ? "●" : "◉";
-    btnToggleWebdavPassword.title = isPassword ? "隐藏密码" : "显示密码";
+    btnToggleWebdavPassword.title = isPassword ? t("隐藏密码") : t("显示密码");
   }
 
   function validateWebdavUrl(url) {
     if (!url) return { valid: true, message: "" };
     const trimmed = url.trim();
     if (trimmed && !trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
-      return { valid: false, message: "URL 应以 http:// 或 https:// 开头" };
+      return { valid: false, message: t("URL 应以 http:// 或 https:// 开头") };
     }
     return { valid: true, message: "" };
   }
 
   async function uploadSessionToWebdav(sessionId) {
     if (!sessionId) {
-      showToast("没有可上传的会话", "warning");
+      showToast(t("没有可上传的会话"), "warning");
       return;
     }
     const cfg = state.webdav.config || {};
     if (!cfg.enabled) {
-      showToast("WebDAV 未启用，请先在设置中心启用", "warning");
+      showToast(t("WebDAV 未启用，请先在设置中心启用"), "warning");
       return;
     }
     setButtonLoading(btnUploadWebdav, true);
@@ -2241,12 +2745,12 @@
         body: JSON.stringify({ session_id: sessionId }),
       });
       if (resp?.ok) {
-        showToast(`上传成功：${resp.uploaded || 0} 个文件`, "success");
+        showToast(t("上传成功：{count} 个文件", { count: resp.uploaded || 0 }), "success");
       } else {
-        showToast(`上传失败：${resp?.error || "unknown"}`, "error");
+        showToast(t("上传失败：{error}", { error: resp?.error || t("unknown") }), "error");
       }
     } catch (e) {
-      showToast(`上传失败：${e}`, "error");
+      showToast(t("上传失败：{error}", { error: e }), "error");
     } finally {
       setButtonLoading(btnUploadWebdav, false);
     }
@@ -2267,10 +2771,10 @@
     }
 
     const kpis = [
-      { k: "学生数", v: String(students.length), s: "tracks in stats.json" },
-      { k: "走神/睡觉区间", v: String(totalIntervals), s: "闭眼 / 低头 / 眼睛不可见" },
-      { k: "总走神/睡觉时长", v: formatDuration(totalDur), s: "累计（秒）" },
-      { k: "会话", v: String(stats?.session_id || "—"), s: "session_id" },
+      { k: t("学生数"), v: String(students.length), s: t("tracks in stats.json") },
+      { k: t("走神/睡觉区间"), v: String(totalIntervals), s: t("闭眼 / 低头 / 眼睛不可见") },
+      { k: t("总走神/睡觉时长"), v: formatDuration(totalDur), s: t("累计（秒）") },
+      { k: t("会话"), v: String(stats?.session_id || "—"), s: "session_id" },
     ];
     for (const item of kpis) {
       const div = document.createElement("div");
@@ -2291,11 +2795,11 @@
       a.textContent = label;
       reportLinks.appendChild(a);
     };
-    add(result?.video, "下载视频");
-    add(result?.audio, "下载音频");
-    add(result?.transcript, "下载转录");
-    add(result?.lesson_summary, "下载课程总结");
-    add(result?.stats, "下载统计 JSON");
+    add(result?.video, t("下载视频"));
+    add(result?.audio, t("下载音频"));
+    add(result?.transcript, t("下载转录"));
+    add(result?.lesson_summary, t("下载课程总结"));
+    add(result?.stats, t("下载统计 JSON"));
   }
 
   function renderReportBody(stats) {
@@ -2327,31 +2831,31 @@
       const llmBase = String(modelCfg?.llm?.base_url || "");
 
       const chips = [];
-      if (mode) chips.push(`mode: ${mode}`);
-      if (asrProvider) chips.push(`asr: ${asrProvider}${asrModel ? ` (${asrModel})` : ""}`);
-      chips.push(llmEnabled ? `llm: on${llmModel ? ` (${llmModel})` : ""}` : "llm: off");
+      if (mode) chips.push(t("mode: {mode}", { mode }));
+      if (asrProvider) chips.push(`${t("asr: {provider}", { provider: asrProvider })}${asrModel ? ` (${asrModel})` : ""}`);
+      chips.push(llmEnabled ? `${t("llm: on")}${llmModel ? ` (${llmModel})` : ""}` : t("llm: off"));
 
       const box = document.createElement("div");
       box.className = "interval";
       box.innerHTML = `
         <div class="interval-head">
-          <div class="interval-title">模型/告警</div>
+          <div class="interval-title">${escapeHtml(t("模型/告警"))}</div>
           <div class="interval-time">${escapeHtml(stats?.session_id || "")}</div>
         </div>
         <div class="interval-body">
-          <div><strong>配置：</strong> <div class="chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div></div>
+          <div><strong>${escapeHtml(t("配置："))}</strong> <div class="chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div></div>
           ${
             llmEnabled && llmBase
-              ? `<div><strong>LLM Base URL：</strong> <span class="mono">${escapeHtml(llmBase)}</span></div>`
+              ? `<div><strong>${escapeHtml(t("LLM Base URL："))}</strong> <span class="mono">${escapeHtml(llmBase)}</span></div>`
               : ""
           }
           ${
             warnings.length
-              ? `<div><strong>告警：</strong><div class="muted">${warnings
+              ? `<div><strong>${escapeHtml(t("告警："))}</strong><div class="muted">${warnings
                   .slice(0, 12)
                   .map((w) => `• ${escapeHtml(String(w))}`)
                   .join("<br/>")}</div></div>`
-              : '<div><strong>告警：</strong> <span class="muted">（无）</span></div>'
+              : `<div><strong>${escapeHtml(t("告警："))}</strong> <span class="muted">${escapeHtml(t("（无）"))}</span></div>`
           }
         </div>
       `;
@@ -2369,36 +2873,36 @@
       box.className = "interval";
       box.innerHTML = `
         <div class="interval-head">
-          <div class="interval-title">${escapeHtml(title || "本节课总结")}</div>
+          <div class="interval-title">${escapeHtml(title || t("本节课总结"))}</div>
           <div class="interval-time">${escapeHtml(stats?.session_id || "")}</div>
         </div>
         <div class="interval-body">
-          <div><strong>概览：</strong> ${overview ? escapeHtml(overview) : '<span class="muted">（未生成）</span>'}</div>
+          <div><strong>${escapeHtml(t("概览："))}</strong> ${overview ? escapeHtml(overview) : `<span class="muted">${escapeHtml(t("（未生成）"))}</span>`}</div>
           <div>
-            <strong>关键要点：</strong>
+            <strong>${escapeHtml(t("关键要点："))}</strong>
             ${
               keyPoints.length
                 ? `<div class="chips">${keyPoints.slice(0, 12).map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
-                : '<span class="muted">（无）</span>'
+                : `<span class="muted">${escapeHtml(t("（无）"))}</span>`
             }
           </div>
           <div>
-            <strong>大纲：</strong>
+            <strong>${escapeHtml(t("大纲："))}</strong>
             ${
               outline.length
                 ? `<div class="muted">${outline.slice(0, 12).map((x) => `• ${escapeHtml(x)}`).join("<br/>")}</div>`
-                : '<span class="muted">（无）</span>'
+                : `<span class="muted">${escapeHtml(t("（无）"))}</span>`
             }
           </div>
           <div>
-            <strong>时间线：</strong>
+            <strong>${escapeHtml(t("时间线："))}</strong>
             ${
               timeline.length
                 ? `<div class="muted">${timeline
                     .slice(0, 12)
-                    .map((t) => `${escapeHtml(formatSec(t.start))}–${escapeHtml(formatSec(t.end))} · ${escapeHtml(t.topic || "（未命名主题）")}`)
+                    .map((t) => `${escapeHtml(formatSec(t.start))}–${escapeHtml(formatSec(t.end))} · ${escapeHtml(t.topic || t("（未命名主题）"))}`)
                     .join("<br/>")}</div>`
-                : '<span class="muted">（无）</span>'
+                : `<span class="muted">${escapeHtml(t("（无）"))}</span>`
             }
           </div>
         </div>
@@ -2411,7 +2915,7 @@
       reportBody.appendChild(head);
       const info = document.createElement("div");
       info.className = "muted";
-      info.textContent = "没有检测到走神/疑似睡觉区间。";
+      info.textContent = t("没有检测到走神/疑似睡觉区间。");
       head.appendChild(info);
       return;
     }
@@ -2431,17 +2935,17 @@
       const sum = document.createElement("summary");
       sum.innerHTML = `
         <div class="summary-left">
-          <div class="student-name">学生 ${escapeHtml(sid)}</div>
-          <span class="badge"><span class="dot warn"></span><span>${intervals.length} 段</span></span>
+          <div class="student-name">${escapeHtml(t("学生 {sid}", { sid }))}</div>
+          <span class="badge"><span class="dot warn"></span><span>${escapeHtml(t("{count} 段", { count: intervals.length }))}</span></span>
         </div>
-        <div class="summary-right">累计 ${escapeHtml(formatDuration(total))}</div>
+        <div class="summary-right">${escapeHtml(t("累计 {duration}", { duration: formatDuration(total) }))}</div>
       `;
       det.appendChild(sum);
 
       const list = document.createElement("div");
       list.className = "intervals";
       if (intervals.length === 0) {
-        list.innerHTML = `<div class="muted">没有检测到异常状态。</div>`;
+        list.innerHTML = `<div class="muted">${escapeHtml(t("没有检测到异常状态。"))}</div>`;
       } else {
         for (const it of intervals) {
           const type = String(it.type || "UNKNOWN");
@@ -2462,31 +2966,31 @@
             </div>
             <div class="interval-body">
               <div>
-                <strong>判定：</strong>
+                <strong>${escapeHtml(t("判定："))}</strong>
                 ${
                   kinds.length
                     ? `<div class="chips">${kinds
                         .slice(0, 6)
                         .map((k) => `<span class="chip">${escapeHtml(intervalTypeLabel(k))}</span>`)
                         .join("")}</div>`
-                    : '<span class="muted">（无）</span>'
+                    : `<span class="muted">${escapeHtml(t("（无）"))}</span>`
                 }
               </div>
-              <div><strong>当时讲解：</strong> ${asr ? escapeHtml(asr) : '<span class="muted">（无 ASR 文本）</span>'}</div>
+              <div><strong>${escapeHtml(t("当时讲解："))}</strong> ${asr ? escapeHtml(asr) : `<span class="muted">${escapeHtml(t("（无 ASR 文本）"))}</span>`}</div>
               <div>
-                <strong>课程主题：</strong>
+                <strong>${escapeHtml(t("课程主题："))}</strong>
                 ${
                   topics.length
                     ? `<div class="chips">${topics.slice(0, 8).map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
-                    : '<span class="muted">（未生成/无匹配）</span>'
+                    : `<span class="muted">${escapeHtml(t("（未生成/无匹配）"))}</span>`
                 }
               </div>
               <div>
-                <strong>知识点：</strong>
+                <strong>${escapeHtml(t("知识点："))}</strong>
                 ${
                   kps.length
                     ? `<div class="chips">${kps.map((k) => `<span class="chip">${escapeHtml(k)}</span>`).join("")}</div>`
-                    : '<span class="muted">（无知识点/未配置大模型）</span>'
+                    : `<span class="muted">${escapeHtml(t("（无知识点/未配置大模型）"))}</span>`
                 }
               </div>
             </div>
@@ -2510,7 +3014,7 @@
   async function startReportJob({ sessionId } = {}) {
     const sid = sessionId || state.sessionId;
     if (!sid) {
-      setReportStatus("没有可用的 session_id（请先开始并停止一次录制）。", "warn-text");
+      setReportStatus(escapeHtml(t("没有可用的 session_id（请先开始并停止一次录制）。")), "warn-text");
       return;
     }
 
@@ -2524,7 +3028,8 @@
     
     reportLinks.innerHTML = "";
     reportKpis.innerHTML = "";
-    setReportStatus("正在提交统计任务…");
+    state.report.lastStats = null;
+    setReportStatus(escapeHtml(t("正在提交统计任务…")));
 
     const j = await fetchJson("/api/session/process", {
       method: "POST",
@@ -2535,7 +3040,7 @@
     state.report.jobId = j.job_id;
     state.report.polling = true;
 
-    setReportStatus(`任务已提交：<span class="mono">${escapeHtml(j.job_id)}</span>，处理中…`);
+    setReportStatus(`${escapeHtml(t("任务已提交："))}<span class="mono">${escapeHtml(j.job_id)}</span>${escapeHtml(t("，处理中…"))}`);
     await pollReportJob(j.job_id);
   }
 
@@ -2547,7 +3052,7 @@
       try {
         st = await fetchJson(`/api/session/process/status?job_id=${encodeURIComponent(jobId)}`);
       } catch (e) {
-        setReportStatus(`轮询失败：${escapeHtml(String(e))}`, "warn-text");
+        setReportStatus(escapeHtml(t("轮询失败：{error}", { error: String(e) })), "warn-text");
         continue;
       }
       const job = st?.job;
@@ -2556,34 +3061,35 @@
         state.report.polling = false;
         state.report.lastResult = job.result || null;
         state.report.lastStatsUrl = job.result?.stats || null;
-        btnOpenReport.style.display = state.report.lastStatsUrl ? "inline-flex" : "none";
-        setReportStatus("统计完成，正在加载结果…");
-        showToast("报告生成完成", "success");
+        btnOpenReport.classList.toggle("is-hidden", !state.report.lastStatsUrl);
+        setReportStatus(escapeHtml(t("统计完成，正在加载结果…")));
+        showToast(t("报告生成完成"), "success");
         await loadReportFromResult(job.result);
         return;
       }
       if (status === "error") {
         state.report.polling = false;
-        setReportStatus(`统计出错：${escapeHtml(String(job?.error || "unknown"))}`, "danger-text");
-        showToast("报告生成失败", "error");
+        setReportStatus(escapeHtml(t("统计出错：{error}", { error: String(job?.error || t("unknown")) })), "danger-text");
+        showToast(t("报告生成失败"), "error");
         return;
       }
-      setReportStatus(`处理中：${escapeHtml(status)}（${i + 1}s）`);
+      setReportStatus(escapeHtml(t("处理中：{status}（{sec}s）", { status: status, sec: i + 1 })));
     }
     state.report.polling = false;
-    setReportStatus("统计超时：任务可能仍在后台运行，可稍后点击“重载”。", "warn-text");
+    setReportStatus(escapeHtml(t("统计超时：任务可能仍在后台运行，可稍后点击“重载”。")), "warn-text");
   }
 
   async function loadReportFromResult(result) {
     renderReportLinks(result);
     if (!result?.stats) {
-      setReportStatus("没有找到 stats.json 输出。", "warn-text");
+      setReportStatus(escapeHtml(t("没有找到 stats.json 输出。")), "warn-text");
       return;
     }
     state.report.lastStatsUrl = result.stats;
-    btnOpenReport.style.display = "inline-flex";
+    btnOpenReport.classList.remove("is-hidden");
 
     const stats = await fetchJson(result.stats);
+    state.report.lastStats = stats;
     renderReportKpis(stats);
     renderReportBody(stats);
   }
@@ -2604,9 +3110,10 @@
     const statsUrl = `/out/${encodeURIComponent(sid)}/stats.json`;
     try {
       const stats = await fetchJson(statsUrl);
+      state.report.lastStats = stats;
       state.report.lastSessionId = sid;
       state.report.lastStatsUrl = statsUrl;
-      btnOpenReport.style.display = "inline-flex";
+      btnOpenReport.classList.remove("is-hidden");
       renderReportLinks({
         stats: statsUrl,
         video: stats.video ? `/out/${sid}/${stats.video}` : null,
@@ -2621,7 +3128,7 @@
       // fall through
     }
 
-    setReportStatus(`该会话尚未生成 <span class="mono">stats.json</span>，正在为其生成报告…`);
+    setReportStatus(`${escapeHtml(t("该会话尚未生成"))} <span class="mono">stats.json</span>${escapeHtml(t("，正在为其生成报告…"))}`);
     await startReportJob({ sessionId: sid });
   }
 
@@ -2639,7 +3146,7 @@
       sessionSelect.innerHTML = "";
       const opt0 = document.createElement("option");
       opt0.value = "";
-      opt0.textContent = "选择历史会话…";
+      opt0.textContent = t("选择历史会话…");
       sessionSelect.appendChild(opt0);
 
       for (const it of items) {
@@ -2652,12 +3159,12 @@
         opt.value = sid;
         // Show display_name if available, otherwise just session_id
         const label = displayName ? `${displayName} (${sid})` : sid;
-        opt.textContent = `${label}${hasStats ? " · stats✅" : ""}`;
+        opt.textContent = `${label}${hasStats ? ` · ${t("stats✅")}` : ""}`;
         sessionSelect.appendChild(opt);
       }
       sessionSelect.disabled = false;
     } catch (e) {
-      sessionSelect.innerHTML = `<option value="">（无法加载：${String(e)}）</option>`;
+      sessionSelect.innerHTML = `<option value="">${escapeHtml(t("（无法加载：{error}）", { error: String(e) }))}</option>`;
       sessionSelect.disabled = true;
     } finally {
       btnRefreshSessions.disabled = false;
@@ -2665,12 +3172,11 @@
   }
 
   function applyStudentFilter() {
-    const q = String(studentFilter.value || "").trim().toLowerCase();
-    const cards = studentList.querySelectorAll(".student-card");
-    for (const card of cards) {
-      const sid = String(card.dataset.sid || "").toLowerCase();
-      card.style.display = !q || sid.includes(q) ? "" : "none";
-    }
+    const view = state.studentListView;
+    if (!view) return;
+    view.filterQuery = String(studentFilter.value || "").trim();
+    updateFilteredStudentIds();
+    scheduleStudentListRender();
   }
 
   function bindUi() {
@@ -2685,6 +3191,9 @@
           e.preventDefault();
         } else if (reportModal.classList.contains("open")) {
           closeReportModal();
+          e.preventDefault();
+        } else if (content && content.classList.contains("sidebar-open") && isSidebarOverlay()) {
+          setSidebarOpen(false);
           e.preventDefault();
         }
       }
@@ -2714,6 +3223,24 @@
       setTimeout(checkScrollEnd, 100);  // Initial check after render
     }
 
+    if (btnThemeToggle) {
+      btnThemeToggle.addEventListener("click", () => {
+        toggleTheme();
+      });
+    }
+
+    if (btnSidebarToggle) {
+      btnSidebarToggle.addEventListener("click", () => {
+        const open = content && content.classList.contains("sidebar-open");
+        setSidebarOpen(!open);
+      });
+    }
+    if (sidebarBackdrop) {
+      sidebarBackdrop.addEventListener("click", () => {
+        setSidebarOpen(false);
+      });
+    }
+
     // Settings Center event listeners
     if (btnSettingsCenter) {
       btnSettingsCenter.addEventListener("click", async () => {
@@ -2741,6 +3268,11 @@
     }
     if (btnSettingsSave) {
       btnSettingsSave.addEventListener("click", saveWebdavConfig);
+    }
+    if (langSelect) {
+      langSelect.addEventListener("change", async () => {
+        await setLanguage(langSelect.value);
+      });
     }
     if (btnSettingsClose) {
       btnSettingsClose.addEventListener("click", closeSettingsModal);
@@ -2779,7 +3311,7 @@
         if (!state.models.config) await loadModelsConfig();
         openModelModal();
       } catch (e) {
-        alert(`模型设置不可用：${String(e)}`);
+        alert(t("模型设置不可用：{error}", { error: String(e) }));
       }
     });
     modelModal.addEventListener("click", (e) => {
@@ -2807,10 +3339,10 @@
       try {
         syncModelStateFromForm();
         await saveModelsConfig();
-        modelCheckBox.innerHTML = `<span class="ok-text">已保存并应用。</span>`;
+        modelCheckBox.innerHTML = `<span class="ok-text">${escapeHtml(t("已保存并应用。"))}</span>`;
         updateModelPill();
       } catch (e) {
-        alert(`保存失败：${String(e)}`);
+        alert(t("保存失败：{error}", { error: String(e) }));
       }
     });
     btnModelsCheck.addEventListener("click", async () => {
@@ -2819,10 +3351,10 @@
         syncModelStateFromForm();
         if (state.models.dirty) await saveModelsConfig();
         await checkModels({ deep: false });
-        showToast("模型检测完成", "success");
+        showToast(t("模型检测完成"), "success");
       } catch (e) {
-        modelCheckBox.innerHTML = `<span class="danger-text">检测失败：${escapeHtml(String(e))}</span>`;
-        showToast(`检测失败：${e}`, "error");
+        modelCheckBox.innerHTML = `<span class="danger-text">${escapeHtml(t("检测失败：{error}", { error: String(e) }))}</span>`;
+        showToast(t("检测失败：{error}", { error: e }), "error");
       } finally {
         setButtonLoading(btnModelsCheck, false);
       }
@@ -2833,10 +3365,10 @@
         syncModelStateFromForm();
         if (state.models.dirty) await saveModelsConfig();
         await checkModels({ deep: true });
-        showToast("深度检测完成", "success");
+        showToast(t("深度检测完成"), "success");
       } catch (e) {
-        modelCheckBox.innerHTML = `<span class="danger-text">深度检测失败：${escapeHtml(String(e))}</span>`;
-        showToast(`深度检测失败：${e}`, "error");
+        modelCheckBox.innerHTML = `<span class="danger-text">${escapeHtml(t("深度检测失败：{error}", { error: String(e) }))}</span>`;
+        showToast(t("深度检测失败：{error}", { error: e }), "error");
       } finally {
         setButtonLoading(btnModelsCheckDeep, false);
       }
@@ -2846,10 +3378,10 @@
       setButtonLoading(btnLlmPullModels, true);
       try {
         await pullLlmModels();
-        showToast("模型列表拉取成功", "success");
+        showToast(t("模型列表拉取成功"), "success");
       } catch (e) {
-        modelCheckBox.innerHTML = `<span class="danger-text">拉取模型失败：${escapeHtml(String(e))}</span>`;
-        showToast(`拉取模型失败：${e}`, "error");
+        modelCheckBox.innerHTML = `<span class="danger-text">${escapeHtml(t("拉取模型失败：{error}", { error: String(e) }))}</span>`;
+        showToast(t("拉取模型失败：{error}", { error: e }), "error");
       } finally {
         setButtonLoading(btnLlmPullModels, false);
       }
@@ -2915,7 +3447,7 @@
       try {
         await startRecording();
       } catch (e) {
-        alert(`开始录制失败：${e}`);
+        alert(t("开始录制失败：{error}", { error: e }));
         setRecording(false, state.sessionId);
       }
     });
@@ -2923,7 +3455,7 @@
       try {
         await stopRecording();
       } catch (e) {
-        alert(`停止失败：${e}`);
+        alert(t("停止失败：{error}", { error: e }));
         setRecording(false, state.sessionId);
       }
     });
@@ -2933,8 +3465,8 @@
       try {
         await startReportJob({ sessionId: state.sessionId });
       } catch (e) {
-        setReportStatus(`生成报告失败：${escapeHtml(String(e))}`, "danger-text");
-        showToast(`生成报告失败：${e}`, "error");
+        setReportStatus(escapeHtml(t("生成报告失败：{error}", { error: String(e) })), "danger-text");
+        showToast(t("生成报告失败：{error}", { error: e }), "error");
       } finally {
         setButtonLoading(btnReport, false);
         btnReport.disabled = state.isRecording || !state.sessionId;
@@ -2966,11 +3498,11 @@
         const sid = state.report.lastSessionId;
         const newName = reportSessionName?.value?.trim();
         if (!sid) {
-          showToast("没有当前会话", "warning");
+          showToast(t("没有当前会话"), "warning");
           return;
         }
         if (!newName) {
-          showToast("请输入会话名称", "warning");
+          showToast(t("请输入会话名称"), "warning");
           return;
         }
         setButtonLoading(btnRenameSession, true);
@@ -2997,10 +3529,10 @@
         } else if (state.report.lastSessionId) {
           await loadReportFromSessionId(state.report.lastSessionId);
         } else {
-          setReportStatus("没有可重载的报告。", "warn-text");
+          setReportStatus(escapeHtml(t("没有可重载的报告。")), "warn-text");
         }
       } catch (e) {
-        setReportStatus(`重载失败：${escapeHtml(String(e))}`, "danger-text");
+        setReportStatus(escapeHtml(t("重载失败：{error}", { error: String(e) })), "danger-text");
       }
     });
 
@@ -3057,6 +3589,9 @@
     window.addEventListener("resize", () => {
       scheduleRender({ preview: true, timeline: true });
       ensureModelDrawerInViewport();
+      ensureSettingsDrawerInViewport();
+      syncSidebarLayout({ preserveOpen: true });
+      scheduleStudentListRender();
     });
   }
 
@@ -3088,6 +3623,12 @@
     timelinePanel.classList.toggle("hidden", !showTimeline);
     mainPanel.classList.toggle("timeline-hidden", !showTimeline);
 
+    initStudentListView();
+    await loadI18n(detectLanguage());
+    applyI18n();
+    applyTheme(getStoredTheme());
+    syncSidebarLayout({ preserveOpen: false });
+    if (langSelect) langSelect.value = i18n.lang;
     bindUi();
     connectWs();
     await loadInitialStatus();

@@ -24,7 +24,11 @@ from asr.dashscope_offline import DashScopeOfflineConfig, transcribe_wav_to_segm
 from asr.xfyun_raasr import XfyunRaasrConfig, transcribe_wav as xfyun_raasr_transcribe_wav
 from tools.session_manager import SessionManager
 from tools.openai_compat import OpenAICompat
+from tools.device_probe import detect_device_profile, DeviceProfile, save_runtime_profile, list_profiles
 from analysis.inattentive_intervals import infer_not_visible_intervals, merge_inattentive_intervals
+
+import logging
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -66,6 +70,13 @@ stats = {
     'batches_broadcast': 0,
     'last_batch_size': 0,
 }
+
+# ---- Device Profile Detection (at startup) ----
+DEVICE_PROFILE: DeviceProfile = detect_device_profile()
+logger.info(f"Device profile detected: {DEVICE_PROFILE.name} (constrained={DEVICE_PROFILE.is_constrained}, "
+            f"rpi={DEVICE_PROFILE.is_rpi}, arch={DEVICE_PROFILE.cpu_arch}, mem={DEVICE_PROFILE.mem_gb:.1f}GB)")
+# Save profile for other processes
+save_runtime_profile(DEVICE_PROFILE, str(PROJ_ROOT))
 
 # ---- Model config (in-memory defaults for next session) ----
 _MODEL_CFG: Dict[str, Any] = {}
@@ -651,38 +662,51 @@ async def root():
 @app.get("/api/sessions")
 async def list_sessions():
     """List all sessions with display names. Returns fresh data without caching."""
-    base = OUT_DIR
-    sessions = []
-    try:
-        for p in base.iterdir():
-            if not p.is_dir():
-                continue
-            sid = p.name
+    import asyncio
+    import concurrent.futures
+    
+    def _read_session_info(p):
+        """Synchronous helper to read session info from disk."""
+        sid = p.name
+        try:
             st = p.stat()
             stats_path = p / "stats.json"
             transcript_path = p / "transcript.txt"
             video_path = p / "session.mp4"
             meta_path = p / "metadata.json"
             
-            # Read display_name from metadata.json if exists
             display_name = None
             try:
                 if meta_path.exists():
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                         display_name = meta.get("display_name")
-                        logger.debug(f"Session {sid}: display_name = {display_name}")
-            except Exception as e:
-                logger.warning(f"Failed to read metadata for {sid}: {e}")
+            except Exception:
+                pass
             
-            sessions.append({
+            return {
                 "session_id": sid,
                 "display_name": display_name,
                 "mtime": float(getattr(st, "st_mtime", 0.0)),
                 "has_stats": stats_path.exists(),
                 "has_transcript": transcript_path.exists(),
                 "has_video": video_path.exists() or any(p.glob("*.mp4")),
-            })
+            }
+        except Exception:
+            return None
+    
+    base = OUT_DIR
+    sessions = []
+    try:
+        dirs = [p for p in base.iterdir() if p.is_dir()]
+        # Performance: Use thread pool to read session info in parallel
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = await asyncio.gather(*[
+                loop.run_in_executor(pool, _read_session_info, p) 
+                for p in dirs
+            ])
+        sessions = [r for r in results if r is not None]
     except Exception:
         sessions = []
     sessions.sort(key=lambda x: x.get("mtime", 0.0), reverse=True)
@@ -690,6 +714,16 @@ async def list_sessions():
         {"ok": True, "sessions": sessions},
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
     )
+
+
+@app.get("/api/device/profile")
+async def get_device_profile():
+    """Return the detected device profile and available profiles."""
+    return JSONResponse({
+        "ok": True,
+        "current": DEVICE_PROFILE.to_dict(),
+        "available": list_profiles(),
+    })
 
 
 @app.post("/api/session/start")

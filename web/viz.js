@@ -168,7 +168,7 @@
       image: null,
       ts: 0,
       faces: [],
-      b64: null,
+      b64Sig: null,  // Signature for duplicate detection (length:first32:last32)
     },
     asrSegments: [], // {start,end,text,label}
 
@@ -204,6 +204,27 @@
     },
   };
 
+  // Performance: Cache font family to avoid getComputedStyle in render loop
+  let _cachedFontFamily = null;
+  function getCachedFontFamily() {
+    if (!_cachedFontFamily) {
+      _cachedFontFamily = getComputedStyle(document.body).fontFamily;
+    }
+    return _cachedFontFamily;
+  }
+
+  // Performance: Binary search for finding first visible ASR segment
+  function findFirstVisibleSegment(segments, startT) {
+    if (segments.length === 0) return 0;
+    let lo = 0, hi = segments.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (segments[mid].end < startT) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
   }
@@ -220,7 +241,7 @@
     
     const closeBtn = document.createElement("button");
     closeBtn.className = "toast-close";
-    closeBtn.innerHTML = "\u00d7";
+    closeBtn.textContent = "\u00d7";
     closeBtn.title = "关闭";
     closeBtn.addEventListener("click", () => {
       toast.classList.add("fade-out");
@@ -672,16 +693,39 @@
     }
   }
 
+  // Performance: Cache canvas sizes and only recheck on resize
+  const _canvasSizeCache = new WeakMap();
+  let _canvasSizeDirty = true;
+  
+  function markCanvasSizeDirty() {
+    _canvasSizeDirty = true;
+  }
+  
+  // Listen for resize events to invalidate cache
+  window.addEventListener("resize", markCanvasSizeDirty);
+
   function resizeCanvasToElement(canvas) {
-    const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
+    const cached = _canvasSizeCache.get(canvas);
+    
+    // Only call getBoundingClientRect if dirty or no cache
+    if (!_canvasSizeDirty && cached && canvas.width === cached.w && canvas.height === cached.h) {
+      return false;
+    }
+    
+    const rect = canvas.getBoundingClientRect();
     const w = Math.max(1, Math.round(rect.width * dpr));
     const h = Math.max(1, Math.round(rect.height * dpr));
+    
+    _canvasSizeCache.set(canvas, { w, h });
+    
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
+      _canvasSizeDirty = false;
       return true;
     }
+    _canvasSizeDirty = false;
     return false;
   }
 
@@ -768,7 +812,13 @@
 
     const badge = document.createElement("span");
     badge.className = "badge";
-    badge.innerHTML = `<span class="dot unknown"></span><span>未知</span>`;
+    // Performance: Create elements separately to avoid innerHTML updates later
+    const badgeDot = document.createElement("span");
+    badgeDot.className = "dot unknown";
+    const badgeLabel = document.createElement("span");
+    badgeLabel.textContent = "未知";
+    badge.appendChild(badgeDot);
+    badge.appendChild(badgeLabel);
 
     top.appendChild(name);
     top.appendChild(badge);
@@ -776,14 +826,24 @@
     const meta = document.createElement("div");
     meta.className = "meta-row";
 
+    // Performance: Create code elements separately to update textContent instead of innerHTML
     const metaSeen = document.createElement("span");
-    metaSeen.innerHTML = `last <code>—</code>`;
+    metaSeen.appendChild(document.createTextNode("last "));
+    const metaSeenCode = document.createElement("code");
+    metaSeenCode.textContent = "—";
+    metaSeen.appendChild(metaSeenCode);
 
     const metaEar = document.createElement("span");
-    metaEar.innerHTML = `EAR <code>—</code>`;
+    metaEar.appendChild(document.createTextNode("EAR "));
+    const metaEarCode = document.createElement("code");
+    metaEarCode.textContent = "—";
+    metaEar.appendChild(metaEarCode);
 
     const metaPitch = document.createElement("span");
-    metaPitch.innerHTML = `pitch <code>—</code>`;
+    metaPitch.appendChild(document.createTextNode("pitch "));
+    const metaPitchCode = document.createElement("code");
+    metaPitchCode.textContent = "—";
+    metaPitch.appendChild(metaPitchCode);
 
     meta.appendChild(metaSeen);
     meta.appendChild(metaEar);
@@ -808,7 +868,7 @@
       pitch: null,
       blinkCount: 0,
       history: [],
-      dom: { card, avatar, name, badge, metaSeen, metaEar, metaPitch },
+      dom: { card, avatar, name, badge, badgeDot, badgeLabel, metaSeenCode, metaEarCode, metaPitchCode },
       lastAvatarTs: -1e9,
     };
 
@@ -849,13 +909,14 @@
     const st = normalizeState(s.state);
     const dotCls = dotClassForState(st);
     const badgeText = stateLabel(st);
-    s.dom.badge.innerHTML = `<span class="dot ${dotCls}"></span><span>${badgeText}</span>`;
+    // Performance: Update class/textContent instead of innerHTML
+    s.dom.badgeDot.className = `dot ${dotCls}`;
+    s.dom.badgeLabel.textContent = badgeText;
 
-    s.dom.metaSeen.innerHTML = `last <code>${formatSec(Math.max(0, state.nowSec - (s.lastSeen || 0)))}</code>`;
-    const earTxt = s.ear == null ? "—" : toNum(s.ear).toFixed(3);
-    const pitchTxt = s.pitch == null ? "—" : `${toNum(s.pitch).toFixed(1)}°`;
-    s.dom.metaEar.innerHTML = `EAR <code>${earTxt}</code>`;
-    s.dom.metaPitch.innerHTML = `pitch <code>${pitchTxt}</code>`;
+    s.dom.metaSeenCode.textContent = formatSec(Math.max(0, state.nowSec - (s.lastSeen || 0)));
+    s.dom.metaSeenCode.className = "";
+    s.dom.metaEarCode.textContent = s.ear == null ? "—" : toNum(s.ear).toFixed(3);
+    s.dom.metaPitchCode.textContent = s.pitch == null ? "—" : `${toNum(s.pitch).toFixed(1)}°`;
   }
 
   function maybeUpdateAvatar(s, img) {
@@ -902,8 +963,10 @@
 
     if (data.image_base64) {
       const b64 = String(data.image_base64);
-      if (b64 !== state.lastFrame.b64) {
-        state.lastFrame.b64 = b64;
+      // Performance: Compare length + first/last chars instead of full string
+      const b64Sig = `${b64.length}:${b64.slice(0, 32)}:${b64.slice(-32)}`;
+      if (b64Sig !== state.lastFrame.b64Sig) {
+        state.lastFrame.b64Sig = b64Sig;
         updatePreviewImageFromB64(b64);
       }
     }
@@ -915,7 +978,7 @@
       const newState = normalizeState(f.state);
       if (s.state !== newState) {
         s.history.push({ ts, state: newState });
-        if (s.history.length > 8000) s.history.splice(0, s.history.length - 8000);
+        if (s.history.length > 2000) s.history.splice(0, s.history.length - 2000);
       }
       s.state = newState;
       s.lastSeen = ts;
@@ -929,7 +992,23 @@
     // Mark stale students as "not seen"
     for (const s of state.students.values()) {
       if (state.nowSec - (s.lastSeen || 0) > 3.5) {
-        s.dom.metaSeen.innerHTML = `last <code class="warn-text">${formatSec(state.nowSec - (s.lastSeen || 0))}</code>`;
+        s.dom.metaSeenCode.textContent = formatSec(state.nowSec - (s.lastSeen || 0));
+        s.dom.metaSeenCode.className = "warn-text";
+      }
+    }
+    
+    // Performance: Periodically cleanup very stale students (not seen for 60+ seconds)
+    if (state.students.size > 20 && Math.random() < 0.05) {  // 5% chance per frame to run cleanup
+      const staleThreshold = state.nowSec - 60;
+      for (const [sid, s] of state.students.entries()) {
+        if ((s.lastSeen || 0) < staleThreshold) {
+          s.dom.card.remove();
+          state.students.delete(sid);
+          if (state.selectedStudentId === sid) {
+            state.selectedStudentId = null;
+            selectedStudentText.textContent = "—";
+          }
+        }
       }
     }
 
@@ -941,13 +1020,22 @@
   const previewImage = new Image();
   previewImage.decoding = "async";
   previewImage.loading = "eager";
+  
+  // Performance: Throttle avatar updates - only check a subset of students per frame
+  let _avatarCheckIndex = 0;
+  const _avatarCheckBatchSize = 5;  // Check at most 5 students per frame
+  
   previewImage.onload = () => {
     state.lastFrame.image = previewImage;
     scheduleRender({ preview: true });
-    // update avatars using the latest frame
-    for (const s of state.students.values()) {
-      maybeUpdateAvatar(s, previewImage);
+    // Performance: Update avatars in batches instead of all at once
+    const students = Array.from(state.students.values());
+    if (students.length === 0) return;
+    const endIdx = Math.min(_avatarCheckIndex + _avatarCheckBatchSize, students.length);
+    for (let i = _avatarCheckIndex; i < endIdx; i++) {
+      maybeUpdateAvatar(students[i], previewImage);
     }
+    _avatarCheckIndex = endIdx >= students.length ? 0 : endIdx;
   };
   previewImage.onerror = () => {
     // ignore
@@ -984,7 +1072,7 @@
 
     const dpr = window.devicePixelRatio || 1;
     previewCtx.lineWidth = Math.max(1, Math.round(2 * dpr));
-    previewCtx.font = `${Math.max(12, Math.round(13 * dpr))}px ${getComputedStyle(document.body).fontFamily}`;
+    previewCtx.font = `${Math.max(12, Math.round(13 * dpr))}px ${getCachedFontFamily()}`;
     previewCtx.textBaseline = "top";
 
     const faces = state.lastFrame.faces || [];
@@ -1116,7 +1204,7 @@
     timelineCtx.stroke();
 
     const dpr = window.devicePixelRatio || 1;
-    timelineCtx.font = `${Math.max(11, Math.round(12 * dpr))}px ${getComputedStyle(document.body).fontFamily}`;
+    timelineCtx.font = `${Math.max(11, Math.round(12 * dpr))}px ${getCachedFontFamily()}`;
     timelineCtx.fillStyle = "rgba(255,255,255,0.65)";
     timelineCtx.textBaseline = "top";
     for (let t = Math.ceil(startT / step) * step; t <= endT; t += step) {
@@ -1169,9 +1257,11 @@
 
     if (state.showAsr && state.asrSegments.length > 0) {
       const segs = state.asrSegments;
-      for (let i = 0; i < segs.length; i++) {
+      // Performance: Start from first potentially visible segment
+      const startIdx = findFirstVisibleSegment(segs, startT);
+      for (let i = startIdx; i < segs.length; i++) {
         const seg = segs[i];
-        if (seg.end < startT || seg.start > endT) continue;
+        if (seg.start > endT) break;  // Early break - all remaining are after visible range
         const segStart = clamp(seg.start, startT, endT);
         const segEnd = clamp(seg.end, startT, endT);
         const x1 = ((segStart - startT) / state.windowSec) * W;

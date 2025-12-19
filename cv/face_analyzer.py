@@ -23,6 +23,633 @@ try:
 except Exception:  # pragma: no cover
     requests = None
 
+
+# -----------------------------------------------------------------------------
+# CaptureQueue: Frame dropping queue for constrained devices
+# -----------------------------------------------------------------------------
+
+class CaptureQueue:
+    """
+    A frame capture queue that drops old frames when the processing thread
+    can't keep up. Designed for constrained devices like Raspberry Pi.
+    
+    Usage:
+        cap = cv2.VideoCapture(0)
+        queue = CaptureQueue(maxsize=1, drop_old=True)
+        queue.start_capture(cap)
+        
+        while running:
+            frame, ts = queue.get_frame(timeout=0.1)
+            if frame is not None:
+                results, events = analyzer.analyze_frame(frame, ts)
+        
+        queue.stop()
+    """
+    
+    def __init__(self, maxsize: int = 1, drop_old: bool = True):
+        """
+        Args:
+            maxsize: Maximum frames to buffer (1 recommended for real-time)
+            drop_old: If True, drop oldest frame when full; if False, drop new frame
+        """
+        self._maxsize = max(1, int(maxsize))
+        self._drop_old = drop_old
+        self._queue: queue.Queue = queue.Queue(maxsize=self._maxsize + 1)  # +1 for drop logic
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._cap = None
+        self._frames_captured = 0
+        self._frames_dropped = 0
+        self._lock = threading.Lock()
+    
+    def start_capture(self, cap) -> None:
+        """Start the capture thread with the given VideoCapture object."""
+        self._cap = cap
+        self._stop_event.clear()
+        self._frames_captured = 0
+        self._frames_dropped = 0
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+    
+    def _capture_loop(self) -> None:
+        """Internal capture loop running in a separate thread."""
+        while not self._stop_event.is_set() and self._cap is not None:
+            try:
+                ok, frame = self._cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                ts = time.time()
+                self._frames_captured += 1
+                
+                with self._lock:
+                    if self._queue.full():
+                        if self._drop_old:
+                            # Drop oldest frame
+                            try:
+                                self._queue.get_nowait()
+                                self._frames_dropped += 1
+                            except queue.Empty:
+                                pass
+                        else:
+                            # Drop new frame
+                            self._frames_dropped += 1
+                            continue
+                    
+                    try:
+                        self._queue.put_nowait((frame, ts))
+                    except queue.Full:
+                        self._frames_dropped += 1
+                        
+            except Exception:
+                time.sleep(0.01)
+    
+    def get_frame(self, timeout: float = 0.1) -> Tuple[Optional[np.ndarray], float]:
+        """
+        Get the next frame from the queue.
+        
+        Returns:
+            (frame, timestamp) or (None, 0.0) if no frame available
+        """
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None, 0.0
+    
+    def get_frame_nowait(self) -> Tuple[Optional[np.ndarray], float]:
+        """Get frame without waiting, returns (None, 0.0) if empty."""
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None, 0.0
+    
+    def stop(self) -> None:
+        """Stop the capture thread."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+    
+    def stats(self) -> Dict[str, int]:
+        """Return capture statistics."""
+        return {
+            "frames_captured": self._frames_captured,
+            "frames_dropped": self._frames_dropped,
+            "drop_rate": self._frames_dropped / max(1, self._frames_captured),
+            "queue_size": self._queue.qsize(),
+        }
+    
+    def is_running(self) -> bool:
+        """Check if capture thread is running."""
+        return self._thread is not None and self._thread.is_alive()
+
+
+# -----------------------------------------------------------------------------
+# AdaptiveScheduler: Dynamic performance adjustment based on CPU/latency
+# -----------------------------------------------------------------------------
+
+class AdaptiveScheduler:
+    """
+    Soft real-time adaptive scheduler that dynamically adjusts processing parameters
+    based on CPU usage and inference latency. Uses a sliding window and PID-style control.
+    
+    When CPU > threshold or latency > target, increases process_every_n or decreases input_scale.
+    When system is underutilized, gradually restores quality.
+    
+    Usage:
+        scheduler = AdaptiveScheduler(target_cpu=75, target_latency_ms=100)
+        
+        while running:
+            results, events = analyzer.analyze_frame(frame, ts)
+            scheduler.update(infer_ms=infer_time, cpu_percent=cpu)
+            
+            # Apply scheduler recommendations
+            if scheduler.should_skip_frame():
+                continue
+            
+            # Get current recommended scale
+            scale = scheduler.recommended_scale
+    """
+    
+    def __init__(
+        self,
+        target_cpu: float = 75.0,
+        target_latency_ms: float = 100.0,
+        window_size: int = 30,
+        min_scale: float = 0.25,
+        max_scale: float = 1.0,
+        min_skip: int = 1,
+        max_skip: int = 5,
+        # PID-style gains
+        kp: float = 0.1,  # Proportional gain
+        ki: float = 0.02,  # Integral gain
+        kd: float = 0.05,  # Derivative gain
+    ):
+        self.target_cpu = target_cpu
+        self.target_latency_ms = target_latency_ms
+        self.window_size = window_size
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.min_skip = min_skip
+        self.max_skip = max_skip
+        
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        
+        # State
+        self._cpu_history: List[float] = []
+        self._latency_history: List[float] = []
+        self._frame_count = 0
+        self._recommended_scale = 1.0
+        self._recommended_skip = 1
+        self._integral_error = 0.0
+        self._prev_error = 0.0
+        self._last_update = time.time()
+        
+        # Try to import psutil for CPU monitoring
+        self._psutil = None
+        try:
+            import psutil
+            self._psutil = psutil
+        except ImportError:
+            pass
+    
+    def update(self, infer_ms: float, cpu_percent: Optional[float] = None) -> None:
+        """
+        Update scheduler with latest metrics.
+        
+        Args:
+            infer_ms: Latest inference time in milliseconds
+            cpu_percent: Current CPU usage (if None, will try to sample)
+        """
+        # Sample CPU if not provided
+        if cpu_percent is None and self._psutil:
+            cpu_percent = self._psutil.cpu_percent()
+        
+        # Update histories
+        self._latency_history.append(infer_ms)
+        if cpu_percent is not None:
+            self._cpu_history.append(cpu_percent)
+        
+        # Trim histories
+        if len(self._latency_history) > self.window_size:
+            self._latency_history = self._latency_history[-self.window_size:]
+        if len(self._cpu_history) > self.window_size:
+            self._cpu_history = self._cpu_history[-self.window_size:]
+        
+        self._frame_count += 1
+        
+        # Only update recommendations every few frames
+        if self._frame_count % 10 != 0:
+            return
+        
+        self._update_recommendations()
+    
+    def _update_recommendations(self) -> None:
+        """Update scale/skip recommendations using PID-style control."""
+        if len(self._latency_history) < 5:
+            return
+        
+        # Calculate current averages
+        avg_latency = sum(self._latency_history) / len(self._latency_history)
+        avg_cpu = sum(self._cpu_history) / len(self._cpu_history) if self._cpu_history else 50.0
+        
+        # Combined error: weighted sum of latency and CPU errors
+        # Positive error means we need to reduce load
+        latency_error = (avg_latency - self.target_latency_ms) / self.target_latency_ms
+        cpu_error = (avg_cpu - self.target_cpu) / self.target_cpu
+        error = max(latency_error, cpu_error)  # Use worst case
+        
+        # PID control
+        dt = max(0.001, time.time() - self._last_update)
+        self._last_update = time.time()
+        
+        p_term = self.kp * error
+        self._integral_error = max(-2.0, min(2.0, self._integral_error + error * dt))
+        i_term = self.ki * self._integral_error
+        d_term = self.kd * (error - self._prev_error) / dt if dt > 0 else 0.0
+        self._prev_error = error
+        
+        adjustment = p_term + i_term + d_term
+        
+        # Apply adjustment to scale (negative adjustment = increase quality)
+        new_scale = self._recommended_scale - adjustment * 0.1
+        self._recommended_scale = max(self.min_scale, min(self.max_scale, new_scale))
+        
+        # Compute skip rate based on load
+        if error > 0.3:  # Significantly overloaded
+            self._recommended_skip = min(self.max_skip, self._recommended_skip + 1)
+        elif error < -0.2 and self._recommended_skip > self.min_skip:  # Underloaded
+            self._recommended_skip = max(self.min_skip, self._recommended_skip - 1)
+    
+    @property
+    def recommended_scale(self) -> float:
+        """Get current recommended input scale (0.25 to 1.0)."""
+        return self._recommended_scale
+    
+    @property
+    def recommended_skip(self) -> int:
+        """Get current recommended process_every_n value."""
+        return self._recommended_skip
+    
+    def should_skip_frame(self) -> bool:
+        """Check if current frame should be skipped based on recommended_skip."""
+        return (self._frame_count % self._recommended_skip) != 0
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current scheduler statistics."""
+        return {
+            "frame_count": self._frame_count,
+            "recommended_scale": round(self._recommended_scale, 3),
+            "recommended_skip": self._recommended_skip,
+            "avg_latency_ms": round(sum(self._latency_history) / max(1, len(self._latency_history)), 1),
+            "avg_cpu": round(sum(self._cpu_history) / max(1, len(self._cpu_history)), 1) if self._cpu_history else None,
+            "integral_error": round(self._integral_error, 3),
+        }
+    
+    def apply_to_config(self, cfg: "FaceAnalyzerConfig") -> None:
+        """Apply current recommendations to a FaceAnalyzerConfig."""
+        cfg.input_scale = self._recommended_scale
+        cfg.process_every_n = self._recommended_skip
+    
+    def reset(self) -> None:
+        """Reset scheduler to initial state."""
+        self._cpu_history = []
+        self._latency_history = []
+        self._frame_count = 0
+        self._recommended_scale = 1.0
+        self._recommended_skip = 1
+        self._integral_error = 0.0
+        self._prev_error = 0.0
+
+
+# -----------------------------------------------------------------------------
+# FaceMeshWorker: Multiprocessing-based inference to avoid GIL
+# -----------------------------------------------------------------------------
+
+def _worker_process(input_queue, output_queue, cfg_dict: Dict, stop_event):
+    """
+    Worker process that runs FaceMesh inference.
+    Avoids GIL interference by running in a separate process.
+    """
+    # Import heavy dependencies inside worker process
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        import mediapipe as _mp
+    except ImportError as e:
+        output_queue.put({"error": f"Import error: {e}"})
+        return
+    
+    # Create FaceAnalyzer with config
+    from dataclasses import fields
+    cfg = FaceAnalyzerConfig()
+    for f in fields(cfg):
+        if f.name in cfg_dict:
+            setattr(cfg, f.name, cfg_dict[f.name])
+    
+    analyzer = FaceAnalyzer(cfg)
+    
+    while not stop_event.is_set():
+        try:
+            # Get frame from input queue
+            item = input_queue.get(timeout=0.1)
+            if item is None:  # Shutdown signal
+                break
+            
+            frame_bytes, ts, shape, dtype = item
+            frame = _np.frombuffer(frame_bytes, dtype=dtype).reshape(shape)
+            
+            # Run inference
+            t0 = time.perf_counter()
+            results, events = analyzer.analyze_frame(frame, ts)
+            infer_ms = (time.perf_counter() - t0) * 1000
+            
+            # Send results back
+            output_queue.put({
+                "results": results,
+                "events": events,
+                "ts": ts,
+                "infer_ms": infer_ms,
+            })
+        except queue.Empty:
+            continue
+        except Exception as e:
+            output_queue.put({"error": str(e), "ts": 0})
+
+
+class FaceMeshWorker:
+    """
+    Multiprocessing-based FaceMesh worker that runs inference in a separate
+    process to avoid GIL interference from the main Python thread.
+    
+    Uses shared memory / multiprocessing queues for frame passing.
+    
+    Usage:
+        worker = FaceMeshWorker(cfg)
+        worker.start()
+        
+        while running:
+            frame, ts = capture_frame()
+            worker.submit_frame(frame, ts)
+            
+            # Get results (non-blocking)
+            result = worker.get_result(timeout=0.01)
+            if result:
+                faces = result["results"]
+        
+        worker.stop()
+    """
+    
+    def __init__(self, cfg: FaceAnalyzerConfig):
+        import multiprocessing as mp
+        
+        self.cfg = cfg
+        self._ctx = mp.get_context("spawn")  # Use spawn for cross-platform compatibility
+        self._input_queue = self._ctx.Queue(maxsize=1)
+        self._output_queue = self._ctx.Queue(maxsize=10)
+        self._stop_event = self._ctx.Event()
+        self._process: Optional[mp.Process] = None
+        self._frames_submitted = 0
+        self._frames_dropped = 0
+    
+    def start(self) -> None:
+        """Start the worker process."""
+        if self._process and self._process.is_alive():
+            return
+        
+        # Convert config to dict for passing to worker
+        from dataclasses import fields, asdict
+        cfg_dict = {}
+        for f in fields(self.cfg):
+            cfg_dict[f.name] = getattr(self.cfg, f.name)
+        
+        self._stop_event.clear()
+        self._process = self._ctx.Process(
+            target=_worker_process,
+            args=(self._input_queue, self._output_queue, cfg_dict, self._stop_event),
+            daemon=True,
+        )
+        self._process.start()
+    
+    def submit_frame(self, frame: np.ndarray, ts: float) -> bool:
+        """
+        Submit a frame for processing.
+        
+        Returns True if submitted, False if queue is full (frame dropped).
+        """
+        self._frames_submitted += 1
+        
+        # Convert frame to bytes for queue transfer
+        frame_bytes = frame.tobytes()
+        shape = frame.shape
+        dtype = str(frame.dtype)
+        
+        try:
+            # Non-blocking put with immediate drop if full
+            self._input_queue.put_nowait((frame_bytes, ts, shape, dtype))
+            return True
+        except queue.Full:
+            self._frames_dropped += 1
+            return False
+    
+    def get_result(self, timeout: float = 0.01) -> Optional[Dict]:
+        """
+        Get inference result from worker.
+        
+        Returns dict with keys: results, events, ts, infer_ms
+        Or None if no result available.
+        """
+        try:
+            return self._output_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+    
+    def get_all_results(self) -> List[Dict]:
+        """Get all available results without blocking."""
+        results = []
+        while True:
+            try:
+                r = self._output_queue.get_nowait()
+                results.append(r)
+            except queue.Empty:
+                break
+        return results
+    
+    def stop(self) -> None:
+        """Stop the worker process."""
+        self._stop_event.set()
+        
+        # Send shutdown signal
+        try:
+            self._input_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        
+        if self._process and self._process.is_alive():
+            self._process.join(timeout=2.0)
+            if self._process.is_alive():
+                self._process.terminate()
+        self._process = None
+    
+    def is_running(self) -> bool:
+        """Check if worker process is running."""
+        return self._process is not None and self._process.is_alive()
+    
+    def stats(self) -> Dict[str, Any]:
+        """Get worker statistics."""
+        return {
+            "is_running": self.is_running(),
+            "frames_submitted": self._frames_submitted,
+            "frames_dropped": self._frames_dropped,
+            "drop_rate": self._frames_dropped / max(1, self._frames_submitted),
+            "input_queue_size": self._input_queue.qsize() if self._input_queue else 0,
+            "output_queue_size": self._output_queue.qsize() if self._output_queue else 0,
+        }
+
+
+# -----------------------------------------------------------------------------
+# AsyncVideoWriter: Thread-based async video writer to avoid blocking main loop
+# -----------------------------------------------------------------------------
+
+class AsyncVideoWriter:
+    """
+    Async video writer that runs encoding in a separate thread.
+    Avoids blocking the main processing loop during frame writes.
+    
+    Usage:
+        writer = AsyncVideoWriter("output.avi", fps=30, size=(640, 480))
+        writer.start()
+        
+        while recording:
+            frame = capture_frame()
+            writer.write(frame)  # Non-blocking
+        
+        writer.stop()  # Waits for queue to drain
+    """
+    
+    def __init__(
+        self,
+        output_path: str,
+        fps: float = 30.0,
+        size: Tuple[int, int] = (640, 480),
+        fourcc: str = "XVID",
+        max_queue_size: int = 60,  # ~2 seconds at 30fps
+    ):
+        self.output_path = output_path
+        self.fps = fps
+        self.size = size
+        self.fourcc = fourcc
+        self.max_queue_size = max_queue_size
+        
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._writer = None
+        self._frames_written = 0
+        self._frames_dropped = 0
+        self._error: Optional[str] = None
+    
+    def start(self) -> None:
+        """Start the writer thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        
+        self._stop_event.clear()
+        self._frames_written = 0
+        self._frames_dropped = 0
+        self._error = None
+        
+        self._thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._thread.start()
+    
+    def _write_loop(self) -> None:
+        """Internal write loop running in separate thread."""
+        try:
+            if cv2 is None:
+                self._error = "OpenCV not available"
+                return
+            
+            fourcc = cv2.VideoWriter_fourcc(*self.fourcc)
+            self._writer = cv2.VideoWriter(
+                self.output_path, fourcc, self.fps, self.size
+            )
+            
+            if not self._writer.isOpened():
+                self._error = f"Failed to open video writer: {self.output_path}"
+                return
+            
+            while not self._stop_event.is_set() or not self._queue.empty():
+                try:
+                    frame = self._queue.get(timeout=0.1)
+                    if frame is None:  # Shutdown signal
+                        break
+                    
+                    # Resize if needed
+                    h, w = frame.shape[:2]
+                    if (w, h) != self.size:
+                        frame = cv2.resize(frame, self.size)
+                    
+                    self._writer.write(frame)
+                    self._frames_written += 1
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    self._error = str(e)
+                    
+        finally:
+            if self._writer:
+                self._writer.release()
+                self._writer = None
+    
+    def write(self, frame: np.ndarray) -> bool:
+        """
+        Write a frame (non-blocking).
+        
+        Returns True if queued, False if dropped (queue full).
+        """
+        try:
+            self._queue.put_nowait(frame.copy())  # Copy to avoid reference issues
+            return True
+        except queue.Full:
+            self._frames_dropped += 1
+            return False
+    
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the writer thread, waiting for queue to drain."""
+        self._stop_event.set()
+        
+        # Send shutdown signal
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._thread = None
+    
+    def is_running(self) -> bool:
+        """Check if writer thread is running."""
+        return self._thread is not None and self._thread.is_alive()
+    
+    def stats(self) -> Dict[str, Any]:
+        """Get writer statistics."""
+        return {
+            "is_running": self.is_running(),
+            "frames_written": self._frames_written,
+            "frames_dropped": self._frames_dropped,
+            "queue_size": self._queue.qsize(),
+            "error": self._error,
+        }
+    
+    @property
+    def error(self) -> Optional[str]:
+        """Get last error message, if any."""
+        return self._error
+
 # FaceMesh landmark indices for eye geometry
 LEFT_EYE_H = (33, 133)
 LEFT_EYE_V1 = (159, 145)
@@ -44,17 +671,38 @@ MODEL_POINTS = np.array([
 
 
 def _dist(a, b) -> float:
-    return float(np.linalg.norm(a - b))
+    """Fast Euclidean distance between two 2D points."""
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def _ear_from_pts(pts2d: np.ndarray,
                   H: Tuple[int, int],
                   V1: Tuple[int, int],
                   V2: Tuple[int, int]) -> float:
-    """Compute single-eye EAR from 6 landmark points."""
-    ph = _dist(pts2d[H[0]], pts2d[H[1]]) + 1e-6
-    pv = _dist(pts2d[V1[0]], pts2d[V1[1]]) + _dist(pts2d[V2[0]], pts2d[V2[1]])
-    return float(pv / (2.0 * ph))
+    """Compute single-eye EAR from 6 landmark points.
+    
+    Uses inline distance calculation to avoid function call overhead.
+    """
+    # Horizontal distance (eye width)
+    h0, h1 = pts2d[H[0]], pts2d[H[1]]
+    dx = h0[0] - h1[0]
+    dy = h0[1] - h1[1]
+    ph = (dx * dx + dy * dy) ** 0.5 + 1e-6
+    
+    # Vertical distances (eye height at two points)
+    v10, v11 = pts2d[V1[0]], pts2d[V1[1]]
+    dx1 = v10[0] - v11[0]
+    dy1 = v10[1] - v11[1]
+    d1 = (dx1 * dx1 + dy1 * dy1) ** 0.5
+    
+    v20, v21 = pts2d[V2[0]], pts2d[V2[1]]
+    dx2 = v20[0] - v21[0]
+    dy2 = v20[1] - v21[1]
+    d2 = (dx2 * dx2 + dy2 * dy2) ** 0.5
+    
+    return float((d1 + d2) / (2.0 * ph))
 
 
 @dataclass
@@ -92,6 +740,8 @@ class FaceAnalyzerConfig:
     refine_landmarks: bool = False
     min_det_conf: float = 0.5
     min_trk_conf: float = 0.5
+    # Model complexity: 0=lite (faster), 1=full (more accurate)
+    model_complexity: int = 1
     # Tuning defaults (made more sensitive to reduce missed drowsy detection)
     ear_min: float = 0.18
     ear_ratio: float = 0.85
@@ -133,6 +783,57 @@ class FaceAnalyzerConfig:
     camera_icp_inlier_px: float = 120.0
 
     debug_draw: bool = False
+    
+    # Frame processing (from device profile)
+    target_fps: float = 30.0
+    process_every_n: int = 1
+    input_scale: float = 1.0
+    input_max_width: int = 1920
+    input_max_height: int = 1080
+    
+    # Capture queue settings
+    use_capture_queue: bool = False
+    capture_queue_size: int = 2
+    drop_old_frames: bool = True
+    async_video_write: bool = False
+
+    @classmethod
+    def from_device_profile(cls, profile: "DeviceProfile") -> "FaceAnalyzerConfig":
+        """Create FaceAnalyzerConfig from a DeviceProfile."""
+        return cls(
+            max_faces=profile.max_faces,
+            refine_landmarks=profile.refine_landmarks,
+            model_complexity=profile.model_complexity,
+            min_det_conf=profile.min_det_conf,
+            min_trk_conf=profile.min_trk_conf,
+            debug_draw=profile.debug_draw,
+            target_fps=profile.target_fps,
+            process_every_n=profile.process_every_n,
+            input_scale=profile.input_scale,
+            input_max_width=profile.input_max_width,
+            input_max_height=profile.input_max_height,
+            use_capture_queue=profile.use_capture_queue,
+            capture_queue_size=profile.capture_queue_size,
+            drop_old_frames=profile.drop_old_frames,
+            async_video_write=profile.async_video_write,
+        )
+
+    def apply_device_profile(self, profile: "DeviceProfile") -> None:
+        """Apply device profile settings to this config (in-place update)."""
+        self.max_faces = profile.max_faces
+        self.refine_landmarks = profile.refine_landmarks
+        self.model_complexity = profile.model_complexity
+        self.min_det_conf = profile.min_det_conf
+        self.min_trk_conf = profile.min_trk_conf
+        self.target_fps = profile.target_fps
+        self.process_every_n = profile.process_every_n
+        self.input_scale = profile.input_scale
+        self.input_max_width = profile.input_max_width
+        self.input_max_height = profile.input_max_height
+        self.use_capture_queue = profile.use_capture_queue
+        self.capture_queue_size = profile.capture_queue_size
+        self.drop_old_frames = profile.drop_old_frames
+        self.async_video_write = profile.async_video_write
 
 
 class FaceAnalyzer:
@@ -141,9 +842,14 @@ class FaceAnalyzer:
     def __init__(self, cfg: FaceAnalyzerConfig = FaceAnalyzerConfig()):
         self.cfg = cfg
         self._mesh = None
+        self._frame_count = 0  # For process_every_n
+        self._last_results = []  # Cache last results for skipped frames
+        self._last_events = []
+        
         if mp is not None:
             try:
                 self._mp = mp.solutions.face_mesh
+                # Use model_complexity for performance tuning (0=lite, 1=full)
                 self._mesh = self._mp.FaceMesh(
                     max_num_faces=cfg.max_faces,
                     refine_landmarks=cfg.refine_landmarks,
@@ -154,12 +860,50 @@ class FaceAnalyzer:
                 self._mesh = None
         self.tracks: Dict[int, TrackState] = {}
         self._next_id: int = 0
+        
+        # Pre-allocated buffers for constrained devices
+        self._scaled_frame = None
+        self._pnp_image_points = np.zeros((6, 2), dtype=np.float32)  # For _compute_pitch
+        self._camera_matrix = None  # Cached camera matrix
+        self._dist_coeffs = np.zeros(5, dtype=np.float32)  # Cached distortion coeffs
 
     def analyze_frame(self, frame_bgr: np.ndarray, timestamp: float):
         if cv2 is None or self._mesh is None:
             return [], []
-        H, W = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Frame skipping for constrained devices
+        self._frame_count += 1
+        if self.cfg.process_every_n > 1 and (self._frame_count % self.cfg.process_every_n) != 0:
+            # Return cached results for skipped frames
+            return self._last_results, []
+        
+        H_orig, W_orig = frame_bgr.shape[:2]
+        
+        # Input scaling for constrained devices
+        scale = self.cfg.input_scale
+        max_w, max_h = self.cfg.input_max_width, self.cfg.input_max_height
+        
+        # Apply max resolution cap
+        if W_orig > max_w or H_orig > max_h:
+            cap_scale = min(max_w / W_orig, max_h / H_orig)
+            scale = min(scale, cap_scale)
+        
+        if scale < 1.0:
+            new_w = int(W_orig * scale)
+            new_h = int(H_orig * scale)
+            # Use pre-allocated buffer if possible
+            if self._scaled_frame is None or self._scaled_frame.shape[:2] != (new_h, new_w):
+                self._scaled_frame = np.empty((new_h, new_w, 3), dtype=np.uint8)
+            cv2.resize(frame_bgr, (new_w, new_h), dst=self._scaled_frame, interpolation=cv2.INTER_LINEAR)
+            frame_proc = self._scaled_frame
+            H, W = new_h, new_w
+            coord_scale = 1.0 / scale  # Scale coordinates back to original
+        else:
+            frame_proc = frame_bgr
+            H, W = H_orig, W_orig
+            coord_scale = 1.0
+        
+        rgb = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2RGB)
         res = self._mesh.process(rgb)
 
         faces_pts: List[np.ndarray] = []
@@ -168,14 +912,13 @@ class FaceAnalyzer:
             for fl in res.multi_face_landmarks[: self.cfg.max_faces]:
                 n = len(fl.landmark)
                 pts2d = np.zeros((n, 2), dtype=np.float32)
-                xs, ys = [], []
+                # Vectorized landmark extraction - avoid Python list append
                 for i, lm in enumerate(fl.landmark):
-                    x, y = lm.x * W, lm.y * H
-                    pts2d[i] = (x, y)
-                    xs.append(x)
-                    ys.append(y)
+                    pts2d[i, 0] = lm.x * W
+                    pts2d[i, 1] = lm.y * H
                 faces_pts.append(pts2d)
-                centers.append((float(np.mean(xs)), float(np.mean(ys))))
+                # Compute center directly from numpy array (vectorized mean)
+                centers.append((float(pts2d[:, 0].mean()), float(pts2d[:, 1].mean())))
 
         assign = self._associate(centers, timestamp)
 
@@ -306,10 +1049,16 @@ class FaceAnalyzer:
             elif st.down_active:
                 state = "down"
             st.state = state
-            x1 = float(np.min(pts2d[:, 0])) if pts2d.size else 0.0
-            y1 = float(np.min(pts2d[:, 1])) if pts2d.size else 0.0
-            x2 = float(np.max(pts2d[:, 0])) if pts2d.size else 0.0
-            y2 = float(np.max(pts2d[:, 1])) if pts2d.size else 0.0
+            # Use vectorized min/max for bounding box (avoids multiple calls)
+            if pts2d.size:
+                x_coords = pts2d[:, 0]
+                y_coords = pts2d[:, 1]
+                x1 = float(x_coords.min())
+                y1 = float(y_coords.min())
+                x2 = float(x_coords.max())
+                y2 = float(y_coords.max())
+            else:
+                x1 = y1 = x2 = y2 = 0.0
             w_px = max(1.0, x2 - x1)
             h_px = max(1.0, y2 - y1)
             bbox_norm = [
@@ -367,21 +1116,35 @@ class FaceAnalyzer:
         if self.cfg.debug_draw:
             self._draw_debug(frame_bgr, results, faces_pts)
 
+        # Cache results for frame skipping
+        self._last_results = results
+        self._last_events = events
+        
         return results, events
 
     def _compute_pitch(self, pts2d: np.ndarray, W: int, H: int) -> Optional[float]:
         if cv2 is None:
             return None
         try:
-            image_points = np.array([pts2d[i] for i in PNP_IDXS], dtype=np.float32)
+            # Use pre-allocated buffer for image points
+            for i, idx in enumerate(PNP_IDXS):
+                self._pnp_image_points[i] = pts2d[idx]
+            
+            # Cache/update camera matrix only when resolution changes
             f = 1.2 * W
-            K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1]], dtype=np.float32)
-            dist = np.zeros(5, dtype=np.float32)
-            ok, rvec, tvec = cv2.solvePnP(MODEL_POINTS, image_points, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+            if self._camera_matrix is None or self._camera_matrix[0, 0] != f:
+                self._camera_matrix = np.array(
+                    [[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1]], dtype=np.float32
+                )
+            
+            ok, rvec, tvec = cv2.solvePnP(
+                MODEL_POINTS, self._pnp_image_points, self._camera_matrix,
+                self._dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+            )
             if not ok:
                 return None
             R, _ = cv2.Rodrigues(rvec)
-            sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+            sy = (R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0]) ** 0.5
             pitch = np.degrees(np.arctan2(-R[2, 0], sy))  # negative is looking down
             return float(pitch)
         except Exception:

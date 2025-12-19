@@ -101,6 +101,9 @@ def _default_model_cfg() -> Dict[str, Any]:
         "asr": {
             "provider": "openai_compat" if has_openai else "none",
             "model": str(env.get("openai_asr_model") or "whisper-1"),
+            "use_independent": False,
+            "base_url": "",
+            "api_key": "",
         },
     }
 
@@ -142,6 +145,18 @@ def _sanitize_model_cfg(cfg: Any) -> Dict[str, Any]:
     asr_model = str(asr.get("model", out["asr"]["model"]) or "").strip()
     if asr_model:
         out["asr"]["model"] = asr_model[:120]
+    # New ASR independent settings
+    out["asr"]["use_independent"] = bool(asr.get("use_independent", False))
+    asr_base_url = str(asr.get("base_url", "") or "").strip()
+    if asr_base_url:
+        out["asr"]["base_url"] = asr_base_url[:300]
+    else:
+        out["asr"]["base_url"] = ""
+    asr_api_key = str(asr.get("api_key", "") or "").strip()
+    if asr_api_key:
+        out["asr"]["api_key"] = asr_api_key[:500]
+    else:
+        out["asr"]["api_key"] = ""
     return out
 
 
@@ -173,6 +188,37 @@ def _openai_client_from_cfg(llm_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
     return OpenAICompat(OpenAICompatConfig(base_url=base_url, api_key=api_key, model=model, timeout_sec=timeout))
 
 
+def _openai_client_for_asr(model_cfg: Dict[str, Any]) -> Optional[OpenAICompat]:
+    """Get an OpenAI client for ASR, using independent settings if configured."""
+    asr_cfg = model_cfg.get("asr") if isinstance(model_cfg.get("asr"), dict) else {}
+    llm_cfg = model_cfg.get("llm") if isinstance(model_cfg.get("llm"), dict) else {}
+    use_independent = bool(asr_cfg.get("use_independent", False))
+    
+    if use_independent:
+        # Use ASR-specific settings
+        asr_api_key = str(asr_cfg.get("api_key") or "").strip()
+        asr_base_url = str(asr_cfg.get("base_url") or "").strip()
+        # Fallback to LLM settings if ASR settings are empty
+        api_key = asr_api_key or str(llm_cfg.get("api_key") or "").strip() or (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
+        base_url = asr_base_url or str(llm_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com")
+    else:
+        # Use LLM settings
+        api_key = str(llm_cfg.get("api_key") or "").strip() or (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or "")
+        base_url = str(llm_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com")
+    
+    if not api_key:
+        return None
+    
+    model = str(asr_cfg.get("model") or os.getenv("OPENAI_ASR_MODEL") or "whisper-1")
+    try:
+        timeout = float(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
+    except Exception:
+        timeout = 60.0
+    from tools.openai_compat import OpenAICompatConfig
+
+    return OpenAICompat(OpenAICompatConfig(base_url=base_url, api_key=api_key, model=model, timeout_sec=timeout))
+
+
 def _redact_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Remove secrets before persisting to disk."""
     if not isinstance(cfg, dict):
@@ -183,6 +229,12 @@ def _redact_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if "api_key" in llm2:
         llm2["api_key"] = ""
     out["llm"] = llm2
+    # Also redact ASR api_key
+    asr = out.get("asr") if isinstance(out.get("asr"), dict) else {}
+    asr2 = dict(asr)
+    if "api_key" in asr2:
+        asr2["api_key"] = ""
+    out["asr"] = asr2
     return out
 
 
@@ -326,7 +378,7 @@ def _check_models(cfg: Dict[str, Any], deep: bool = False) -> Dict[str, Any]:
         _make_silence_wav(wav)
         if asr_provider == "openai_compat":
             t0 = time.time()
-            client = _openai_client_from_cfg(cfg.get("llm") or {})
+            client = _openai_client_for_asr(cfg)
             if not client:
                 out["asr"] = {
                     "ok": False,
@@ -937,7 +989,7 @@ def _ensure_asr_segments(session_dir: Path, job_id: str, model_cfg: Dict[str, An
         if provider == "none":
             return []
         if provider == "openai_compat":
-            client = _openai_client_from_cfg(model_cfg.get("llm") or {})
+            client = _openai_client_for_asr(model_cfg)
             if not client:
                 raise RuntimeError("OPENAI_API_KEY not set.")
             segs = _transcribe_openai_audio_to_segments(session_dir, job_id, client, model)

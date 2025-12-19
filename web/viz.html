@@ -249,7 +249,7 @@
 			                      <div class="student-name">ASR（整节课转写）</div>
 			                      <span class="badge"><span class="dot unknown"></span><span>provider</span></span>
 			                    </div>
-			                    <div class="summary-right">用于“睡觉时间 × 讲课内容”对齐</div>
+			                    <div class="summary-right">用于"睡觉时间 × 讲课内容"对齐</div>
 			                  </div>
 			                  <div class="model-section-body">
 			                    <div class="form-grid">
@@ -267,11 +267,42 @@
 			                        <div class="field-help">DashScope Key：`DASH_SCOPE_API_KEY`；讯飞：`XFYUN_APP_ID`/`XFYUN_SECRET_KEY`。</div>
 			                      </div>
 			                      <div class="field">
-			                        <div class="field-label">ASR 模型</div>
+			                        <div class="field-label">可用模型（从 LLM 拉取）</div>
+			                        <div style="display:flex; gap:10px; align-items:center;">
+			                          <div class="select" style="flex:1; min-width:0;">
+			                            <span>Model</span>
+			                            <select id="asrModelSel">
+			                              <option value="">（先在 LLM 拉取模型）</option>
+			                            </select>
+			                          </div>
+			                        </div>
+			                        <div class="field-help">选择后自动填入下方模型名；也可手动输入。</div>
+			                      </div>
+			                      <div class="field">
+			                        <div class="field-label">ASR 模型名（手动/被下拉框填入）</div>
 			                        <div class="input" title="OpenAI ASR model 或 DashScope model（讯飞不需要）">
 			                          <input id="asrModelInput" placeholder="whisper-1 / fun-asr-realtime / ..." autocomplete="off" />
 			                        </div>
-			                        <div class="field-help">建议：录制前先“检测”，避免报告生成时才发现不可用。</div>
+			                        <div class="field-help">建议：录制前先"检测"，避免报告生成时才发现不可用。</div>
+			                      </div>
+			                    </div>
+			                    <div class="field-row" style="margin-top:12px;">
+			                      <label class="toggle"><input type="checkbox" id="asrUseIndependentToggle" />使用独立 API 设置（不与 LLM 共用）</label>
+			                    </div>
+			                    <div id="asrIndependentSettings" class="form-grid" style="margin-top:10px; display:none;">
+			                      <div class="field">
+			                        <div class="field-label">ASR Base URL</div>
+			                        <div class="input">
+			                          <input id="asrBaseUrlInput" placeholder="https://api.openai.com 或其他兼容服务" autocomplete="off" />
+			                        </div>
+			                        <div class="field-help">留空则使用 LLM 的 Base URL。</div>
+			                      </div>
+			                      <div class="field">
+			                        <div class="field-label">ASR API Key</div>
+			                        <div class="input">
+			                          <input id="asrApiKeyInput" type="password" placeholder="留空则使用 LLM 的 API Key" autocomplete="off" />
+			                        </div>
+			                        <div class="field-help">留空则使用 LLM 的 API Key 或环境变量。</div>
 			                      </div>
 			                    </div>
 			                  </div>

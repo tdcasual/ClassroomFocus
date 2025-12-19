@@ -31,7 +31,12 @@
   const btnModelsClose = document.getElementById("btnModelsClose");
   const modelModeSel = document.getElementById("modelModeSel");
   const asrProviderSel = document.getElementById("asrProviderSel");
+  const asrModelSel = document.getElementById("asrModelSel");
   const asrModelInput = document.getElementById("asrModelInput");
+  const asrUseIndependentToggle = document.getElementById("asrUseIndependentToggle");
+  const asrIndependentSettings = document.getElementById("asrIndependentSettings");
+  const asrBaseUrlInput = document.getElementById("asrBaseUrlInput");
+  const asrApiKeyInput = document.getElementById("asrApiKeyInput");
   const llmEnabledToggle = document.getElementById("llmEnabledToggle");
   const llmBaseUrlInput = document.getElementById("llmBaseUrlInput");
   const llmApiKeyInput = document.getElementById("llmApiKeyInput");
@@ -1201,6 +1206,9 @@
     modelModeSel.value = String(cfg.mode || "offline");
     asrProviderSel.value = String(cfg.asr?.provider || "none");
     asrModelInput.value = String(cfg.asr?.model || "");
+    if (asrUseIndependentToggle) asrUseIndependentToggle.checked = Boolean(cfg.asr?.use_independent);
+    if (asrBaseUrlInput) asrBaseUrlInput.value = String(cfg.asr?.base_url || "");
+    if (asrApiKeyInput) asrApiKeyInput.value = String(cfg.asr?.api_key || "");
     llmEnabledToggle.checked = Boolean(cfg.llm?.enabled);
     llmBaseUrlInput.value = String(cfg.llm?.base_url || "");
     llmApiKeyInput.value = String(cfg.llm?.api_key || "");
@@ -1211,7 +1219,8 @@
 
   function updateModelFormDisabledState() {
     const cfg = state.models.config || {};
-    const asrProvider = String(cfg.asr?.provider || "none");
+    const asrProvider = String(asrProviderSel.value || cfg.asr?.provider || "none");
+    const asrUseIndependent = asrUseIndependentToggle && asrUseIndependentToggle.checked;
     const busy = Boolean(state.models.checking || state.models.llmModelsLoading);
 
     modelModeSel.disabled = busy;
@@ -1224,7 +1233,15 @@
     llmModelInput.disabled = busy;
 
     asrProviderSel.disabled = busy;
-    asrModelInput.disabled = busy || asrProvider === "none" || asrProvider === "xfyun_raasr";
+    const asrModelDisabled = busy || asrProvider === "none" || asrProvider === "xfyun_raasr";
+    asrModelInput.disabled = asrModelDisabled;
+    if (asrModelSel) asrModelSel.disabled = asrModelDisabled || !(state.models.llmModels && state.models.llmModels.length);
+    if (asrUseIndependentToggle) asrUseIndependentToggle.disabled = busy || asrProvider !== "openai_compat";
+    if (asrBaseUrlInput) asrBaseUrlInput.disabled = busy || !asrUseIndependent;
+    if (asrApiKeyInput) asrApiKeyInput.disabled = busy || !asrUseIndependent;
+    if (asrIndependentSettings) {
+      asrIndependentSettings.style.display = asrUseIndependent && asrProvider === "openai_compat" ? "" : "none";
+    }
 
     btnModelsSave.disabled = busy;
     btnModelsCheck.disabled = busy;
@@ -1251,7 +1268,10 @@
       llmModelSel.appendChild(opt);
     }
 
-    if (cur && models.includes(cur)) llmModelSel.value = cur;
+    // Case-insensitive matching for model selection
+    const curLower = cur.toLowerCase();
+    const matchIdx = models.findIndex((m) => String(m).toLowerCase() === curLower);
+    if (cur && matchIdx >= 0) llmModelSel.value = models[matchIdx];
     else llmModelSel.value = "";
 
     if (!state.models.llmModelsLoading) {
@@ -1263,6 +1283,37 @@
         llmModelsStatus.textContent = "（未拉取）";
       }
     }
+
+    // Also update ASR model select
+    renderAsrModelsSelect();
+  }
+
+  function renderAsrModelsSelect() {
+    if (!asrModelSel) return;
+    const cfg = state.models.config || {};
+    const cur = String(cfg.asr?.model || "").trim();
+    const models = Array.isArray(state.models.llmModels) ? state.models.llmModels : [];
+
+    asrModelSel.innerHTML = "";
+    const opt0 = document.createElement("option");
+    opt0.value = "";
+    opt0.textContent = models.length ? "选择模型…" : "（先在 LLM 拉取模型）";
+    asrModelSel.appendChild(opt0);
+
+    for (const id of models) {
+      const mid = String(id || "").trim();
+      if (!mid) continue;
+      const opt = document.createElement("option");
+      opt.value = mid;
+      opt.textContent = mid;
+      asrModelSel.appendChild(opt);
+    }
+
+    // Case-insensitive matching for model selection
+    const curLower = cur.toLowerCase();
+    const matchIdx = models.findIndex((m) => String(m).toLowerCase() === curLower);
+    if (cur && matchIdx >= 0) asrModelSel.value = models[matchIdx];
+    else asrModelSel.value = "";
   }
 
   async function fetchJsonSoft(url, options) {
@@ -1319,20 +1370,26 @@
 
   function syncModelStateFromForm() {
     const existing = state.models.config && typeof state.models.config === "object" ? state.models.config : {};
+    const llmEnabled = Boolean(llmEnabledToggle.checked);
+    const asrProvider = String(asrProviderSel.value || "none");
+    const asrUseIndependent = asrUseIndependentToggle && asrUseIndependentToggle.checked && asrProvider === "openai_compat";
     const cfg = {
       mode: String(modelModeSel.value || existing.mode || "offline"),
       llm: {
         ...(existing.llm && typeof existing.llm === "object" ? existing.llm : {}),
-        enabled: Boolean(llmEnabledToggle.checked),
-        provider: "openai_compat",
+        enabled: llmEnabled,
+        provider: llmEnabled ? "openai_compat" : (existing.llm?.provider || "openai_compat"),
         base_url: String(llmBaseUrlInput.value || "").trim(),
         api_key: String(llmApiKeyInput.value || "").trim(),
         model: String(llmModelInput.value || "").trim(),
       },
       asr: {
         ...(existing.asr && typeof existing.asr === "object" ? existing.asr : {}),
-        provider: String(asrProviderSel.value || "none"),
+        provider: asrProvider,
         model: String(asrModelInput.value || "").trim(),
+        use_independent: asrUseIndependent,
+        base_url: asrUseIndependent && asrBaseUrlInput ? String(asrBaseUrlInput.value || "").trim() : "",
+        api_key: asrUseIndependent && asrApiKeyInput ? String(asrApiKeyInput.value || "").trim() : "",
       },
     };
     state.models.config = cfg;
@@ -1401,13 +1458,6 @@
     renderModelCheckBox();
     initModelDrawerPos();
     setModelSettingsView("__all__", { preserveAllScroll: false });
-    modelModal.addEventListener(
-      "click",
-      (e) => {
-        if (e.target === modelModal) closeModelModal();
-      },
-      { once: true },
-    );
   }
 
   function closeModelModal() {
@@ -1447,7 +1497,7 @@
       state.models.config = {
         ...cur,
         mode: "offline",
-        llm: { ...(cur.llm || {}), enabled: false, provider: "openai_compat" },
+        llm: { ...(cur.llm || {}), enabled: false },
         asr: { ...(cur.asr || {}), provider: "none" },
       };
       state.models.dirty = true;
@@ -1463,7 +1513,7 @@
       state.models.config = {
         ...cfg,
         mode: "offline",
-        llm: { ...(cfg.llm || {}), enabled: false, provider: "openai_compat" },
+        llm: { ...(cfg.llm || {}), enabled: false },
         asr: { ...(cfg.asr || {}), provider: "none" },
       };
       state.models.dirty = true;
@@ -1938,6 +1988,9 @@
         alert(`模型设置不可用：${String(e)}`);
       }
     });
+    modelModal.addEventListener("click", (e) => {
+      if (e.target === modelModal) closeModelModal();
+    });
     if (modelDragHandle) {
       modelDragHandle.addEventListener("pointerdown", startModelDrag);
       modelDragHandle.addEventListener("pointermove", moveModelDrag);
@@ -2007,6 +2060,27 @@
       syncModelStateFromForm();
     });
     llmModelInput.addEventListener("input", syncModelStateFromForm);
+
+    // ASR model selection events
+    if (asrModelSel) {
+      asrModelSel.addEventListener("change", () => {
+        const v = String(asrModelSel.value || "").trim();
+        if (v) asrModelInput.value = v;
+        syncModelStateFromForm();
+      });
+    }
+    if (asrUseIndependentToggle) {
+      asrUseIndependentToggle.addEventListener("change", () => {
+        syncModelStateFromForm();
+        updateModelFormDisabledState();
+      });
+    }
+    if (asrBaseUrlInput) {
+      asrBaseUrlInput.addEventListener("input", syncModelStateFromForm);
+    }
+    if (asrApiKeyInput) {
+      asrApiKeyInput.addEventListener("input", syncModelStateFromForm);
+    }
 
     windowSel.addEventListener("change", () => {
       state.windowSec = toNum(windowSel.value, 60);

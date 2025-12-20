@@ -10,6 +10,7 @@ from pathlib import Path
 from queue import Queue, Empty
 import subprocess
 import logging
+from contextlib import nullcontext
 
 # Ensure project root is in path
 import sys
@@ -17,7 +18,7 @@ PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
-from cv.face_analyzer import FaceAnalyzer, FaceAnalyzerConfig
+from cv.face_analyzer import FaceAnalyzer, FaceAnalyzerConfig, AdaptiveScheduler
 
 logger = logging.getLogger("SessionManager")
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,22 @@ class SessionManager:
         self.ffmpeg_path = ffmpeg_path
         self.camera_index = camera_index
         self.mic_device = mic_device
+        self.preview_enabled = os.getenv("WEB_PREVIEW_ENABLED", "1").lower() not in ("0", "false", "no")
+        try:
+            self.preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))
+        except Exception:
+            self.preview_interval_sec = 0.15
+        self.video_write_enabled = os.getenv("WEB_RECORD_VIDEO", "1").lower() not in ("0", "false", "no")
+        self.audio_enabled = os.getenv("WEB_RECORD_AUDIO", "1").lower() not in ("0", "false", "no")
+        self.faces_write_enabled = os.getenv("WEB_WRITE_FACES", "1").lower() not in ("0", "false", "no")
+        try:
+            self.faces_sample_sec = float(os.getenv("WEB_FACES_SAMPLE_SEC", "0") or 0)
+        except Exception:
+            self.faces_sample_sec = 0.0
+        self.face_cfg = None
+        self.device_profile = None
+        self.profile_overrides = {}
+        self.adaptive_scheduler = None
         
         self.is_recording = False
         self.stop_event = threading.Event()
@@ -48,6 +65,46 @@ class SessionManager:
         self.audio_queue = Queue()
         self.sample_rate = 16000
         self.channels = 1
+
+    def set_preview(self, enabled=None, interval_sec=None):
+        if enabled is not None:
+            self.preview_enabled = bool(enabled)
+        if interval_sec is not None:
+            try:
+                self.preview_interval_sec = float(interval_sec)
+            except Exception:
+                pass
+
+    def set_video_write(self, enabled=None):
+        if enabled is not None:
+            self.video_write_enabled = bool(enabled)
+
+    def set_audio_enabled(self, enabled=None):
+        if enabled is not None:
+            self.audio_enabled = bool(enabled)
+
+    def set_faces_write(self, enabled=None, sample_sec=None):
+        if enabled is not None:
+            self.faces_write_enabled = bool(enabled)
+        if sample_sec is not None:
+            try:
+                self.faces_sample_sec = float(sample_sec)
+            except Exception:
+                pass
+
+    def set_face_config(self, cfg):
+        self.face_cfg = cfg
+
+    def set_device_profile(self, profile, overrides=None):
+        self.device_profile = profile
+        self.profile_overrides = dict(overrides or {})
+
+    def set_adaptive_scheduler(self, enabled=None, **kwargs):
+        if enabled is False:
+            self.adaptive_scheduler = None
+            return
+        if enabled is True:
+            self.adaptive_scheduler = AdaptiveScheduler(**kwargs)
 
     def set_callback(self, callback):
         self.on_data_callback = callback
@@ -91,17 +148,28 @@ class SessionManager:
                     pass
 
             # Initialize FaceAnalyzer
-            cfg = FaceAnalyzerConfig() # Use defaults or allow tuning
+            if self.face_cfg is not None:
+                cfg = self.face_cfg
+            elif self.device_profile is not None:
+                cfg = FaceAnalyzerConfig.from_device_profile(self.device_profile)
+                for key, value in (self.profile_overrides or {}).items():
+                    if hasattr(cfg, key):
+                        setattr(cfg, key, value)
+            else:
+                cfg = FaceAnalyzerConfig() # Use defaults or allow tuning
             self.face_analyzer = FaceAnalyzer(cfg)
+            if self.adaptive_scheduler:
+                self.adaptive_scheduler.reset()
 
             self.is_recording = True
 
             # Start threads
             self.video_thread = threading.Thread(target=self._video_loop, daemon=True)
-            self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
+            self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True) if self.audio_enabled else None
             
             self.video_thread.start()
-            self.audio_thread.start()
+            if self.audio_thread:
+                self.audio_thread.start()
             
             return self.session_id
         except Exception:
@@ -161,15 +229,15 @@ class SessionManager:
             pass
 
         # Ensure we actually captured audio for the whole session.
-        audio_path = (self.output_dir / "temp_audio.wav") if self.output_dir else None
+        audio_path = (self.output_dir / "temp_audio.wav") if (self.output_dir and self.audio_enabled) else None
             
         # Post-processing: Mux video and audio
         self._mux_files()
 
         # Validate audio/video after mux so artifacts are still produced for debugging.
-        if self.audio_error:
+        if self.audio_enabled and self.audio_error:
             raise RuntimeError(f"Audio recording failed: {self.audio_error}")
-        if audio_path and (not audio_path.exists() or audio_path.stat().st_size <= 0):
+        if self.audio_enabled and audio_path and (not audio_path.exists() or audio_path.stat().st_size <= 0):
             raise RuntimeError("Audio recording output is missing/empty (temp_audio.wav).")
         if self.video_error:
             # Video problems are reported as warnings so we still keep the audio
@@ -205,10 +273,12 @@ class SessionManager:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         
-        temp_video_path = self.output_dir / "temp_video.avi"
-        # MJPG is usually safe and widely supported for AVI
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG') 
-        out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
+        out = None
+        if self.video_write_enabled:
+            temp_video_path = self.output_dir / "temp_video.avi"
+            # MJPG is usually safe and widely supported for AVI
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG') 
+            out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
         faces_path = self.output_dir / "faces.jsonl"
         events_path = self.output_dir / "cv_events.jsonl"
@@ -216,10 +286,15 @@ class SessionManager:
         frame_idx = 0
         start_time = self.session_start_wall or time.time()
         last_preview_ts = -1e9
-        preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))  # ~6-7 fps by default
+        preview_interval_sec = self.preview_interval_sec
+        preview_enabled = bool(self.preview_enabled) and preview_interval_sec > 0.0
+        last_face_write_ts = -1e9
+        faces_write_enabled = bool(self.faces_write_enabled)
+        faces_sample_sec = float(self.faces_sample_sec or 0.0)
 
         try:
-            with open(faces_path, "w", encoding="utf-8") as f_faces, \
+            faces_ctx = open(faces_path, "w", encoding="utf-8") if faces_write_enabled else nullcontext(None)
+            with faces_ctx as f_faces, \
                  open(events_path, "w", encoding="utf-8") as f_events:
                 
                 while not self.stop_event.is_set():
@@ -234,13 +309,27 @@ class SessionManager:
                     ts = current_time - start_time
                     
                     # Analyze
+                    infer_t0 = time.perf_counter()
                     results, events = self.face_analyzer.analyze_frame(frame, ts)
+                    infer_ms = (time.perf_counter() - infer_t0) * 1000.0
+                    if self.adaptive_scheduler and self.face_analyzer and self.face_analyzer._mesh is not None:
+                        processed = True
+                        if self.face_analyzer.cfg.process_every_n > 1:
+                            processed = (self.face_analyzer._frame_count % self.face_analyzer.cfg.process_every_n) == 0
+                        if processed:
+                            self.adaptive_scheduler.update(infer_ms=infer_ms, cpu_percent=None)
+                            self.adaptive_scheduler.apply_to_config(self.face_analyzer.cfg)
                     
                     # Write to files
-                    for r in results:
-                        # Add frame index
-                        r['frame'] = frame_idx
-                        f_faces.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    write_faces = False
+                    if f_faces is not None:
+                        write_faces = faces_sample_sec <= 0 or (ts - last_face_write_ts) >= faces_sample_sec
+                    if write_faces:
+                        last_face_write_ts = ts
+                        for r in results:
+                            # Add frame index
+                            r['frame'] = frame_idx
+                            f_faces.write(json.dumps(r, ensure_ascii=False) + "\n")
                     
                     for e in events:
                         if 'ts' not in e or e['ts'] is None:
@@ -248,13 +337,14 @@ class SessionManager:
                         f_events.write(json.dumps(e, ensure_ascii=False) + "\n")
     
                     # Write video
-                    out.write(frame)
+                    if out:
+                        out.write(frame)
                     
                     # Callback for Web Viz
                     if self.on_data_callback:
                         img_str = None
                         # Throttle preview frames to reduce CPU/network usage.
-                        if (ts - last_preview_ts) >= preview_interval_sec:
+                        if preview_enabled and (ts - last_preview_ts) >= preview_interval_sec:
                             last_preview_ts = ts
                             try:
                                 _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
@@ -279,10 +369,11 @@ class SessionManager:
                 cap.release()
             except Exception:
                 pass
-            try:
-                out.release()
-            except Exception:
-                pass
+            if out:
+                try:
+                    out.release()
+                except Exception:
+                    pass
 
     def _audio_loop(self):
         temp_audio_path = self.output_dir / "temp_audio.wav"

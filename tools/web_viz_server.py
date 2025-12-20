@@ -78,8 +78,347 @@ logger.info(f"Device profile detected: {DEVICE_PROFILE.name} (constrained={DEVIC
 # Save profile for other processes
 save_runtime_profile(DEVICE_PROFILE, str(PROJ_ROOT))
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_ui_mode(profile: DeviceProfile) -> str:
+    raw = str(os.getenv("WEB_UI_MODE") or "").strip().lower()
+    if raw in ("lite", "low", "rpi", "constrained"):
+        return "lite"
+    if raw in ("full", "default", "classic"):
+        return "full"
+    if raw in ("auto", ""):
+        return "lite" if profile.is_constrained else "full"
+    return "full"
+
+
+UI_MODE = _resolve_ui_mode(DEVICE_PROFILE)
+LITE_MODE = UI_MODE == "lite"
+try:
+    LITE_STATUS_INTERVAL_SEC = float(os.getenv("LITE_STATUS_INTERVAL_SEC", "5"))
+except Exception:
+    LITE_STATUS_INTERVAL_SEC = 5.0
+LITE_AUTO_START = _env_bool("LITE_AUTO_START", default=True)
+LITE_AUTO_REPORT = _env_bool("LITE_AUTO_REPORT", default=False)
+LITE_DISABLE_VIDEO_WRITE = _env_bool("LITE_DISABLE_VIDEO_WRITE", default=True)
+LITE_DISABLE_AUDIO = _env_bool("LITE_DISABLE_AUDIO", default=True)
+LITE_WRITE_FACES = _env_bool("LITE_WRITE_FACES", default=True)
+try:
+    LITE_FACES_SAMPLE_SEC = float(os.getenv("LITE_FACES_SAMPLE_SEC", "1.0"))
+except Exception:
+    LITE_FACES_SAMPLE_SEC = 1.0
+try:
+    LITE_AUTO_STOP_SEC = float(os.getenv("LITE_AUTO_STOP_SEC", "0"))
+except Exception:
+    LITE_AUTO_STOP_SEC = 0.0
+LITE_AUTO_UPLOAD = _env_bool("LITE_AUTO_UPLOAD", default=False)
+LITE_ADAPTIVE_SCHEDULER = _env_bool("LITE_ADAPTIVE_SCHEDULER", default=True)
+try:
+    LITE_RECOVERY_BACKOFF_SEC = float(os.getenv("LITE_RECOVERY_BACKOFF_SEC", "3.0"))
+except Exception:
+    LITE_RECOVERY_BACKOFF_SEC = 3.0
+try:
+    LITE_RECOVERY_MAX_FAILS = int(os.getenv("LITE_RECOVERY_MAX_FAILS", "3"))
+except Exception:
+    LITE_RECOVERY_MAX_FAILS = 3
+try:
+    LITE_HEARTBEAT_SEC = float(os.getenv("LITE_HEARTBEAT_SEC", "60"))
+except Exception:
+    LITE_HEARTBEAT_SEC = 60.0
+
+if LITE_MODE:
+    session_mgr.set_preview(enabled=False)
+    if LITE_DISABLE_VIDEO_WRITE:
+        session_mgr.set_video_write(enabled=False)
+    session_mgr.set_audio_enabled(not LITE_DISABLE_AUDIO)
+    if LITE_WRITE_FACES and LITE_FACES_SAMPLE_SEC > 0:
+        session_mgr.set_faces_write(enabled=True, sample_sec=LITE_FACES_SAMPLE_SEC)
+    else:
+        session_mgr.set_faces_write(enabled=False)
+    lite_overrides = {
+        "max_faces": int(os.getenv("LITE_MAX_FACES", "1")),
+        "process_every_n": int(os.getenv("LITE_PROCESS_EVERY_N", "3")),
+        "target_fps": float(os.getenv("LITE_TARGET_FPS", "8")),
+        "input_scale": float(os.getenv("LITE_INPUT_SCALE", "0.5")),
+        "compensate_camera_similarity": not _env_bool("LITE_DISABLE_CAMERA_SIMILARITY", default=True),
+    }
+    session_mgr.set_device_profile(DEVICE_PROFILE, overrides=lite_overrides)
+    if LITE_ADAPTIVE_SCHEDULER:
+        session_mgr.set_adaptive_scheduler(
+            enabled=True,
+            target_cpu=float(os.getenv("LITE_ADAPTIVE_CPU", "65")),
+            target_latency_ms=float(os.getenv("LITE_ADAPTIVE_LATENCY_MS", "120")),
+            max_skip=int(os.getenv("LITE_ADAPTIVE_MAX_SKIP", "6")),
+        )
+    logger.info("UI mode: lite (preview disabled)")
+else:
+    logger.info("UI mode: full")
+
 # ---- Model config (in-memory defaults for next session) ----
 _MODEL_CFG: Dict[str, Any] = {}
+
+# ---- Lite UI state (for delta snapshots) ----
+LITE_STATE = {
+    "last_emit_ts": -1e9,
+    "last_snapshot": {},
+    "pending": False,
+    "latest_faces": [],
+    "latest_snapshot": {},
+    "latest_ts": 0.0,
+    "session_id": None,
+    "last_diff": {"changed": {}, "removed": []},
+}
+LITE_AUTOSTOP_TASK = None
+
+
+def _reset_lite_state(session_id=None):
+    LITE_STATE["last_emit_ts"] = -1e9
+    LITE_STATE["last_snapshot"] = {}
+    LITE_STATE["pending"] = False
+    LITE_STATE["latest_faces"] = []
+    LITE_STATE["latest_snapshot"] = {}
+    LITE_STATE["latest_ts"] = 0.0
+    LITE_STATE["session_id"] = session_id
+    LITE_STATE["last_diff"] = {"changed": {}, "removed": []}
+
+
+def _snapshot_from_faces(faces):
+    snap = {}
+    for f in faces:
+        if not isinstance(f, dict):
+            continue
+        sid = f.get("track_id")
+        if sid is None:
+            sid = f.get("student_id")
+        if sid is None:
+            continue
+        state = str(f.get("state") or "unknown")
+        snap[str(sid)] = state
+    return snap
+
+
+def _diff_snapshots(prev, cur):
+    changed = {}
+    for sid, st in cur.items():
+        if prev.get(sid) != st:
+            changed[sid] = st
+    removed = [sid for sid in prev.keys() if sid not in cur]
+    return changed, removed
+
+
+def _track_sort_key(item):
+    sid = item.get("track_id")
+    try:
+        return (0, int(sid))
+    except Exception:
+        return (1, str(sid))
+
+
+def _build_lite_faces(faces, ts):
+    out = []
+    for f in faces:
+        if not isinstance(f, dict):
+            continue
+        sid = f.get("track_id")
+        if sid is None:
+            sid = f.get("student_id")
+        if sid is None:
+            continue
+        out.append({
+            "track_id": str(sid),
+            "state": str(f.get("state") or "unknown"),
+            "last_seen": float(f.get("ts") or ts or 0.0),
+        })
+    out.sort(key=_track_sort_key)
+    return out
+
+
+def _lite_snapshot_payload():
+    snapshot = LITE_STATE["latest_snapshot"] or LITE_STATE["last_snapshot"]
+    faces = [{"track_id": sid, "state": st} for sid, st in snapshot.items()]
+    faces.sort(key=_track_sort_key)
+    return {"type": "lite_snapshot", "ts": float(time.time()), "faces": faces}
+
+
+def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    try:
+        ts = float(data.get("ts", 0.0))
+    except Exception:
+        ts = 0.0
+    sid = session_mgr.session_id
+
+    faces = data.get("faces") if isinstance(data.get("faces"), list) else []
+    snapshot = _snapshot_from_faces(faces)
+
+    is_new_session = sid != LITE_STATE["session_id"]
+    if not is_new_session and LITE_STATE["last_emit_ts"] > 0 and ts < (LITE_STATE["last_emit_ts"] - 1.0):
+        is_new_session = True
+
+    if is_new_session:
+        _reset_lite_state(session_id=sid)
+        LITE_STATE["latest_faces"] = faces
+        LITE_STATE["latest_snapshot"] = dict(snapshot)
+        LITE_STATE["latest_ts"] = ts
+        LITE_STATE["last_snapshot"] = dict(snapshot)
+        LITE_STATE["last_emit_ts"] = ts
+        if allow_emit:
+            return {
+                "type": "lite_snapshot",
+                "ts": ts,
+                "faces": _build_lite_faces(faces, ts),
+            }
+        return None
+
+    if not allow_emit:
+        LITE_STATE["latest_faces"] = faces
+        LITE_STATE["latest_snapshot"] = dict(snapshot)
+        LITE_STATE["latest_ts"] = ts
+        LITE_STATE["last_snapshot"] = dict(snapshot)
+        LITE_STATE["pending"] = False
+        return None
+
+    if snapshot != LITE_STATE["last_snapshot"]:
+        LITE_STATE["pending"] = True
+        LITE_STATE["latest_faces"] = faces
+        LITE_STATE["latest_snapshot"] = snapshot
+        LITE_STATE["latest_ts"] = ts
+    else:
+        LITE_STATE["pending"] = False
+
+    if not LITE_STATE["pending"]:
+        return None
+
+    if LITE_STATE["last_emit_ts"] < 0 or (ts - LITE_STATE["last_emit_ts"] >= LITE_STATUS_INTERVAL_SEC):
+        changed, removed = _diff_snapshots(LITE_STATE["last_snapshot"], LITE_STATE["latest_snapshot"])
+        if not changed and not removed:
+            LITE_STATE["pending"] = False
+            return None
+        payload = {
+            "type": "lite_delta",
+            "ts": LITE_STATE["latest_ts"] or ts,
+            "changed": changed,
+            "removed": removed,
+        }
+        LITE_STATE["last_emit_ts"] = LITE_STATE["latest_ts"] or ts
+        LITE_STATE["last_snapshot"] = dict(LITE_STATE["latest_snapshot"])
+        LITE_STATE["pending"] = False
+        LITE_STATE["last_diff"] = {"changed": dict(changed), "removed": list(removed)}
+        return payload
+    return None
+
+
+def _queue_event_threadsafe(payload: Dict[str, Any]) -> None:
+    if not main_loop:
+        return
+    try:
+        main_loop.call_soon_threadsafe(event_queue.put_nowait, payload)
+    except Exception:
+        pass
+
+
+def _emit_error_event(message: str) -> None:
+    if not message:
+        return
+    if not main_loop or not getattr(manager, "active", None):
+        return
+    payload = {"type": "error", "ts": time.time(), "error": str(message)}
+    _queue_event_threadsafe(payload)
+
+
+def _emit_lite_clear() -> None:
+    if not main_loop or not getattr(manager, "active", None):
+        return
+    payload = {"type": "lite_snapshot", "ts": time.time(), "faces": []}
+    _queue_event_threadsafe(payload)
+
+
+async def _auto_stop_worker(session_id: str, delay_sec: float) -> None:
+    try:
+        await asyncio.sleep(max(0.0, delay_sec))
+        if session_mgr.is_recording and session_mgr.session_id == session_id:
+            try:
+                await asyncio.to_thread(session_mgr.stop)
+            except Exception as exc:
+                _emit_error_event(f"Auto-stop failed: {exc}")
+            _reset_lite_state(session_id=None)
+            _emit_lite_clear()
+    except asyncio.CancelledError:
+        return
+
+
+def _schedule_lite_auto_stop(session_id: str) -> None:
+    global LITE_AUTOSTOP_TASK
+    if not LITE_MODE or LITE_AUTO_STOP_SEC <= 0:
+        return
+    if LITE_AUTOSTOP_TASK and not LITE_AUTOSTOP_TASK.done():
+        LITE_AUTOSTOP_TASK.cancel()
+    LITE_AUTOSTOP_TASK = asyncio.create_task(_auto_stop_worker(session_id, LITE_AUTO_STOP_SEC))
+
+
+async def _start_session_with_cfg(cfg: Dict[str, Any]) -> str:
+    already_recording = bool(session_mgr.is_recording)
+    sid = await asyncio.to_thread(session_mgr.start, output_dir_base=str(OUT_DIR))
+    if not sid:
+        raise RuntimeError("session start failed")
+    if not already_recording:
+        try:
+            session_dir = OUT_DIR / sid
+            _write_session_config(session_dir, cfg)
+        except Exception:
+            pass
+        if LITE_MODE:
+            _reset_lite_state(session_id=sid)
+            _schedule_lite_auto_stop(sid)
+    return sid
+
+
+async def _lite_auto_recovery_task() -> None:
+    fail_count = 0
+    backoff = max(0.5, LITE_RECOVERY_BACKOFF_SEC)
+    while True:
+        await asyncio.sleep(1.0)
+        if not LITE_MODE or not LITE_AUTO_START:
+            await asyncio.sleep(2.0)
+            continue
+        if session_mgr.is_recording:
+            fail_count = 0
+            backoff = max(0.5, LITE_RECOVERY_BACKOFF_SEC)
+            await asyncio.sleep(2.0)
+            continue
+        try:
+            cfg = _get_model_cfg()
+            await _start_session_with_cfg(cfg)
+            fail_count = 0
+            backoff = max(0.5, LITE_RECOVERY_BACKOFF_SEC)
+            await asyncio.sleep(1.0)
+        except Exception as exc:
+            fail_count += 1
+            if fail_count >= max(1, LITE_RECOVERY_MAX_FAILS):
+                _emit_error_event(f"Auto-start failed: {exc}")
+                fail_count = 0
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 60.0)
+
+
+async def _lite_heartbeat_task() -> None:
+    if LITE_HEARTBEAT_SEC <= 0:
+        return
+    while True:
+        await asyncio.sleep(LITE_HEARTBEAT_SEC)
+        if not LITE_MODE or not manager.active:
+            continue
+        payload = {"type": "lite_heartbeat", "ts": time.time()}
+        try:
+            event_queue.put_nowait(payload)
+        except Exception:
+            pass
 
 
 def _env_summary() -> Dict[str, Any]:
@@ -574,6 +913,11 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
+        if LITE_MODE:
+            try:
+                await ws.send_text(json.dumps(_lite_snapshot_payload()))
+            except Exception:
+                pass
 
     def disconnect(self, ws: WebSocket):
         try:
@@ -593,13 +937,13 @@ manager = ConnectionManager()
 
 
 async def broadcaster_task():
-    """Background task that batches events and broadcasts every 100ms."""
-    BATCH_INTERVAL = 0.1
+    """Background task that batches events and broadcasts at a fixed interval."""
+    batch_interval = 0.5 if LITE_MODE else 0.1
     while True:
         batch = []
         try:
             # wait for first item
-            item = await asyncio.wait_for(event_queue.get(), timeout=BATCH_INTERVAL)
+            item = await asyncio.wait_for(event_queue.get(), timeout=batch_interval)
             batch.append(item)
         except asyncio.TimeoutError:
             # nothing arrived in interval
@@ -619,7 +963,7 @@ async def broadcaster_task():
             payload = json.dumps({"type": "batch", "events": batch})
             await manager.broadcast(payload)
 
-        await asyncio.sleep(BATCH_INTERVAL)
+        await asyncio.sleep(batch_interval)
 
 
 async def stats_logger():
@@ -642,21 +986,63 @@ async def startup():
 
     # Configure session manager callback
     def callback_wrapper(data, img_bytes):
-        if main_loop:
-            if img_bytes:
-                data['image_base64'] = base64.b64encode(img_bytes).decode('utf-8')
-            main_loop.call_soon_threadsafe(event_queue.put_nowait, data)
+        if not main_loop:
+            return
+        if LITE_MODE:
+            if isinstance(data, dict) and data.get("type") == "error":
+                if manager.active:
+                    _queue_event_threadsafe(data)
+                return
+            payload = _handle_lite_frame(data, allow_emit=bool(manager.active))
+            if payload and manager.active:
+                _queue_event_threadsafe(payload)
+            return
+        if not manager.active:
+            return
+        if img_bytes:
+            data['image_base64'] = base64.b64encode(img_bytes).decode('utf-8')
+        _queue_event_threadsafe(data)
 
     session_mgr.set_callback(callback_wrapper)
 
     # start background tasks
     asyncio.create_task(broadcaster_task())
     asyncio.create_task(stats_logger())
+    if LITE_MODE:
+        asyncio.create_task(_lite_heartbeat_task())
+        asyncio.create_task(_lite_auto_recovery_task())
 
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/static/viz.html")
+    return RedirectResponse(url="/static/viz_lite.html" if LITE_MODE else "/static/viz.html")
+
+
+@app.get("/lite")
+async def lite_root():
+    return RedirectResponse(url="/static/viz_lite.html")
+
+
+@app.get("/api/ui/config")
+async def ui_config():
+    return JSONResponse({
+        "ok": True,
+        "ui_mode": UI_MODE,
+        "lite": {
+            "enabled": LITE_MODE,
+            "status_interval_sec": LITE_STATUS_INTERVAL_SEC,
+            "auto_start": LITE_AUTO_START,
+            "auto_report": LITE_AUTO_REPORT,
+            "disable_video_write": LITE_DISABLE_VIDEO_WRITE,
+            "disable_audio": LITE_DISABLE_AUDIO,
+            "write_faces": LITE_WRITE_FACES,
+            "faces_sample_sec": LITE_FACES_SAMPLE_SEC,
+            "auto_stop_sec": LITE_AUTO_STOP_SEC,
+            "auto_upload": LITE_AUTO_UPLOAD,
+            "adaptive_scheduler": LITE_ADAPTIVE_SCHEDULER,
+            "heartbeat_sec": LITE_HEARTBEAT_SEC,
+        },
+    })
 
 
 @app.get("/api/sessions")
@@ -737,13 +1123,7 @@ async def start_session(request: Request):
         # Persist as the current default so the UI/session status stays consistent.
         cfg = _set_model_cfg(cfg)
 
-        sid = session_mgr.start(output_dir_base=str(OUT_DIR))
-        # Persist config snapshot to session dir for report reproducibility.
-        try:
-            session_dir = OUT_DIR / sid
-            _write_session_config(session_dir, cfg)
-        except Exception:
-            pass
+        sid = await _start_session_with_cfg(cfg)
         return {"ok": True, "session_id": sid, "model_config": cfg}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -755,6 +1135,11 @@ async def stop_session(background_tasks: BackgroundTasks):
         path = session_mgr.stop()
         warn = getattr(session_mgr, "video_error", None) or None
         session_id = Path(path).name if path else None
+        if LITE_AUTOSTOP_TASK and not LITE_AUTOSTOP_TASK.done():
+            LITE_AUTOSTOP_TASK.cancel()
+        if LITE_MODE:
+            _reset_lite_state(session_id=None)
+            _emit_lite_clear()
         
         # Check if auto-upload is enabled
         webdav_cfg = _get_webdav_cfg()

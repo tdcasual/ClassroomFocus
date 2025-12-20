@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Focus Monitor Lite</title>
+    <link rel="stylesheet" href="./viz_lite.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">CF</div>
+          <div class="brand-text">
+            <div class="title">Focus Monitor Lite</div>
+            <div class="subtitle">Low-resource status view (no video preview)</div>
+          </div>
+        </div>
+        <div class="actions">
+          <div class="pill" role="status" aria-live="polite">
+            <span class="dot" id="wsDot" aria-hidden="true"></span>
+            <span id="wsText">disconnected</span>
+          </div>
+          <div class="pill" role="status" aria-live="polite">
+            <span class="dot" id="recDot" aria-hidden="true"></span>
+            <span id="recText">idle</span>
+            <span class="mono" id="sessionId"></span>
+          </div>
+          <div class="btn-group">
+            <button class="btn primary" id="btnStart">Start</button>
+            <button class="btn" id="btnStop" disabled>Stop</button>
+            <button class="btn ghost" id="btnReport" disabled>Generate Report</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Detected Faces</div>
+            <div class="panel-meta">
+              <span id="faceCount">0</span>
+              <span class="meta-sep">/</span>
+              <span id="lastUpdate">No updates yet</span>
+            </div>
+          </div>
+          <div class="face-list" id="faceList" role="list">
+            <div class="empty" id="emptyState">Waiting for detections...</div>
+          </div>
+        </section>
+
+        <section class="panel report-panel is-hidden" id="reportPanel">
+          <div class="panel-head">
+            <div class="panel-title">Report</div>
+            <div class="panel-meta" id="reportMeta">Idle</div>
+          </div>
+          <div class="report-body">
+            <div class="muted" id="reportStatus">No report running.</div>
+            <div class="report-links" id="reportLinks"></div>
+          </div>
+        </section>
+      </main>
+
+      <div class="banner error is-hidden" id="errorBanner" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="./viz_lite.js" defer></script>
+  </body>
+</html>

@@ -24,6 +24,19 @@ except Exception:  # pragma: no cover
     requests = None
 
 
+def refresh_results_timestamps(results: List[Dict[str, Any]], timestamp: float) -> None:
+    """Update cached result timestamps for skipped frames."""
+    if not isinstance(results, list):
+        return
+    try:
+        ts = float(timestamp)
+    except Exception:
+        return
+    for item in results:
+        if isinstance(item, dict):
+            item["ts"] = ts
+
+
 # -----------------------------------------------------------------------------
 # CaptureQueue: Frame dropping queue for constrained devices
 # -----------------------------------------------------------------------------
@@ -669,6 +682,35 @@ MODEL_POINTS = np.array([
     [150.,  -150., -125.],
 ], dtype=np.float32)
 
+# Lightweight ReID uses a small set of stable landmarks (translation/scale/rotation normalized).
+REID_IDXS = sorted(set([
+    1, 152, 33, 133, 263, 362, 61, 291, 4, 94, 324, 199
+]))
+
+
+def _compute_reid_descriptor(pts2d: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        max_idx = max(REID_IDXS + [LEFT_EYE_H[0], RIGHT_EYE_H[0]])
+    except Exception:
+        return None
+    if pts2d is None or pts2d.shape[0] <= max_idx:
+        return None
+    left = pts2d[LEFT_EYE_H[0]]
+    right = pts2d[RIGHT_EYE_H[0]]
+    eye_vec = right - left
+    scale = float(np.hypot(eye_vec[0], eye_vec[1]))
+    if not np.isfinite(scale) or scale <= 1e-6:
+        return None
+    center = (left + right) / 2.0
+    angle = float(np.arctan2(eye_vec[1], eye_vec[0]))
+    cos_a = float(np.cos(-angle))
+    sin_a = float(np.sin(-angle))
+    R = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+    pts = pts2d[REID_IDXS].astype(np.float32)
+    pts = (pts - center) / scale
+    pts = pts @ R.T
+    return pts.reshape(-1)
+
 
 def _dist(a, b) -> float:
     """Fast Euclidean distance between two 2D points."""
@@ -713,6 +755,8 @@ class TrackState:
     center: Tuple[float, float] = (0.0, 0.0)
     prev_center: Tuple[float, float] = (0.0, 0.0)
     miss_count: int = 0
+    reid_vec: Optional[np.ndarray] = None
+    reid_ts: Optional[float] = None
 
     ear_ema: Optional[float] = None
     pitch_ema: Optional[float] = None
@@ -781,6 +825,15 @@ class FaceAnalyzerConfig:
     camera_scale_max: float = 1.25
     camera_icp_iters: int = 2
     camera_icp_inlier_px: float = 120.0
+
+    # Lightweight ReID (landmark-based, only when ambiguous)
+    reid_enabled: bool = True
+    reid_ambiguity_px: float = 30.0
+    reid_ambiguity_ratio: float = 1.15
+    reid_accept_dist: float = 0.35
+    reid_reject_dist: float = 0.55
+    reid_bias_px: float = 24.0
+    reid_max_age_sec: float = 4.0
 
     debug_draw: bool = False
     
@@ -875,6 +928,7 @@ class FaceAnalyzer:
         self._frame_count += 1
         if self.cfg.process_every_n > 1 and (self._frame_count % self.cfg.process_every_n) != 0:
             # Return cached results for skipped frames
+            refresh_results_timestamps(self._last_results, timestamp)
             return self._last_results, []
         
         H_orig, W_orig = frame_bgr.shape[:2]
@@ -920,7 +974,7 @@ class FaceAnalyzer:
                 # Compute center directly from numpy array (vectorized mean)
                 centers.append((float(pts2d[:, 0].mean()), float(pts2d[:, 1].mean())))
 
-        assign = self._associate(centers, timestamp)
+        assign, reid_desc = self._associate(centers, timestamp, faces_pts)
 
         results: List[Dict] = []
         events: List[Dict] = []
@@ -942,6 +996,9 @@ class FaceAnalyzer:
             st.last_ts = timestamp
             st.center = center
             st.miss_count = 0
+            if idx in reid_desc:
+                st.reid_vec = reid_desc[idx]
+                st.reid_ts = timestamp
 
             # EAR
             left_ear = _ear_from_pts(pts2d, LEFT_EYE_H, LEFT_EYE_V1, LEFT_EYE_V2)
@@ -1150,7 +1207,12 @@ class FaceAnalyzer:
         except Exception:
             return None
 
-    def _associate(self, centers: List[Tuple[float, float]], timestamp: float) -> Dict[int, int]:
+    def _associate(
+        self,
+        centers: List[Tuple[float, float]],
+        timestamp: float,
+        faces_pts: Optional[List[np.ndarray]] = None,
+    ) -> Tuple[Dict[int, int], Dict[int, np.ndarray]]:
         """Assign detections to existing tracks.
 
         This matcher is designed to be robust to:
@@ -1163,12 +1225,12 @@ class FaceAnalyzer:
         """
         assign: Dict[int, int] = {}
         if not centers:
-            return assign
+            return assign, {}
         track_ids = list(self.tracks.keys())
         if not track_ids:
             for i in range(len(centers)):
                 assign[i] = None
-            return assign
+            return assign, {}
 
         def _predict_center(st: TrackState) -> Tuple[float, float]:
             """Constant-velocity prediction from (prev_center, center) with timestamps."""
@@ -1381,35 +1443,125 @@ class FaceAnalyzer:
             # Then attempt similarity compensation (rotation + zoom + translation).
             _try_camera_similarity_compensation()
 
-        # Build all candidate pairs and do a global greedy assignment by distance.
-        candidates: List[Tuple[float, int, int]] = []  # (dist, det_i, tid)
-        for i, c in enumerate(centers):
-            for tid in track_ids:
-                pc = pred[tid]
-                d = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
-                candidates.append((d, i, tid))
-        candidates.sort(key=lambda x: x[0])
-
-        assigned_dets = set()
-        assigned_tracks = set()
-        for d, i, tid in candidates:
-            if i in assigned_dets or tid in assigned_tracks:
-                continue
+        # Build candidate pairs within geometric threshold.
+        track_thresh: Dict[int, float] = {}
+        for tid in track_ids:
             st = self.tracks[tid]
             dt = max(0.0, float(timestamp - (st.last_ts or timestamp)))
             dt_cap = float(getattr(self.cfg, "match_slack_max_secs", 0.8))
             slack = min(dt, dt_cap) * float(getattr(self.cfg, "match_speed_px_per_sec", 0.0))
-            threshold = float(self.cfg.match_max_px) + slack
-            if d <= threshold:
-                assign[i] = tid
-                assigned_dets.add(i)
-                assigned_tracks.add(tid)
+            track_thresh[tid] = float(self.cfg.match_max_px) + slack
+
+        det_cands: Dict[int, List[Tuple[float, int]]] = {i: [] for i in range(len(centers))}
+        track_cands: Dict[int, List[Tuple[float, int]]] = {tid: [] for tid in track_ids}
+        for i, c in enumerate(centers):
+            for tid in track_ids:
+                pc = pred[tid]
+                d = float(np.hypot(c[0] - pc[0], c[1] - pc[1]))
+                if d <= track_thresh.get(tid, float(self.cfg.match_max_px)):
+                    det_cands[i].append((d, tid))
+                    track_cands[tid].append((d, i))
+
+        def _is_ambiguous(cands: List[Tuple[float, int]]) -> bool:
+            if len(cands) < 2:
+                return False
+            cands = sorted(cands, key=lambda x: x[0])
+            d1 = float(cands[0][0])
+            d2 = float(cands[1][0])
+            if (d2 - d1) <= float(getattr(self.cfg, "reid_ambiguity_px", 30.0)):
+                return True
+            if d1 > 1e-6 and (d2 / d1) <= float(getattr(self.cfg, "reid_ambiguity_ratio", 1.15)):
+                return True
+            return False
+
+        ambiguous_dets = set()
+        for i, cands in det_cands.items():
+            if _is_ambiguous(cands):
+                ambiguous_dets.add(i)
+        for tid, cands in track_cands.items():
+            if _is_ambiguous(cands):
+                for _, i in cands:
+                    ambiguous_dets.add(i)
+
+        reid_desc: Dict[int, np.ndarray] = {}
+        reid_dists: Dict[Tuple[int, int], float] = {}
+        if (
+            bool(getattr(self.cfg, "reid_enabled", True))
+            and ambiguous_dets
+            and faces_pts is not None
+        ):
+            for i in ambiguous_dets:
+                if i >= len(faces_pts):
+                    continue
+                desc = _compute_reid_descriptor(faces_pts[i])
+                if desc is not None:
+                    reid_desc[i] = desc
+            if reid_desc:
+                max_age = float(getattr(self.cfg, "reid_max_age_sec", 4.0))
+                track_desc: Dict[int, np.ndarray] = {}
+                for tid in track_ids:
+                    st = self.tracks[tid]
+                    if st.reid_vec is None or st.reid_ts is None:
+                        continue
+                    age = float(timestamp - st.reid_ts)
+                    if max_age > 0 and age > max_age:
+                        continue
+                    track_desc[tid] = st.reid_vec
+                for i, cands in det_cands.items():
+                    if i not in ambiguous_dets:
+                        continue
+                    desc = reid_desc.get(i)
+                    if desc is None:
+                        continue
+                    for d, tid in cands:
+                        tdesc = track_desc.get(tid)
+                        if tdesc is None:
+                            continue
+                        try:
+                            dist = float(np.linalg.norm(desc - tdesc))
+                        except Exception:
+                            continue
+                        reid_dists[(i, tid)] = dist
+
+        strong_reid: Dict[int, bool] = {}
+        if reid_dists:
+            accept_dist = float(getattr(self.cfg, "reid_accept_dist", 0.35))
+            for i in ambiguous_dets:
+                vals = [v for (di, _), v in reid_dists.items() if di == i]
+                if vals and min(vals) <= accept_dist:
+                    strong_reid[i] = True
+
+        # Build all candidate pairs and do a global greedy assignment by distance.
+        candidates: List[Tuple[float, float, int, int]] = []  # (eff_d, raw_d, det_i, tid)
+        bias_px = float(getattr(self.cfg, "reid_bias_px", 24.0))
+        reject_dist = float(getattr(self.cfg, "reid_reject_dist", 0.55))
+        for i, cands in det_cands.items():
+            for d, tid in cands:
+                if i in strong_reid:
+                    dist = reid_dists.get((i, tid))
+                    if dist is None or dist > reject_dist:
+                        continue
+                eff_d = d
+                dist = reid_dists.get((i, tid))
+                if dist is not None:
+                    eff_d = d + (bias_px * dist)
+                candidates.append((eff_d, d, i, tid))
+        candidates.sort(key=lambda x: x[0])
+
+        assigned_dets = set()
+        assigned_tracks = set()
+        for _, _, i, tid in candidates:
+            if i in assigned_dets or tid in assigned_tracks:
+                continue
+            assign[i] = tid
+            assigned_dets.add(i)
+            assigned_tracks.add(tid)
 
         for i in range(len(centers)):
             if i not in assign:
                 assign[i] = None
 
-        return assign
+        return assign, reid_desc
 
     def _draw_debug(self, frame_bgr: np.ndarray, results: List[Dict], faces_pts: List[np.ndarray]):
         """Draw landmarks and state text on the frame when debug_draw=True."""

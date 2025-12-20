@@ -1,3 +1,4 @@
+import base64
 import cv2
 import time
 import threading
@@ -11,6 +12,7 @@ from queue import Queue, Empty
 import subprocess
 import logging
 from contextlib import nullcontext
+from typing import Dict
 
 # Ensure project root is in path
 import sys
@@ -18,7 +20,9 @@ PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
+from config import load_session_config
 from cv.face_analyzer import FaceAnalyzer, FaceAnalyzerConfig, AdaptiveScheduler
+from tools.thumb_utils import effective_refresh_sec
 
 logger = logging.getLogger("SessionManager")
 logging.basicConfig(level=logging.INFO)
@@ -28,18 +32,23 @@ class SessionManager:
         self.ffmpeg_path = ffmpeg_path
         self.camera_index = camera_index
         self.mic_device = mic_device
-        self.preview_enabled = os.getenv("WEB_PREVIEW_ENABLED", "1").lower() not in ("0", "false", "no")
-        try:
-            self.preview_interval_sec = float(os.getenv("WEB_PREVIEW_INTERVAL_SEC", "0.15"))
-        except Exception:
-            self.preview_interval_sec = 0.15
-        self.video_write_enabled = os.getenv("WEB_RECORD_VIDEO", "1").lower() not in ("0", "false", "no")
-        self.audio_enabled = os.getenv("WEB_RECORD_AUDIO", "1").lower() not in ("0", "false", "no")
-        self.faces_write_enabled = os.getenv("WEB_WRITE_FACES", "1").lower() not in ("0", "false", "no")
-        try:
-            self.faces_sample_sec = float(os.getenv("WEB_FACES_SAMPLE_SEC", "0") or 0)
-        except Exception:
-            self.faces_sample_sec = 0.0
+        env_cfg = load_session_config()
+        self.preview_enabled = bool(env_cfg.preview_enabled)
+        self.preview_interval_sec = float(env_cfg.preview_interval_sec)
+        self.preview_max_width = int(env_cfg.preview_max_width)
+        self.preview_max_height = int(env_cfg.preview_max_height)
+        self.video_write_enabled = bool(env_cfg.video_write_enabled)
+        self.audio_enabled = bool(env_cfg.audio_enabled)
+        self.faces_write_enabled = bool(env_cfg.faces_write_enabled)
+        self.faces_sample_sec = float(env_cfg.faces_sample_sec)
+        self.stop_soft_timeout_sec = float(env_cfg.stop_soft_timeout_sec)
+        self.stop_hard_timeout_sec = float(env_cfg.stop_hard_timeout_sec)
+        self.preview_thumbs_enabled = bool(env_cfg.preview_thumbs_enabled)
+        self.preview_thumb_size = int(env_cfg.preview_thumb_size)
+        self.preview_thumb_quality = int(env_cfg.preview_thumb_quality)
+        self.preview_thumb_pad = float(env_cfg.preview_thumb_pad)
+        self.preview_thumb_refresh_sec = float(env_cfg.preview_thumb_refresh_sec)
+        self.preview_thumb_refresh_frames = int(env_cfg.preview_thumb_refresh_frames)
         self.face_cfg = None
         self.device_profile = None
         self.profile_overrides = {}
@@ -60,6 +69,12 @@ class SessionManager:
         self.on_data_callback = None # Function to call with frame data for web viz
         self.audio_error = None
         self.video_error = None
+        self._video_cap = None
+        self._audio_stream = None
+        self._preview_thumb_ts = {}
+        self._preview_thumb_cache = {}
+        self.last_stop_duration_sec = None
+        self.last_stop_hard_used = False
         
         # Audio buffer
         self.audio_queue = Queue()
@@ -72,6 +87,35 @@ class SessionManager:
         if interval_sec is not None:
             try:
                 self.preview_interval_sec = float(interval_sec)
+            except Exception:
+                pass
+
+    def set_preview_thumbs(self, enabled=None, size=None, quality=None, pad=None, refresh_sec=None, refresh_frames=None):
+        if enabled is not None:
+            self.preview_thumbs_enabled = bool(enabled)
+        if size is not None:
+            try:
+                self.preview_thumb_size = int(size)
+            except Exception:
+                pass
+        if quality is not None:
+            try:
+                self.preview_thumb_quality = int(quality)
+            except Exception:
+                pass
+        if pad is not None:
+            try:
+                self.preview_thumb_pad = float(pad)
+            except Exception:
+                pass
+        if refresh_sec is not None:
+            try:
+                self.preview_thumb_refresh_sec = float(refresh_sec)
+            except Exception:
+                pass
+        if refresh_frames is not None:
+            try:
+                self.preview_thumb_refresh_frames = int(refresh_frames)
             except Exception:
                 pass
 
@@ -109,6 +153,122 @@ class SessionManager:
     def set_callback(self, callback):
         self.on_data_callback = callback
 
+    def _reset_preview_thumbs(self) -> None:
+        self._preview_thumb_ts = {}
+        self._preview_thumb_cache = {}
+
+    def _preview_thumb_refresh_window(self) -> float:
+        return effective_refresh_sec(
+            self.preview_thumb_refresh_sec,
+            self.preview_interval_sec,
+            self.preview_thumb_refresh_frames,
+        )
+
+    def _resize_preview_frame(self, frame: np.ndarray) -> np.ndarray:
+        try:
+            h, w = frame.shape[:2]
+        except Exception:
+            return frame
+        max_w = int(self.preview_max_width)
+        max_h = int(self.preview_max_height)
+        if max_w <= 0 or max_h <= 0:
+            return frame
+        if w <= max_w and h <= max_h:
+            return frame
+        scale = min(float(max_w) / max(1.0, w), float(max_h) / max(1.0, h))
+        if scale >= 1.0:
+            return frame
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        try:
+            return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return frame
+
+    def _build_preview_thumbs(self, frame: np.ndarray, results: list, ts: float) -> Dict[str, str]:
+        if not self.preview_thumbs_enabled or frame is None or not results:
+            return {}
+        refresh_sec = self._preview_thumb_refresh_window()
+        now_ts = float(ts)
+        h, w = frame.shape[:2]
+        if h <= 0 or w <= 0:
+            return {}
+
+        updates: Dict[str, str] = {}
+        pad = float(self.preview_thumb_pad)
+        size = int(self.preview_thumb_size)
+        quality = int(self.preview_thumb_quality)
+
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            sid = r.get("track_id")
+            if sid is None:
+                sid = r.get("student_id")
+            if sid is None:
+                continue
+            sid = str(sid)
+            last_ts = self._preview_thumb_ts.get(sid)
+            if sid in self._preview_thumb_cache and refresh_sec > 0 and last_ts is not None:
+                if (now_ts - float(last_ts)) < refresh_sec:
+                    continue
+            bbox = r.get("bbox")
+            if not (isinstance(bbox, list) and len(bbox) >= 4):
+                continue
+            try:
+                nx, ny, nw, nh = [float(b) for b in bbox[:4]]
+            except Exception:
+                continue
+            if nw <= 0 or nh <= 0:
+                continue
+            cx = nx + nw / 2.0
+            cy = ny + nh / 2.0
+            box = max(nw, nh) * (1.0 + pad * 2.0)
+            sx0 = max(0.0, min(1.0, cx - box / 2.0))
+            sy0 = max(0.0, min(1.0, cy - box / 2.0))
+            sx1 = max(0.0, min(1.0, cx + box / 2.0))
+            sy1 = max(0.0, min(1.0, cy + box / 2.0))
+            x0 = int(max(0, min(w - 1, round(sx0 * w))))
+            y0 = int(max(0, min(h - 1, round(sy0 * h))))
+            x1 = int(max(1, min(w, round(sx1 * w))))
+            y1 = int(max(1, min(h, round(sy1 * h))))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = frame[y0:y1, x0:x1]
+            if crop.size == 0:
+                continue
+            try:
+                thumb = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            except Exception:
+                continue
+            if not ok:
+                continue
+            b64 = base64.b64encode(buf).decode("utf-8")
+            self._preview_thumb_cache[sid] = b64
+            self._preview_thumb_ts[sid] = now_ts
+            updates[sid] = b64
+        return updates
+
+    def _force_stop_resources(self) -> None:
+        try:
+            if self._video_cap is not None:
+                self._video_cap.release()
+        except Exception:
+            pass
+        try:
+            if self._audio_stream is not None:
+                try:
+                    self._audio_stream.stop()
+                except Exception:
+                    pass
+                try:
+                    self._audio_stream.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def start(self, output_dir_base="out"):
         if self.is_recording:
             logger.warning("Session already running")
@@ -118,6 +278,7 @@ class SessionManager:
         self.output_dir = Path(output_dir_base) / self.session_id
         self.video_thread = None
         self.audio_thread = None
+        self._reset_preview_thumbs()
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -197,19 +358,46 @@ class SessionManager:
         # Allow stop() even if a worker thread already flipped is_recording due to an error.
         if not self.session_id or not self.output_dir:
             return None
-            
+        t0 = time.perf_counter()
         logger.info("Stopping session...")
         self.stop_event.set()
 
         # Flip state after signaling stop (threads may check is_recording).
         self.is_recording = False
-        
+
+        soft_timeout = max(0.1, float(self.stop_soft_timeout_sec))
+        hard_timeout = max(0.1, float(self.stop_hard_timeout_sec))
+        self.last_stop_hard_used = False
+
         if self.video_thread:
-            self.video_thread.join()
+            self.video_thread.join(timeout=soft_timeout)
         if self.audio_thread:
-            self.audio_thread.join()
+            self.audio_thread.join(timeout=soft_timeout)
+
+        hard_needed = False
+        if self.video_thread and self.video_thread.is_alive():
+            hard_needed = True
+        if self.audio_thread and self.audio_thread.is_alive():
+            hard_needed = True
+
+        if hard_needed:
+            self.last_stop_hard_used = True
+            self._force_stop_resources()
+            if self.video_thread:
+                self.video_thread.join(timeout=hard_timeout)
+            if self.audio_thread:
+                self.audio_thread.join(timeout=hard_timeout)
+
+        if self.video_thread and self.video_thread.is_alive():
+            logger.warning("Video thread did not stop within %.2fs", soft_timeout + hard_timeout)
+        if self.audio_thread and self.audio_thread.is_alive():
+            logger.warning("Audio thread did not stop within %.2fs", soft_timeout + hard_timeout)
+
         self.video_thread = None
         self.audio_thread = None
+        self._reset_preview_thumbs()
+        self.last_stop_duration_sec = time.perf_counter() - t0
+        logger.info("Stop complete in %.2fs (hard=%s)", self.last_stop_duration_sec, self.last_stop_hard_used)
 
         # Persist sync metadata to align CV timestamps with audio/ASR timestamps.
         try:
@@ -267,6 +455,7 @@ class SessionManager:
             except Exception:
                 pass
             return
+        self._video_cap = cap
 
         # Video Writer setup
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -343,12 +532,16 @@ class SessionManager:
                     # Callback for Web Viz
                     if self.on_data_callback:
                         img_str = None
+                        thumb_updates = None
                         # Throttle preview frames to reduce CPU/network usage.
                         if preview_enabled and (ts - last_preview_ts) >= preview_interval_sec:
                             last_preview_ts = ts
                             try:
-                                _, buffer = cv2.imencode('.jpg', cv2.resize(frame, (320, 240)))
+                                preview_frame = self._resize_preview_frame(frame)
+                                _, buffer = cv2.imencode('.jpg', preview_frame)
                                 img_str = buffer.tobytes()
+                                if self.preview_thumbs_enabled:
+                                    thumb_updates = self._build_preview_thumbs(preview_frame, results, ts)
                             except Exception:
                                 img_str = None
                         
@@ -358,6 +551,8 @@ class SessionManager:
                             "faces": results,
                             "events": events,
                         }
+                        if thumb_updates:
+                            data["thumbs"] = thumb_updates
                         self.on_data_callback(data, img_str)
     
                     frame_idx += 1
@@ -369,6 +564,7 @@ class SessionManager:
                 cap.release()
             except Exception:
                 pass
+            self._video_cap = None
             if out:
                 try:
                     out.release()
@@ -386,7 +582,8 @@ class SessionManager:
                     channels=self.channels,
                     dtype="int16",
                     callback=self._audio_callback,
-                ):
+                ) as stream:
+                    self._audio_stream = stream
                     if self.audio_start_wall is None:
                         self.audio_start_wall = time.time()
                     while not self.stop_event.is_set():
@@ -405,6 +602,8 @@ class SessionManager:
         except Exception as e:
             self.audio_error = str(e)
             logger.error(f"Audio recording failed: {e}")
+        finally:
+            self._audio_stream = None
 
     def _audio_callback(self, indata, frames, time, status):
         if status:

@@ -6,7 +6,7 @@ import time
 import re
 import tempfile
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -24,8 +24,12 @@ from asr.dashscope_offline import DashScopeOfflineConfig, transcribe_wav_to_segm
 from asr.xfyun_raasr import XfyunRaasrConfig, transcribe_wav as xfyun_raasr_transcribe_wav
 from tools.session_manager import SessionManager
 from tools.openai_compat import OpenAICompat
+from tools.language_utils import normalize_language, llm_language_hint, asr_language_param, resolve_asr_language
+from tools.model_config_utils import merge_redacted_model_cfg, merge_session_meta
 from tools.device_probe import detect_device_profile, DeviceProfile, save_runtime_profile, list_profiles
+from tools.thumb_utils import effective_refresh_sec
 from analysis.inattentive_intervals import infer_not_visible_intervals, merge_inattentive_intervals
+from config import load_web_config
 
 import logging
 logger = logging.getLogger(__name__)
@@ -55,9 +59,6 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 OUT_DIR.mkdir(exist_ok=True)
 app.mount("/out", StaticFiles(directory=str(OUT_DIR)), name="out")
 
-# in-memory queue of events
-event_queue: asyncio.Queue = asyncio.Queue()
-
 # Session Manager Instance
 FFMPEG_PATH = os.getenv("FFMPEG_PATH") or "ffmpeg"
 session_mgr = SessionManager(ffmpeg_path=FFMPEG_PATH)
@@ -69,6 +70,8 @@ stats = {
     'received': 0,
     'batches_broadcast': 0,
     'last_batch_size': 0,
+    'dropped_events': 0,
+    'coalesced_updates': 0,
 }
 
 # ---- Device Profile Detection (at startup) ----
@@ -78,61 +81,55 @@ logger.info(f"Device profile detected: {DEVICE_PROFILE.name} (constrained={DEVIC
 # Save profile for other processes
 save_runtime_profile(DEVICE_PROFILE, str(PROJ_ROOT))
 
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _resolve_ui_mode(profile: DeviceProfile) -> str:
-    raw = str(os.getenv("WEB_UI_MODE") or "").strip().lower()
-    if raw in ("lite", "low", "rpi", "constrained"):
-        return "lite"
-    if raw in ("full", "default", "classic"):
-        return "full"
-    if raw in ("auto", ""):
-        return "lite" if profile.is_constrained else "full"
-    return "full"
-
-
-UI_MODE = _resolve_ui_mode(DEVICE_PROFILE)
+WEB_CFG = load_web_config(DEVICE_PROFILE)
+UI_MODE = WEB_CFG.ui_mode
 LITE_MODE = UI_MODE == "lite"
-try:
-    LITE_STATUS_INTERVAL_SEC = float(os.getenv("LITE_STATUS_INTERVAL_SEC", "5"))
-except Exception:
-    LITE_STATUS_INTERVAL_SEC = 5.0
-LITE_AUTO_START = _env_bool("LITE_AUTO_START", default=True)
-LITE_AUTO_REPORT = _env_bool("LITE_AUTO_REPORT", default=False)
-LITE_DISABLE_VIDEO_WRITE = _env_bool("LITE_DISABLE_VIDEO_WRITE", default=True)
-LITE_DISABLE_AUDIO = _env_bool("LITE_DISABLE_AUDIO", default=True)
-LITE_WRITE_FACES = _env_bool("LITE_WRITE_FACES", default=True)
-try:
-    LITE_FACES_SAMPLE_SEC = float(os.getenv("LITE_FACES_SAMPLE_SEC", "1.0"))
-except Exception:
-    LITE_FACES_SAMPLE_SEC = 1.0
-try:
-    LITE_AUTO_STOP_SEC = float(os.getenv("LITE_AUTO_STOP_SEC", "0"))
-except Exception:
-    LITE_AUTO_STOP_SEC = 0.0
-LITE_AUTO_UPLOAD = _env_bool("LITE_AUTO_UPLOAD", default=False)
-LITE_ADAPTIVE_SCHEDULER = _env_bool("LITE_ADAPTIVE_SCHEDULER", default=True)
-try:
-    LITE_RECOVERY_BACKOFF_SEC = float(os.getenv("LITE_RECOVERY_BACKOFF_SEC", "3.0"))
-except Exception:
-    LITE_RECOVERY_BACKOFF_SEC = 3.0
-try:
-    LITE_RECOVERY_MAX_FAILS = int(os.getenv("LITE_RECOVERY_MAX_FAILS", "3"))
-except Exception:
-    LITE_RECOVERY_MAX_FAILS = 3
-try:
-    LITE_HEARTBEAT_SEC = float(os.getenv("LITE_HEARTBEAT_SEC", "60"))
-except Exception:
-    LITE_HEARTBEAT_SEC = 60.0
+LITE_STATUS_INTERVAL_SEC = WEB_CFG.lite.status_interval_sec
+LITE_AUTO_START = WEB_CFG.lite.auto_start
+LITE_AUTO_REPORT = WEB_CFG.lite.auto_report
+LITE_DISABLE_VIDEO_WRITE = WEB_CFG.lite.disable_video_write
+LITE_DISABLE_AUDIO = WEB_CFG.lite.disable_audio
+LITE_WRITE_FACES = WEB_CFG.lite.write_faces
+LITE_FACES_SAMPLE_SEC = WEB_CFG.lite.faces_sample_sec
+LITE_AUTO_STOP_SEC = WEB_CFG.lite.auto_stop_sec
+LITE_AUTO_UPLOAD = WEB_CFG.lite.auto_upload
+LITE_ADAPTIVE_SCHEDULER = WEB_CFG.lite.adaptive_scheduler
+LITE_RECOVERY_BACKOFF_SEC = WEB_CFG.lite.recovery_backoff_sec
+LITE_RECOVERY_MAX_FAILS = WEB_CFG.lite.recovery_max_fails
+LITE_HEARTBEAT_SEC = WEB_CFG.lite.heartbeat_sec
+LITE_THUMBNAILS = WEB_CFG.lite.thumbnails
+LITE_THUMB_INTERVAL_SEC = WEB_CFG.lite.thumb_interval_sec
+LITE_THUMB_SIZE = WEB_CFG.lite.thumb_size
+LITE_THUMB_QUALITY = WEB_CFG.lite.thumb_quality
+LITE_THUMB_PAD = WEB_CFG.lite.thumb_pad
+LITE_THUMB_REFRESH_SEC = WEB_CFG.lite.thumb_refresh_sec
+LITE_THUMB_REFRESH_FRAMES = WEB_CFG.lite.thumb_refresh_frames
+LITE_MAX_FACES = WEB_CFG.lite.max_faces
+LITE_PROCESS_EVERY_N = WEB_CFG.lite.process_every_n
+LITE_TARGET_FPS = WEB_CFG.lite.target_fps
+LITE_INPUT_SCALE = WEB_CFG.lite.input_scale
+LITE_DISABLE_CAMERA_SIMILARITY = WEB_CFG.lite.disable_camera_similarity
+LITE_ADAPTIVE_CPU = WEB_CFG.lite.adaptive_cpu
+LITE_ADAPTIVE_LATENCY_MS = WEB_CFG.lite.adaptive_latency_ms
+LITE_ADAPTIVE_MAX_SKIP = WEB_CFG.lite.adaptive_max_skip
+
+WEB_IDLE_THROTTLE_SEC = WEB_CFG.idle_throttle_sec
+WEB_IDLE_PREVIEW_INTERVAL_SEC = WEB_CFG.idle_preview_interval_sec
+WEB_IDLE_STATS_INTERVAL_SEC = WEB_CFG.idle_stats_interval_sec
 
 if LITE_MODE:
-    session_mgr.set_preview(enabled=False)
+    session_mgr.set_preview(
+        enabled=LITE_THUMBNAILS,
+        interval_sec=LITE_THUMB_INTERVAL_SEC if LITE_THUMBNAILS else None,
+    )
+    session_mgr.set_preview_thumbs(
+        enabled=LITE_THUMBNAILS,
+        size=LITE_THUMB_SIZE,
+        quality=LITE_THUMB_QUALITY,
+        pad=LITE_THUMB_PAD,
+        refresh_sec=LITE_THUMB_REFRESH_SEC,
+        refresh_frames=LITE_THUMB_REFRESH_FRAMES,
+    )
     if LITE_DISABLE_VIDEO_WRITE:
         session_mgr.set_video_write(enabled=False)
     session_mgr.set_audio_enabled(not LITE_DISABLE_AUDIO)
@@ -141,23 +138,42 @@ if LITE_MODE:
     else:
         session_mgr.set_faces_write(enabled=False)
     lite_overrides = {
-        "max_faces": int(os.getenv("LITE_MAX_FACES", "1")),
-        "process_every_n": int(os.getenv("LITE_PROCESS_EVERY_N", "3")),
-        "target_fps": float(os.getenv("LITE_TARGET_FPS", "8")),
-        "input_scale": float(os.getenv("LITE_INPUT_SCALE", "0.5")),
-        "compensate_camera_similarity": not _env_bool("LITE_DISABLE_CAMERA_SIMILARITY", default=True),
+        "max_faces": int(LITE_MAX_FACES),
+        "process_every_n": int(LITE_PROCESS_EVERY_N),
+        "target_fps": float(LITE_TARGET_FPS),
+        "input_scale": float(LITE_INPUT_SCALE),
+        "compensate_camera_similarity": not bool(LITE_DISABLE_CAMERA_SIMILARITY),
     }
     session_mgr.set_device_profile(DEVICE_PROFILE, overrides=lite_overrides)
     if LITE_ADAPTIVE_SCHEDULER:
         session_mgr.set_adaptive_scheduler(
             enabled=True,
-            target_cpu=float(os.getenv("LITE_ADAPTIVE_CPU", "65")),
-            target_latency_ms=float(os.getenv("LITE_ADAPTIVE_LATENCY_MS", "120")),
-            max_skip=int(os.getenv("LITE_ADAPTIVE_MAX_SKIP", "6")),
+            target_cpu=float(LITE_ADAPTIVE_CPU),
+            target_latency_ms=float(LITE_ADAPTIVE_LATENCY_MS),
+            max_skip=int(LITE_ADAPTIVE_MAX_SKIP),
         )
     logger.info("UI mode: lite (preview disabled)")
 else:
     logger.info("UI mode: full")
+
+# in-memory queue of events
+EVENT_QUEUE_MAXSIZE = int(getattr(WEB_CFG, "event_queue_maxsize", 2000) or 0)
+event_queue: asyncio.Queue = (
+    asyncio.Queue(maxsize=EVENT_QUEUE_MAXSIZE) if EVENT_QUEUE_MAXSIZE > 0 else asyncio.Queue()
+)
+
+LAST_CLIENT_TS = time.time()
+PREVIEW_DEFAULT_ENABLED = bool(session_mgr.preview_enabled)
+PREVIEW_DEFAULT_INTERVAL = float(session_mgr.preview_interval_sec)
+PREVIEW_DEFAULT_THUMBS = bool(session_mgr.preview_thumbs_enabled)
+PREVIEW_DEFAULT_THUMB_CFG = {
+    "size": int(session_mgr.preview_thumb_size),
+    "quality": int(session_mgr.preview_thumb_quality),
+    "pad": float(session_mgr.preview_thumb_pad),
+    "refresh_sec": float(session_mgr.preview_thumb_refresh_sec),
+    "refresh_frames": int(session_mgr.preview_thumb_refresh_frames),
+}
+PREVIEW_THROTTLED = False
 
 # ---- Model config (in-memory defaults for next session) ----
 _MODEL_CFG: Dict[str, Any] = {}
@@ -172,7 +188,14 @@ LITE_STATE = {
     "latest_ts": 0.0,
     "session_id": None,
     "last_diff": {"changed": {}, "removed": []},
+    "thumbs": {},
+    "thumb_updates": {},
+    "thumb_ts": {},
 }
+
+COALESCE_TYPES = {"frame_data"}
+COALESCE_CACHE: Dict[str, Dict[str, Any]] = {}
+COALESCE_PENDING: Dict[str, bool] = {}
 LITE_AUTOSTOP_TASK = None
 
 
@@ -185,6 +208,14 @@ def _reset_lite_state(session_id=None):
     LITE_STATE["latest_ts"] = 0.0
     LITE_STATE["session_id"] = session_id
     LITE_STATE["last_diff"] = {"changed": {}, "removed": []}
+    LITE_STATE["thumbs"] = {}
+    LITE_STATE["thumb_updates"] = {}
+    LITE_STATE["thumb_ts"] = {}
+
+
+def _mark_client_activity() -> None:
+    global LAST_CLIENT_TS
+    LAST_CLIENT_TS = time.time()
 
 
 def _snapshot_from_faces(faces):
@@ -238,14 +269,131 @@ def _build_lite_faces(faces, ts):
     return out
 
 
+def _thumbs_for_snapshot(snapshot: Dict[str, Any]) -> Dict[str, str]:
+    if not LITE_STATE.get("thumbs"):
+        return {}
+    out: Dict[str, str] = {}
+    for sid in snapshot.keys():
+        thumb = LITE_STATE["thumbs"].get(str(sid))
+        if thumb:
+            out[str(sid)] = thumb
+    return out
+
+
+def _lite_thumb_refresh_sec() -> float:
+    preview_interval = float(getattr(session_mgr, "preview_interval_sec", 0.0) or 0.0)
+    return effective_refresh_sec(LITE_THUMB_REFRESH_SEC, preview_interval, LITE_THUMB_REFRESH_FRAMES)
+
+
+def _apply_thumb_updates(updates: Dict[str, Any], ts: float) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not updates:
+        return out
+    now_ts = float(ts)
+    for sid, b64 in updates.items():
+        if not b64:
+            continue
+        key = str(sid)
+        val = str(b64)
+        LITE_STATE.setdefault("thumbs", {})[key] = val
+        LITE_STATE.setdefault("thumb_ts", {})[key] = now_ts
+        out[key] = val
+    return out
+
+
+def _maybe_capture_thumbs(
+    faces: List[Dict[str, Any]],
+    img_bytes: Optional[bytes],
+    ts: Optional[float] = None,
+) -> Dict[str, str]:
+    if not LITE_THUMBNAILS or not img_bytes or not faces:
+        return {}
+    refresh_sec = _lite_thumb_refresh_sec()
+    now_ts = float(ts) if ts is not None else time.time()
+    candidates = []
+    for f in faces:
+        if not isinstance(f, dict):
+            continue
+        sid = f.get("track_id")
+        if sid is None:
+            sid = f.get("student_id")
+        if sid is None:
+            continue
+        sid = str(sid)
+        last_ts = LITE_STATE.get("thumb_ts", {}).get(sid)
+        if sid not in LITE_STATE.get("thumbs", {}):
+            candidates.append((sid, f))
+            continue
+        if refresh_sec > 0 and (last_ts is None or (now_ts - float(last_ts)) >= refresh_sec):
+            candidates.append((sid, f))
+    if not candidates:
+        return {}
+    try:
+        import numpy as np
+        import cv2
+    except Exception:
+        return {}
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return {}
+    h, w = img.shape[:2]
+    updates: Dict[str, str] = {}
+    for sid, f in candidates:
+        bbox = f.get("bbox")
+        if not (isinstance(bbox, list) and len(bbox) >= 4):
+            continue
+        try:
+            nx, ny, nw, nh = [float(b) for b in bbox[:4]]
+        except Exception:
+            continue
+        if nw <= 0 or nh <= 0:
+            continue
+        pad = float(LITE_THUMB_PAD)
+        cx = nx + nw / 2.0
+        cy = ny + nh / 2.0
+        size = max(nw, nh) * (1.0 + pad * 2.0)
+        sx0 = max(0.0, cx - size / 2.0)
+        sy0 = max(0.0, cy - size / 2.0)
+        sx1 = min(1.0, cx + size / 2.0)
+        sy1 = min(1.0, cy + size / 2.0)
+        x0 = int(max(0, min(w - 1, round(sx0 * w))))
+        y0 = int(max(0, min(h - 1, round(sy0 * h))))
+        x1 = int(max(1, min(w, round(sx1 * w))))
+        y1 = int(max(1, min(h, round(sy1 * h))))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = img[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        try:
+            thumb = cv2.resize(crop, (LITE_THUMB_SIZE, LITE_THUMB_SIZE), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), int(LITE_THUMB_QUALITY)])
+        except Exception:
+            continue
+        if not ok:
+            continue
+        b64 = base64.b64encode(buf).decode("utf-8")
+        LITE_STATE.setdefault("thumbs", {})[sid] = b64
+        LITE_STATE.setdefault("thumb_ts", {})[sid] = now_ts
+        updates[sid] = b64
+    return updates
+
+
 def _lite_snapshot_payload():
     snapshot = LITE_STATE["latest_snapshot"] or LITE_STATE["last_snapshot"]
     faces = [{"track_id": sid, "state": st} for sid, st in snapshot.items()]
     faces.sort(key=_track_sort_key)
-    return {"type": "lite_snapshot", "ts": float(time.time()), "faces": faces}
+    payload = {"type": "lite_snapshot", "ts": float(time.time()), "faces": faces}
+    thumbs = _thumbs_for_snapshot(snapshot)
+    if thumbs:
+        payload["thumbs"] = thumbs
+    return payload
 
 
-def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optional[Dict[str, Any]]:
+def _handle_lite_frame(
+    data: Dict[str, Any], allow_emit: bool = True, img_bytes: Optional[bytes] = None
+) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict):
         return None
     try:
@@ -256,6 +404,16 @@ def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optiona
 
     faces = data.get("faces") if isinstance(data.get("faces"), list) else []
     snapshot = _snapshot_from_faces(faces)
+    data_thumbs = data.get("thumbs") if isinstance(data, dict) else None
+    if isinstance(data_thumbs, dict) and data_thumbs:
+        thumb_updates = _apply_thumb_updates(data_thumbs, ts)
+    else:
+        thumb_updates = _maybe_capture_thumbs(faces, img_bytes, ts=ts)
+    if thumb_updates:
+        LITE_STATE["thumb_updates"].update(thumb_updates)
+        LITE_STATE["latest_faces"] = faces
+        LITE_STATE["latest_snapshot"] = dict(snapshot)
+        LITE_STATE["latest_ts"] = ts
 
     is_new_session = sid != LITE_STATE["session_id"]
     if not is_new_session and LITE_STATE["last_emit_ts"] > 0 and ts < (LITE_STATE["last_emit_ts"] - 1.0):
@@ -269,11 +427,17 @@ def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optiona
         LITE_STATE["last_snapshot"] = dict(snapshot)
         LITE_STATE["last_emit_ts"] = ts
         if allow_emit:
-            return {
+            payload = {
                 "type": "lite_snapshot",
                 "ts": ts,
                 "faces": _build_lite_faces(faces, ts),
             }
+            thumbs = _thumbs_for_snapshot(snapshot)
+            if thumbs:
+                payload["thumbs"] = thumbs
+            if LITE_STATE["thumb_updates"]:
+                LITE_STATE["thumb_updates"] = {}
+            return payload
         return None
 
     if not allow_emit:
@@ -293,11 +457,23 @@ def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optiona
         LITE_STATE["pending"] = False
 
     if not LITE_STATE["pending"]:
+        if LITE_STATE["thumb_updates"]:
+            payload = {
+                "type": "lite_delta",
+                "ts": LITE_STATE["latest_ts"] or ts,
+                "changed": {},
+                "removed": [],
+                "thumbs": dict(LITE_STATE["thumb_updates"]),
+            }
+            LITE_STATE["thumb_updates"] = {}
+            LITE_STATE["last_emit_ts"] = LITE_STATE["latest_ts"] or ts
+            LITE_STATE["last_diff"] = {"changed": {}, "removed": []}
+            return payload
         return None
 
     if LITE_STATE["last_emit_ts"] < 0 or (ts - LITE_STATE["last_emit_ts"] >= LITE_STATUS_INTERVAL_SEC):
         changed, removed = _diff_snapshots(LITE_STATE["last_snapshot"], LITE_STATE["latest_snapshot"])
-        if not changed and not removed:
+        if not changed and not removed and not LITE_STATE["thumb_updates"]:
             LITE_STATE["pending"] = False
             return None
         payload = {
@@ -306,6 +482,9 @@ def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optiona
             "changed": changed,
             "removed": removed,
         }
+        if LITE_STATE["thumb_updates"]:
+            payload["thumbs"] = dict(LITE_STATE["thumb_updates"])
+            LITE_STATE["thumb_updates"] = {}
         LITE_STATE["last_emit_ts"] = LITE_STATE["latest_ts"] or ts
         LITE_STATE["last_snapshot"] = dict(LITE_STATE["latest_snapshot"])
         LITE_STATE["pending"] = False
@@ -314,11 +493,66 @@ def _handle_lite_frame(data: Dict[str, Any], allow_emit: bool = True) -> Optiona
     return None
 
 
+def _is_coalesce_marker(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("type") == "_coalesce" and "key" in item
+
+
+def _resolve_coalesced_item(item: Any) -> Optional[Dict[str, Any]]:
+    if _is_coalesce_marker(item):
+        key = item.get("key")
+        if isinstance(key, str):
+            COALESCE_PENDING[key] = False
+            return COALESCE_CACHE.get(key)
+        return None
+    if isinstance(item, dict):
+        return item
+    return None
+
+
+def _queue_put(payload: Dict[str, Any]) -> bool:
+    try:
+        event_queue.put_nowait(payload)
+        return True
+    except asyncio.QueueFull:
+        try:
+            dropped = event_queue.get_nowait()
+            stats["dropped_events"] += 1
+            if _is_coalesce_marker(dropped):
+                key = dropped.get("key")
+                if isinstance(key, str):
+                    COALESCE_PENDING[key] = False
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            event_queue.put_nowait(payload)
+            return True
+        except asyncio.QueueFull:
+            stats["dropped_events"] += 1
+            return False
+
+
+def _enqueue_event(payload: Dict[str, Any]) -> bool:
+    if isinstance(payload, dict):
+        ptype = payload.get("type")
+        if isinstance(ptype, str) and ptype in COALESCE_TYPES:
+            COALESCE_CACHE[ptype] = payload
+            if not COALESCE_PENDING.get(ptype, False):
+                marker = {"type": "_coalesce", "key": ptype}
+                if _queue_put(marker):
+                    COALESCE_PENDING[ptype] = True
+                    stats["coalesced_updates"] += 1
+                    return True
+                return False
+            stats["coalesced_updates"] += 1
+            return True
+    return _queue_put(payload)
+
+
 def _queue_event_threadsafe(payload: Dict[str, Any]) -> None:
     if not main_loop:
         return
     try:
-        main_loop.call_soon_threadsafe(event_queue.put_nowait, payload)
+        main_loop.call_soon_threadsafe(_enqueue_event, payload)
     except Exception:
         pass
 
@@ -416,7 +650,7 @@ async def _lite_heartbeat_task() -> None:
             continue
         payload = {"type": "lite_heartbeat", "ts": time.time()}
         try:
-            event_queue.put_nowait(payload)
+            _enqueue_event(payload)
         except Exception:
             pass
 
@@ -438,6 +672,8 @@ def _env_summary() -> Dict[str, Any]:
 def _default_model_cfg() -> Dict[str, Any]:
     env = _env_summary()
     has_openai = bool(env.get("has_openai_key"))
+    llm_lang = normalize_language(os.getenv("REPORT_LANGUAGE") or os.getenv("SUMMARY_LANGUAGE") or "zh", default="zh", allow_auto=True)
+    asr_lang = normalize_language(os.getenv("ASR_LANGUAGE") or os.getenv("OPENAI_ASR_LANGUAGE") or "auto", default="auto", allow_auto=True)
     return {
         "mode": "online" if has_openai else "offline",
         "llm": {
@@ -447,6 +683,7 @@ def _default_model_cfg() -> Dict[str, Any]:
             "base_url": str(env.get("openai_base_url") or "https://api.openai.com"),
             # Optional override (kept in memory only; never persisted to session outputs).
             "api_key": "",
+            "language": llm_lang,
         },
         "asr": {
             "provider": "openai_compat" if has_openai else "none",
@@ -454,6 +691,7 @@ def _default_model_cfg() -> Dict[str, Any]:
             "use_independent": False,
             "base_url": "",
             "api_key": "",
+            "language": asr_lang,
         },
     }
 
@@ -486,6 +724,12 @@ def _sanitize_model_cfg(cfg: Any) -> Dict[str, Any]:
     if api_key:
         # Don't try to validate format; just keep it bounded.
         out["llm"]["api_key"] = api_key[:500]
+    llm_lang = normalize_language(
+        llm.get("language", out["llm"].get("language", "zh")),
+        default=out["llm"].get("language", "zh"),
+        allow_auto=True,
+    )
+    out["llm"]["language"] = llm_lang
 
     asr = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
     asr_provider = str(asr.get("provider", out["asr"]["provider"]) or "").strip()
@@ -507,6 +751,12 @@ def _sanitize_model_cfg(cfg: Any) -> Dict[str, Any]:
         out["asr"]["api_key"] = asr_api_key[:500]
     else:
         out["asr"]["api_key"] = ""
+    asr_lang = normalize_language(
+        asr.get("language", out["asr"].get("language", "auto")),
+        default=out["asr"].get("language", "auto"),
+        allow_auto=True,
+    )
+    out["asr"]["language"] = asr_lang
     return out
 
 
@@ -673,11 +923,25 @@ def _redact_model_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _write_session_config(session_dir: Path, cfg: Dict[str, Any]) -> None:
     try:
+        meta = {}
+        try:
+            llm = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+            asr = cfg.get("asr") if isinstance(cfg.get("asr"), dict) else {}
+            mode = str(cfg.get("mode") or "").strip()
+            if mode in ("online", "offline"):
+                meta["mode"] = mode
+            if llm.get("language") is not None:
+                meta["llm_language"] = normalize_language(llm.get("language"), default="zh", allow_auto=True)
+            if asr.get("language") is not None:
+                meta["asr_language"] = normalize_language(asr.get("language"), default="auto", allow_auto=True)
+        except Exception:
+            meta = {}
         with open(session_dir / "session_config.json", "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "model_config": _redact_model_cfg(cfg),
                     "env_summary": _env_summary(),
+                    "meta": meta,
                     "ts": time.time(),
                 },
                 fh,
@@ -699,9 +963,9 @@ def _read_session_config(session_dir: Path) -> Dict[str, Any]:
             loaded = _sanitize_model_cfg(cfg)
             cur = _get_model_cfg()
             try:
-                if isinstance(loaded.get("llm"), dict) and isinstance(cur.get("llm"), dict):
-                    if not str(loaded["llm"].get("api_key") or "").strip() and str(cur["llm"].get("api_key") or "").strip():
-                        loaded["llm"]["api_key"] = cur["llm"]["api_key"]
+                meta = j.get("meta") if isinstance(j, dict) else None
+                loaded = merge_session_meta(loaded, meta)
+                loaded = merge_redacted_model_cfg(loaded, cur)
             except Exception:
                 pass
             return loaded
@@ -913,6 +1177,8 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
+        _mark_client_activity()
+        _restore_preview_defaults()
         if LITE_MODE:
             try:
                 await ws.send_text(json.dumps(_lite_snapshot_payload()))
@@ -924,16 +1190,60 @@ class ConnectionManager:
             self.active.remove(ws)
         except ValueError:
             pass
+        if not self.active:
+            _mark_client_activity()
 
     async def broadcast(self, message: str):
         coros = []
-        for ws in list(self.active):
+        targets = list(self.active)
+        for ws in targets:
             coros.append(ws.send_text(message))
-        if coros:
-            await asyncio.gather(*coros, return_exceptions=True)
+        if not coros:
+            return
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for ws, res in zip(targets, results):
+            if isinstance(res, Exception):
+                try:
+                    self.active.remove(ws)
+                except ValueError:
+                    pass
 
 
 manager = ConnectionManager()
+
+
+def _restore_preview_defaults() -> None:
+    global PREVIEW_THROTTLED
+    session_mgr.set_preview(enabled=PREVIEW_DEFAULT_ENABLED, interval_sec=PREVIEW_DEFAULT_INTERVAL)
+    session_mgr.set_preview_thumbs(
+        enabled=PREVIEW_DEFAULT_THUMBS,
+        size=PREVIEW_DEFAULT_THUMB_CFG["size"],
+        quality=PREVIEW_DEFAULT_THUMB_CFG["quality"],
+        pad=PREVIEW_DEFAULT_THUMB_CFG["pad"],
+        refresh_sec=PREVIEW_DEFAULT_THUMB_CFG["refresh_sec"],
+        refresh_frames=PREVIEW_DEFAULT_THUMB_CFG["refresh_frames"],
+    )
+    PREVIEW_THROTTLED = False
+
+
+def _apply_idle_throttle() -> None:
+    global PREVIEW_THROTTLED
+    if PREVIEW_THROTTLED:
+        return
+    interval = float(WEB_IDLE_PREVIEW_INTERVAL_SEC or 0.0)
+    enabled = interval > 0.0
+    session_mgr.set_preview(enabled=enabled, interval_sec=interval if enabled else None)
+    if not enabled:
+        session_mgr.set_preview_thumbs(enabled=False)
+    PREVIEW_THROTTLED = True
+
+
+def _is_idle() -> bool:
+    if float(WEB_IDLE_THROTTLE_SEC or 0.0) <= 0.0:
+        return False
+    if manager.active:
+        return False
+    return (time.time() - float(LAST_CLIENT_TS or 0.0)) >= float(WEB_IDLE_THROTTLE_SEC)
 
 
 async def broadcaster_task():
@@ -944,7 +1254,9 @@ async def broadcaster_task():
         try:
             # wait for first item
             item = await asyncio.wait_for(event_queue.get(), timeout=batch_interval)
-            batch.append(item)
+            resolved = _resolve_coalesced_item(item)
+            if resolved is not None:
+                batch.append(resolved)
         except asyncio.TimeoutError:
             # nothing arrived in interval
             pass
@@ -953,7 +1265,9 @@ async def broadcaster_task():
         while True:
             try:
                 item = event_queue.get_nowait()
-                batch.append(item)
+                resolved = _resolve_coalesced_item(item)
+                if resolved is not None:
+                    batch.append(resolved)
             except asyncio.QueueEmpty:
                 break
 
@@ -969,10 +1283,27 @@ async def broadcaster_task():
 async def stats_logger():
     while True:
         try:
-            print(f"[web_viz_server] stats received={stats['received']} batches_broadcast={stats['batches_broadcast']} last_batch_size={stats['last_batch_size']}")
+            print(
+                f"[web_viz_server] stats received={stats['received']} "
+                f"batches_broadcast={stats['batches_broadcast']} "
+                f"last_batch_size={stats['last_batch_size']} "
+                f"dropped_events={stats['dropped_events']} "
+                f"coalesced_updates={stats['coalesced_updates']}"
+            )
         except Exception:
             pass
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(WEB_IDLE_STATS_INTERVAL_SEC if _is_idle() else 2.0)
+
+
+async def _idle_throttle_task() -> None:
+    if float(WEB_IDLE_THROTTLE_SEC or 0.0) <= 0.0:
+        return
+    while True:
+        await asyncio.sleep(1.0)
+        if _is_idle():
+            _apply_idle_throttle()
+        elif PREVIEW_THROTTLED:
+            _restore_preview_defaults()
 
 
 # Global loop reference
@@ -993,7 +1324,7 @@ async def startup():
                 if manager.active:
                     _queue_event_threadsafe(data)
                 return
-            payload = _handle_lite_frame(data, allow_emit=bool(manager.active))
+            payload = _handle_lite_frame(data, allow_emit=bool(manager.active), img_bytes=img_bytes)
             if payload and manager.active:
                 _queue_event_threadsafe(payload)
             return
@@ -1008,6 +1339,7 @@ async def startup():
     # start background tasks
     asyncio.create_task(broadcaster_task())
     asyncio.create_task(stats_logger())
+    asyncio.create_task(_idle_throttle_task())
     if LITE_MODE:
         asyncio.create_task(_lite_heartbeat_task())
         asyncio.create_task(_lite_auto_recovery_task())
@@ -1041,6 +1373,11 @@ async def ui_config():
             "auto_upload": LITE_AUTO_UPLOAD,
             "adaptive_scheduler": LITE_ADAPTIVE_SCHEDULER,
             "heartbeat_sec": LITE_HEARTBEAT_SEC,
+            "thumbnails": LITE_THUMBNAILS,
+            "thumb_interval_sec": LITE_THUMB_INTERVAL_SEC,
+            "thumb_size": LITE_THUMB_SIZE,
+            "thumb_refresh_sec": LITE_THUMB_REFRESH_SEC,
+            "thumb_refresh_frames": LITE_THUMB_REFRESH_FRAMES,
         },
     })
 
@@ -1187,7 +1524,128 @@ def _read_jsonl(path):
     return out
 
 
-def _summarize_text(text: str, max_points: int = 6, llm: Optional[OpenAICompat] = None, allow_llm: bool = True):
+def _estimate_id_switch_stats(
+    faces: Optional[List[Dict[str, Any]]] = None,
+    faces_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    out = {"id_switches": 0, "id_switch_matches": 0, "id_switch_rate": 0.0}
+    if faces is None:
+        if faces_path is None or not faces_path.exists():
+            return out
+
+    try:
+        max_dist = float(os.getenv("ID_SWITCH_MAX_NORM_DIST", "0.12"))
+    except Exception:
+        max_dist = 0.12
+
+    def _center(rec: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        c = rec.get("center")
+        if isinstance(c, list) and len(c) >= 2:
+            try:
+                return float(c[0]), float(c[1])
+            except Exception:
+                return None
+        bbox = rec.get("bbox")
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            try:
+                nx, ny, nw, nh = [float(b) for b in bbox[:4]]
+            except Exception:
+                return None
+            return nx + nw / 2.0, ny + nh / 2.0
+        return None
+
+    def _track_id(rec: Dict[str, Any]) -> Optional[str]:
+        tid = rec.get("track_id")
+        if tid is None:
+            tid = rec.get("student_id")
+        if tid is None:
+            return None
+        return str(tid)
+
+    def _flush(prev: List[Dict[str, Any]], cur: List[Dict[str, Any]]) -> None:
+        if not prev or not cur:
+            return
+        candidates: List[Tuple[float, int, int]] = []
+        for ci, c in enumerate(cur):
+            cc = _center(c)
+            if cc is None:
+                continue
+            for pi, p in enumerate(prev):
+                pc = _center(p)
+                if pc is None:
+                    continue
+                d = float((cc[0] - pc[0]) ** 2 + (cc[1] - pc[1]) ** 2) ** 0.5
+                if d <= max_dist:
+                    candidates.append((d, ci, pi))
+        if not candidates:
+            return
+        candidates.sort(key=lambda x: x[0])
+        used_cur = set()
+        used_prev = set()
+        for _, ci, pi in candidates:
+            if ci in used_cur or pi in used_prev:
+                continue
+            used_cur.add(ci)
+            used_prev.add(pi)
+            cur_id = _track_id(cur[ci])
+            prev_id = _track_id(prev[pi])
+            if cur_id is None or prev_id is None:
+                continue
+            out["id_switch_matches"] += 1
+            if cur_id != prev_id:
+                out["id_switches"] += 1
+
+    prev_dets: List[Dict[str, Any]] = []
+    cur_frame = None
+    cur_dets: List[Dict[str, Any]] = []
+    try:
+        if faces is None:
+            faces = []
+            with open(faces_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict):
+                        faces.append(rec)
+        for rec in faces:
+            if not isinstance(rec, dict):
+                continue
+            frame = rec.get("frame")
+            if frame is None:
+                try:
+                    frame = int(float(rec.get("ts", 0.0)) * 10.0)
+                except Exception:
+                    frame = None
+            if cur_frame is None:
+                cur_frame = frame
+            if frame != cur_frame:
+                _flush(prev_dets, cur_dets)
+                prev_dets = cur_dets
+                cur_dets = []
+                cur_frame = frame
+            cur_dets.append(rec)
+        _flush(prev_dets, cur_dets)
+    except Exception:
+        return out
+
+    matches = float(out["id_switch_matches"])
+    if matches > 0:
+        out["id_switch_rate"] = float(out["id_switches"]) / matches
+    return out
+
+
+def _summarize_text(
+    text: str,
+    max_points: int = 6,
+    llm: Optional[OpenAICompat] = None,
+    allow_llm: bool = True,
+    language: str = "zh",
+):
     """Summarize text into knowledge points.
 
     Uses an OpenAI-compatible LLM when configured, otherwise falls back to
@@ -1204,9 +1662,10 @@ def _summarize_text(text: str, max_points: int = 6, llm: Optional[OpenAICompat] 
         llm = OpenAICompat.from_env()
     if allow_llm and llm:
         try:
+            lang_hint = llm_language_hint(normalize_language(language, default="zh", allow_auto=True))
             messages = [
-                {"role": "system", "content": "你从课堂讲解中提炼知识点。只输出 JSON 数组（字符串数组），不要输出任何额外文字。"},
-                {"role": "user", "content": f"从下面转录内容中提炼最多 {int(max_points)} 条知识点（尽量中文、短语化、去重）：\n\n{text}"},
+                {"role": "system", "content": f"你从课堂讲解中提炼知识点。{lang_hint}只输出 JSON 数组（字符串数组），不要输出任何额外文字。"},
+                {"role": "user", "content": f"从下面转录内容中提炼最多 {int(max_points)} 条知识点（短语化、去重）：\n\n{text}"},
             ]
             pts = llm.generate_json_array(messages=messages, max_tokens=500, temperature=0.2)
             out = []
@@ -1278,7 +1737,12 @@ def _chunk_asr_segments(asr_segments: List[dict], chunk_secs: float) -> List[dic
     return chunks
 
 
-def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] = None, allow_llm: bool = True) -> dict:
+def _llm_summarize_lesson(
+    asr_segments: List[dict],
+    llm: Optional[OpenAICompat] = None,
+    allow_llm: bool = True,
+    language: str = "zh",
+) -> dict:
     """Summarize the whole lesson and produce a timeline of topics."""
     if not allow_llm:
         return {}
@@ -1286,6 +1750,7 @@ def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] 
         llm = OpenAICompat.from_env()
     if not llm:
         return {}
+    lang_hint = llm_language_hint(normalize_language(language, default="zh", allow_auto=True))
     chunk_secs = float(os.getenv("SUMMARY_CHUNK_SECONDS", "180"))
     chunks = _chunk_asr_segments(asr_segments, chunk_secs=chunk_secs)
     if not chunks:
@@ -1294,7 +1759,7 @@ def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] 
     timeline = []
     for ch in chunks:
         messages = [
-            {"role": "system", "content": "你要总结课堂讲解内容。只输出 JSON 对象，不要输出任何额外文字。"},
+            {"role": "system", "content": f"你要总结课堂讲解内容。{lang_hint}只输出 JSON 对象，不要输出任何额外文字。"},
             {
                 "role": "user",
                 "content": (
@@ -1330,7 +1795,7 @@ def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] 
             "summary": t["summary"],
         })
     messages = [
-        {"role": "system", "content": "你要生成用于课堂专注度分析的课程结构化总结。只输出 JSON 对象，不要输出任何额外文字。"},
+        {"role": "system", "content": f"你要生成用于课堂专注度分析的课程结构化总结。{lang_hint}只输出 JSON 对象，不要输出任何额外文字。"},
         {
             "role": "user",
             "content": (
@@ -1340,7 +1805,7 @@ def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] 
                 "- overview：3-6 句概览\n"
                 "- key_points：6-12 条关键要点（短语化）\n"
                 "- outline：大纲（章节标题数组）\n"
-                "要求中文。\n\n"
+                f"{lang_hint}\n\n"
                 + json.dumps(compact, ensure_ascii=False)
             ),
         },
@@ -1356,6 +1821,7 @@ def _llm_summarize_lesson(asr_segments: List[dict], llm: Optional[OpenAICompat] 
         "key_points": [str(x).strip() for x in (overall.get("key_points") or [])] if isinstance(overall, dict) else [],
         "outline": [str(x).strip() for x in (overall.get("outline") or [])] if isinstance(overall, dict) else [],
         "timeline": timeline,
+        "language": normalize_language(language, default="zh", allow_auto=True),
     }
     return out
 
@@ -1383,16 +1849,33 @@ def _load_asr_segments(asr_path: Path) -> List[dict]:
         return _read_jsonl(asr_path)
 
 
-def _write_asr_segments(asr_path: Path, segments: List[dict]) -> None:
+def _write_asr_segments(asr_path: Path, segments: List[dict], language: Optional[str] = None) -> None:
+    try:
+        lang = str(language or "").strip()
+    except Exception:
+        lang = ""
     try:
         with open(asr_path, "w", encoding="utf-8") as fh:
             for s in segments:
-                fh.write(json.dumps(s, ensure_ascii=False) + "\n")
+                if not isinstance(s, dict):
+                    continue
+                if lang and "language" not in s:
+                    item = dict(s)
+                    item["language"] = lang
+                else:
+                    item = s
+                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
 
-def _transcribe_openai_audio_to_segments(session_dir: Path, job_id: str, client: OpenAICompat, asr_model: Optional[str]) -> List[dict]:
+def _transcribe_openai_audio_to_segments(
+    session_dir: Path,
+    job_id: str,
+    client: OpenAICompat,
+    asr_model: Optional[str],
+    language: Optional[str] = None,
+) -> List[dict]:
     """Transcribe `temp_audio.wav` via OpenAI-compatible `/audio/transcriptions`."""
     wav_in = session_dir / "temp_audio.wav"
     if not wav_in.exists() or wav_in.stat().st_size <= 0:
@@ -1429,7 +1912,12 @@ def _transcribe_openai_audio_to_segments(session_dir: Path, job_id: str, client:
                 _proc_jobs[job_id]["status"] = f"running:asr(openai) chunk {idx} ({offset:.0f}s)"
 
                 try:
-                    resp = client.transcribe_audio(str(chunk_path), model=asr_model or None, response_format="verbose_json")
+                    resp = client.transcribe_audio(
+                        str(chunk_path),
+                        model=asr_model or None,
+                        language=language,
+                        response_format="verbose_json",
+                    )
                 except Exception as exc:
                     raise RuntimeError(f"openai-compatible transcription failed at chunk {idx}: {exc}") from exc
 
@@ -1536,8 +2024,12 @@ def _ensure_asr_segments(session_dir: Path, job_id: str, model_cfg: Dict[str, An
         return []
 
     asr_cfg = model_cfg.get("asr") if isinstance(model_cfg.get("asr"), dict) else {}
+    llm_cfg = model_cfg.get("llm") if isinstance(model_cfg.get("llm"), dict) else {}
     provider = str(asr_cfg.get("provider") or "none")
     model = str(asr_cfg.get("model") or "").strip() or None
+    llm_lang = normalize_language(llm_cfg.get("language", "zh"), default="zh", allow_auto=True)
+    asr_lang = resolve_asr_language(asr_cfg.get("language", "auto"), llm_lang)
+    asr_lang_param = asr_language_param(asr_lang)
 
     try:
         if provider == "none":
@@ -1546,7 +2038,7 @@ def _ensure_asr_segments(session_dir: Path, job_id: str, model_cfg: Dict[str, An
             client = _openai_client_for_asr(model_cfg)
             if not client:
                 raise RuntimeError("OPENAI_API_KEY not set.")
-            segs = _transcribe_openai_audio_to_segments(session_dir, job_id, client, model)
+            segs = _transcribe_openai_audio_to_segments(session_dir, job_id, client, model, language=asr_lang_param)
         elif provider == "dashscope":
             segs = _transcribe_dashscope_audio_to_segments(session_dir, job_id, model)
         elif provider == "xfyun_raasr":
@@ -1557,7 +2049,7 @@ def _ensure_asr_segments(session_dir: Path, job_id: str, model_cfg: Dict[str, An
         warnings.append(f"ASR failed ({provider}): {exc}")
         return []
 
-    _write_asr_segments(asr_path, segs)
+    _write_asr_segments(asr_path, segs, language=asr_lang)
     return segs
 
 
@@ -1588,6 +2080,9 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             warnings: List[str] = []
             model_cfg = _read_session_config(session_dir)
             llm_cfg = model_cfg.get("llm") if isinstance(model_cfg.get("llm"), dict) else {}
+            asr_cfg = model_cfg.get("asr") if isinstance(model_cfg.get("asr"), dict) else {}
+            llm_lang = normalize_language(llm_cfg.get("language", "zh"), default="zh", allow_auto=True)
+            asr_lang = resolve_asr_language(asr_cfg.get("language", "auto"), llm_lang)
             allow_llm = (
                 str(model_cfg.get("mode") or "offline") == "online"
                 and bool(llm_cfg.get("enabled"))
@@ -1610,6 +2105,8 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             transcript_txt = session_dir / "transcript.txt"
             try:
                 with open(transcript_txt, "w", encoding="utf-8") as fh:
+                    if asr_lang:
+                        fh.write(f"[language: {asr_lang}]\n")
                     if asr_segments:
                         for seg in asr_segments:
                             if not isinstance(seg, dict):
@@ -1631,7 +2128,12 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
 
             # 2) Summarize the whole lesson via OpenAI-compatible LLM (if configured)
             _proc_jobs[job_id]["status"] = "running:lesson_summary"
-            lesson_summary = _llm_summarize_lesson(asr_segments, llm=llm_client, allow_llm=allow_llm)
+            lesson_summary = _llm_summarize_lesson(
+                asr_segments,
+                llm=llm_client,
+                allow_llm=allow_llm,
+                language=llm_lang,
+            )
             lesson_summary_path = session_dir / "lesson_summary.json"
             if lesson_summary:
                 try:
@@ -1646,6 +2148,7 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
             faces_path = session_dir / 'faces.jsonl'
             events = _read_jsonl(events_path) if events_path.exists() else []
             faces = _read_jsonl(faces_path) if faces_path.exists() else []
+            id_switch_stats = _estimate_id_switch_stats(faces=faces)
 
             per_student = {}
 
@@ -1807,7 +2310,12 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                     seen = set()
                     it["lecture_topics"] = [t for t in topics if not (t in seen or seen.add(t))]
                     # Summarize interval into knowledge points (fine-grained)
-                    it['knowledge_points'] = _summarize_text(joined or '', llm=llm_client, allow_llm=allow_llm)
+                    it['knowledge_points'] = _summarize_text(
+                        joined or '',
+                        llm=llm_client,
+                        allow_llm=allow_llm,
+                        language=llm_lang,
+                    )
 
             # Save stats file
             _proc_jobs[job_id]["status"] = "running:write_stats"
@@ -1819,6 +2327,11 @@ async def process_session(request: Request, background_tasks: BackgroundTasks):
                     'audio': 'temp_audio.wav' if (session_dir / 'temp_audio.wav').exists() else None,
                     'transcript': str(transcript_txt.name) if transcript_txt.exists() else None,
                     'model_config': _redact_model_cfg(model_cfg),
+                    'languages': {
+                        'llm': llm_lang,
+                        'asr': asr_lang,
+                    },
+                    'tracking': id_switch_stats,
                     'warnings': warnings,
                     'lesson_summary': lesson_summary if lesson_summary else None,
                     'per_student': per_student,
@@ -2153,13 +2666,15 @@ async def push(request: Request):
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
     events = data if isinstance(data, list) else [data]
+    dropped = 0
     for e in events:
         if isinstance(e, dict) and "ts" not in e:
             e["ts"] = asyncio.get_event_loop().time()
-        await event_queue.put(e)
+        if not _enqueue_event(e):
+            dropped += 1
         stats['received'] += 1
 
-    return JSONResponse({"ok": True, "queued": len(events)})
+    return JSONResponse({"ok": True, "queued": len(events) - dropped, "dropped": dropped})
 
 
 @app.get('/stats')
